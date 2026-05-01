@@ -15,6 +15,13 @@ clean:
 build:
 	$(UV) build
 
+# Semantics
+
+kdist-build:
+	$(UV_RUN) kdist -v build -j2 komet-node.*
+
+kdist-clean:
+	$(UV_RUN) kdist clean
 
 # Tests
 
