@@ -150,7 +150,7 @@ class NodeInterpreter:
                 case CreateAccount(destination=dest, starting_balance=balance):
                     # starting_balance is XLM (may have decimals); convert to stroops (1 XLM = 10^7 stroops).
                     # We ignore the source account for now.
-                    balance_stroops = int(Decimal(str(balance)) * Decimal('10000000'))
+                    balance_stroops = int(Decimal(str(balance)) * Decimal('10000000')) # TODO check this calculation. not sure about this
                     return self.make_set_account_step(dest, balance_stroops)
 
                 case InvokeHostFunction(host_function=hf) if (
@@ -236,7 +236,7 @@ class NodeInterpreter:
         step = call_tx(
             from_addr=self.address_to_kast(caller.universal_account_id),
             to_addr=callee_addr,
-            func=str(invoke.function_name),
+            func=invoke.function_name.sc_symbol.decode('ascii'), # TODO not sure if ascii is the correct encoding
             args=[scvalue_from_xdr(a).to_kast() for a in invoke.args],
             result=SC_VOID,
         )
@@ -284,7 +284,7 @@ class NodeInterpreter:
         conf_with_pgm_kore = kast_to_kore(self.definition.kdefinition, conf_with_pgm, KSort('GeneratedTopCell'))
 
         with temp_working_directory():
-            res = self.definition.krun.run_process(pgm=conf_with_pgm_kore)
+            res = self.definition.krun.run_process(pgm=conf_with_pgm_kore, term=True)
 
             if res.returncode:
                 raise NodeInterpreterError('Failed to krun program', res)

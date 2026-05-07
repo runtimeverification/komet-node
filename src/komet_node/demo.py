@@ -1,6 +1,9 @@
 """
 Komet Node demo — deploy a Soroban contract and invoke it through the K semantics.
 
+See the link below for more details about Stellar RPC:
+    https://developers.stellar.org/docs/data/apis/rpc/api-reference/methods/sendTransaction
+
 Prerequisites:
   - K semantics compiled:  make kdist-build
   - wat2wasm on PATH:      apt install wabt  (or brew install wabt)
