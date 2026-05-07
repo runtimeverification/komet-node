@@ -238,7 +238,7 @@ class NodeInterpreter:
             to_addr=callee_addr,
             func=invoke.function_name.sc_symbol.decode('ascii'), # TODO not sure if ascii is the correct encoding
             args=[scvalue_from_xdr(a).to_kast() for a in invoke.args],
-            result=SC_VOID,
+            result=SC_VOID, # This field is used for checking the tx result in komet. we should make it optional in komet semantics.
         )
         return [step]
 
