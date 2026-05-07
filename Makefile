@@ -19,6 +19,7 @@ build:
 
 kdist-build:
 	$(UV_RUN) kdist -v build -j2 komet-node.*
+	$(UV_RUN) kdist -v build -j2 soroban-semantics.*
 
 kdist-clean:
 	$(UV_RUN) kdist clean

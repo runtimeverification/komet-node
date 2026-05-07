@@ -27,7 +27,7 @@ class NodeKompileTarget(KompileTarget):
     def deps(self) -> tuple[str]:
         return super().deps()
 
-    def source(self):
+    def source(self) -> tuple[Path, ...]:
         return (NODE_KSRC_DIR,)
 
 
