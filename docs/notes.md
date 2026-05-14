@@ -2,7 +2,7 @@
 
 ## What this does
 
-`komet-node` is a Stellar node backed by the K semantics. The core component implemented so far is `NodeInterpreter`, which takes a `.kore` file (blockchain state) and a Stellar `Transaction`, executes the operations through `krun`, and returns the updated state as kore text. A server that listens for incoming transactions, manages state persistence, and calls `NodeInterpreter` is yet to be built.
+`komet-node` is a Stellar node backed by the K semantics. The core component is `NodeInterpreter`, which takes a `.kore` file (blockchain state) and a Stellar `Transaction`, executes the operations through `krun`, and returns the updated state as kore text. A server that listens for incoming transactions, manages state persistence, and calls `NodeInterpreter` is yet to be built.
 
 See `src/komet_node/demo.py` for an end-to-end example: empty state → create account → upload wasm → deploy contract → call `foo()`.
 
@@ -25,7 +25,14 @@ Supported operations:
 | `InvokeHostFunction` / create contract (V1, V2) | `deployContract(from, address, wasmHash)` |
 | `InvokeHostFunction` / invoke contract | `callTx(from, to, func, args, Void)` |
 
-Execution path (`run_steps`):
+Execution paths:
+
+**JSON fast path** (`run_request_file`) — used for all operations except wasm upload:
+1. Encode the transaction as a JSON string (`encode_transaction_to_json`)
+2. Write it as `request.json` in a temp working directory
+3. Run `krun` on the idle `.kore` state — K reads the file, decodes it, executes the steps, removes the file, and halts
+
+**KORE round-trip** (`run_steps`) — used only for wasm upload, which must embed a `ModuleDecl` in the K AST:
 1. Parse `input.kore` → Python AST (`kore_to_kast`)
 2. Inject K steps into the `PROGRAM_CELL` of the config
 3. Re-serialize to KORE and run `krun`
@@ -36,22 +43,23 @@ Converts Stellar XDR `SCVal` to Komet `SCValue` dataclasses, used when building 
 
 ### K semantics (`src/komet_node/kdist/node.md`)
 
-These rules exist specifically to support the JSON fast path. When the configuration is on the idle state (empty `<k>`, `<instrs>`, `<program>` cells):
-- If `request.json` exists in the working directory → read it, remove it, dispatch `#handleRequest(contents)`, halt
-- If not → halt immediately (this is the expected idle state)
+Implements the JSON fast path on the K side. When the configuration is in the idle state (empty `<k>`, `<instrs>`, `<program>` cells):
+- If `request.json` exists → read it, dispatch `#handleRequest(contents)`, remove the file, halt
+- If not → halt immediately (expected idle state, ready for the next request)
 
-`#handleRequest(String)` is **declared but not implemented** — that's the main TODO.
+`#handleRequest` decodes the JSON string into K `Steps` using `String2JSON` and a set of `#decodeStep` / `#decodeArg` rules, then injects them directly into `<k>`. A `steps-done` rule (mirroring KASMER's `steps-empty` but with `...`) is needed to let the continuation proceed once the decoded steps finish.
+
+Supported JSON step types and SCVal arg types mirror the Python encoder — see the format comment in `node.md`.
+
+### Tests (`src/tests/integration/`)
+
+- `test_full_lifecycle` — end-to-end: create account → upload wasm (KORE path) → deploy contract → call `foo()` (no args)
+- `test_callTx_with_args` — deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` args, exercising the full `_encode_scval` / `#decodeArg` pipeline
+
+Not yet covered by tests: `bytes` and `address` SCVal types (require host object allocation).
 
 ---
 
 ## What needs to be implemented
 
-The current `run_steps` path is expensive — it parses the KORE file, converts to KAst, mutates the AST, and re-serializes.
-This round-trip is only necessary when uploading wasm, because the wasm module must be embedded as a `ModuleDecl` in the K AST.
-For all other operations, a JSON fast path can be used: Python writes a `request.json` describing the transaction,
-and the K semantics read and execute it directly against the idle state — no KORE parsing or AST manipulation required.
-
-1. Design the JSON format for `request.json`
-2. Implement the transaction encoder in Python (`interpreter.py`)
-3. Implement the transaction decoder in K (`node.md`) — parse the JSON into K terms
-4. Implement the transaction handler in K (`node.md`) — execute the decoded steps against the state
+A server that sits above `NodeInterpreter`: listens for incoming Stellar RPC requests, manages the `.kore` state file on disk, and calls `run_transaction` for each incoming transaction.
