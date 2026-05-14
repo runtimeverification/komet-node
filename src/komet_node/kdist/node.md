@@ -77,12 +77,18 @@ handleRequestFile: wraps the request lifecycle in an exit-code guard.
 
     rule [removeRequestFile]:
         <k> #removeRequestFile => #remove("request.json") ... </k>
+
+    // KASMER's steps-empty requires <k> .Steps </k> exactly (no frame).
+    // When steps are injected into <k> with a continuation, we need this rule
+    // to consume .Steps and let the continuation proceed.
+    rule [steps-done]:
+        <k> .Steps => .K ... </k>
+        <instrs> .K </instrs>
 ```
 
 handleRequest: parse the JSON request body and inject the decoded Steps directly into
-`<k>`. The existing KASMER `steps-seq` and `steps-empty` rules then execute them one
-by one while the remaining continuation (`#removeRequestFile ~> setExitCode(0)`) is
-preserved by the `...` frame.
+`<k>`. `steps-seq` executes each step; `steps-done` (above) consumes the final `.Steps`
+so the continuation (`#removeRequestFile ~> setExitCode(0)`) can proceed.
 
 ```k
     rule [handleRequest]:
