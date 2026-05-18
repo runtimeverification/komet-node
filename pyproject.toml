@@ -18,7 +18,7 @@ name = "Runtime Verification, Inc."
 email = "contact@runtimeverification.com"
 
 [project.scripts]
-komet-node = "komet-node.__main__:main"
+komet-node = "komet_node.__main__:main"
 
 [project.entry-points.kdist]
 komet-node = "komet_node.kdist.plugin"

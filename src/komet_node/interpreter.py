@@ -21,6 +21,7 @@ from pyk.kast.inner import KSort
 from pyk.kast.manip import Subst, split_config_from
 from pyk.konvert import kast_to_kore, kore_to_kast
 from pyk.kore.parser import KoreParser
+from pyk.kore.prelude import str_dv
 from pyk.ktool.krun import KRunOutput, _krun
 from pykwasm.wasm2kast import wasm2kast
 from stellar_sdk import Network, StrKey, xdr
@@ -47,27 +48,38 @@ if TYPE_CHECKING:
 REQUEST_FILE = 'request.json'
 
 
+_TRACE_FILE = 'trace.jsonl'
+
+
 class InterpreterResponse(NamedTuple):
     final_kore: str
+    trace: str | None = None
 
 
 class NodeInterpreter:
     definition: SimbolikDefinition
     network_passphrase: str
+    trace: bool
 
-    def __init__(self, network_passphrase: str = Network.TESTNET_NETWORK_PASSPHRASE) -> None:
+    def __init__(self, network_passphrase: str = Network.TESTNET_NETWORK_PASSPHRASE, trace: bool = False) -> None:
         self.definition = simbolik_definition()
         self.network_passphrase = network_passphrase
+        self.trace = trace
+
+    def _trace_config_vars(self) -> tuple[dict[str, str], dict[str, str]]:
+        return {'TRACE': str_dv(_TRACE_FILE).text}, {'TRACE': 'cat'}
 
     def empty_config(self) -> str:
-        """
-        Return the initial K configuration with an empty program cell.
-        This is used as the base state before any steps are injected.
-        """
+        """Return the initial idle K configuration, with tracing enabled if requested."""
+        kwargs: dict = {'output': KRunOutput.KORE}
+        if self.trace:
+            cmap, pmap = self._trace_config_vars()
+            kwargs['cmap'] = cmap
+            kwargs['pmap'] = pmap
         res = self.definition.krun_with_kast(
             pgm=steps_of([set_exit_code(0)]),
             sort=KSort('Steps'),
-            output=KRunOutput.KORE,
+            **kwargs,
         )
         res.check_returncode()
         return res.stdout
@@ -340,7 +352,10 @@ class NodeInterpreter:
             if res.returncode:
                 raise NodeInterpreterError(f'krun failed for request: {request_str}', res)
 
-            return InterpreterResponse(final_kore=res.stdout)
+            trace_file = root / _TRACE_FILE
+            trace = trace_file.read_text() if trace_file.exists() else None
+
+            return InterpreterResponse(final_kore=res.stdout, trace=trace)
 
     def run_steps(self, input_file: Path, steps: Iterable[KInner]) -> InterpreterResponse:
         input_state_kore = KoreParser(input_file.read_text()).pattern()
