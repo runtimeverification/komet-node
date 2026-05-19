@@ -22,6 +22,7 @@ from pyk.kast.manip import Subst, split_config_from
 from pyk.konvert import kast_to_kore, kore_to_kast
 from pyk.kore.parser import KoreParser
 from pyk.kore.prelude import str_dv
+from pyk.kore.syntax import App, Pattern
 from pyk.ktool.krun import KRunOutput, _krun
 from pykwasm.wasm2kast import wasm2kast
 from stellar_sdk import Network, StrKey, xdr
@@ -67,19 +68,18 @@ class NodeInterpreter:
         self.trace = trace
 
     def _trace_config_vars(self) -> tuple[dict[str, str], dict[str, str]]:
-        return {'TRACE': str_dv(_TRACE_FILE).text}, {'TRACE': 'cat'}
+        trace_path = _TRACE_FILE if self.trace else ''
+        return {'TRACE': str_dv(trace_path).text}, {'TRACE': 'cat'}
 
     def empty_config(self) -> str:
         """Return the initial idle K configuration, with tracing enabled if requested."""
-        kwargs: dict = {'output': KRunOutput.KORE}
-        if self.trace:
-            cmap, pmap = self._trace_config_vars()
-            kwargs['cmap'] = cmap
-            kwargs['pmap'] = pmap
+        cmap, pmap = self._trace_config_vars()
         res = self.definition.krun_with_kast(
             pgm=steps_of([set_exit_code(0)]),
             sort=KSort('Steps'),
-            **kwargs,
+            output=KRunOutput.KORE,
+            cmap=cmap,
+            pmap=pmap,
         )
         res.check_returncode()
         return res.stdout
@@ -357,6 +357,46 @@ class NodeInterpreter:
 
             return InterpreterResponse(final_kore=res.stdout, trace=trace)
 
+    def run_transaction_with_trace(
+        self, input_file: Path, transaction: Transaction, ledger_seq: int = 0
+    ) -> InterpreterResponse:
+        """Like run_transaction but always produces a trace, regardless of self.trace."""
+        if self.trace:
+            return self.run_transaction(input_file, transaction, ledger_seq)
+
+        request_str = self.encode_transaction_to_json(transaction, ledger_seq)
+        if request_str is not None:
+            return self._run_request_file_force_trace(input_file, request_str)
+
+        # KORE round-trip (wasm upload) — tracing not supported for this path
+        return self.run_transaction(input_file, transaction, ledger_seq)
+
+    def _run_request_file_force_trace(self, input_file: Path, request_str: str) -> InterpreterResponse:
+        """Run request.json with tracing forced on by patching <ioDir> in state.kore."""
+        state_kore = KoreParser(input_file.read_text()).pattern()
+        patched_kore = _set_io_dir(state_kore, _TRACE_FILE)
+
+        with temp_working_directory() as root:
+            (root / REQUEST_FILE).write_text(request_str)
+            patched_state = root / 'state_traced.kore'
+            patched_state.write_text(patched_kore.text)
+
+            res = _krun(
+                input_file=patched_state,
+                definition_dir=self.definition.path,
+                parser='cat',
+                term=True,
+                output=KRunOutput.KORE,
+                check=False,
+            )
+
+            if res.returncode:
+                raise NodeInterpreterError(f'krun failed for traced request: {request_str}', res)
+
+            trace_file = root / _TRACE_FILE
+            trace = trace_file.read_text() if trace_file.exists() else None
+            return InterpreterResponse(final_kore=res.stdout, trace=trace)
+
     def run_steps(self, input_file: Path, steps: Iterable[KInner]) -> InterpreterResponse:
         input_state_kore = KoreParser(input_file.read_text()).pattern()
         input_state_kast = kore_to_kast(self.definition.kdefinition, input_state_kore)
@@ -430,6 +470,15 @@ def _encode_scval(scval: xdr.SCVal) -> dict:
                 return {'type': 'address', 'addrType': 'contract', 'value': raw.hex()}
         case _:
             raise NotImplementedError(f'Unsupported SCVal type for JSON encoding: {scval.type}')
+
+
+def _set_io_dir(pattern: Pattern, path: str) -> Pattern:
+    """Walk a KORE pattern and set the <ioDir> cell value to `path`."""
+    if isinstance(pattern, App):
+        if pattern.symbol == "Lbl'-LT-'ioDir'-GT-'":
+            return App(pattern.symbol, pattern.sorts, (str_dv(path),))
+        return App(pattern.symbol, pattern.sorts, tuple(_set_io_dir(a, path) for a in pattern.args))
+    return pattern
 
 
 class NodeInterpreterError(RuntimeError):

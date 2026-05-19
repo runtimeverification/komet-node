@@ -47,6 +47,7 @@ class StellarRpcServer(JsonRpcServer):
             'getLatestLedger': self.exec_get_latest_ledger,
             'sendTransaction': self.exec_send_transaction,
             'getTransaction': self.exec_get_transaction,
+            'traceTransaction': self.exec_trace_transaction,
         }.items():
             self.register_method(name, fn)
 
@@ -99,6 +100,46 @@ class StellarRpcServer(JsonRpcServer):
         return {
             'hash': tx_hash,
             'status': 'PENDING',
+            'latestLedger': str(self.ledger_seq),
+            'latestLedgerCloseTime': now,
+        }
+
+    def exec_trace_transaction(self, transaction: str) -> dict[str, Any]:
+        now = str(int(time.time()))
+        envelope = TransactionEnvelope.from_xdr(transaction, self.interpreter.network_passphrase)
+        tx_hash = envelope.hash_hex()
+
+        try:
+            result = self.interpreter.run_transaction_with_trace(
+                self.state_file, envelope.transaction, self.ledger_seq
+            )
+            self.state_file.write_text(result.final_kore)
+            self.ledger_seq += 1
+            self._transactions[tx_hash] = {
+                'status': 'SUCCESS',
+                'ledger': str(self.ledger_seq),
+                'createdAt': now,
+                'envelopeXdr': transaction,
+                'resultXdr': '',
+                'resultMetaXdr': '',
+                'trace': result.trace,
+            }
+        except NodeInterpreterError:
+            self._transactions[tx_hash] = {
+                'status': 'FAILED',
+                'ledger': str(self.ledger_seq),
+                'createdAt': now,
+                'envelopeXdr': transaction,
+                'resultXdr': '',
+                'resultMetaXdr': '',
+                'trace': None,
+            }
+
+        return {
+            'hash': tx_hash,
+            'status': self._transactions[tx_hash]['status'],
+            'ledger': self._transactions[tx_hash]['ledger'],
+            'trace': self._transactions[tx_hash]['trace'],
             'latestLedger': str(self.ledger_seq),
             'latestLedgerCloseTime': now,
         }
