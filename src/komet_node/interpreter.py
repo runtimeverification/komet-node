@@ -157,7 +157,7 @@ class NodeInterpreter:
         )
         return StrKey.encode_contract(self.contract_id_from_preimage(preimage))
 
-    def run_transaction(self, input_file: Path, transaction: Transaction) -> InterpreterResponse:
+    def run_transaction(self, input_file: Path, transaction: Transaction, ledger_seq: int = 0) -> InterpreterResponse:
 
         def operation_to_steps(op: Operation) -> list[KInner]:
             match op:
@@ -210,7 +210,7 @@ class NodeInterpreter:
                 case _:
                     raise NotImplementedError(f'Unsupported operation type: {type(op)}')
 
-        request_str = self.encode_transaction_to_json(transaction)
+        request_str = self.encode_transaction_to_json(transaction, ledger_seq)
         if request_str is not None:
             return self.run_request_file(input_file, request_str)
 
@@ -252,7 +252,7 @@ class NodeInterpreter:
         )
         return [step]
 
-    def encode_transaction_to_json(self, transaction: Transaction) -> str | None:
+    def encode_transaction_to_json(self, transaction: Transaction, ledger_seq: int = 0) -> str | None:
         """
         Encode a transaction as a JSON request string for the fast path.
 
@@ -262,7 +262,7 @@ class NodeInterpreter:
         Key ordering in each step dict is significant: it must match the K JSON patterns
         in node.md exactly, because K's JSON sort is ordered.
         """
-        steps = []
+        steps = [{'op': 'setLedgerSequence', 'sequence': ledger_seq}]
         for op in transaction.operations:
             encoded = self._encode_operation_as_json(op, transaction.source)
             if encoded is None:

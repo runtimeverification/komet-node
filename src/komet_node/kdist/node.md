@@ -30,6 +30,12 @@ module NODE
     syntax KItem ::= "#handleRequestFile"
                    | "#removeRequestFile"
                    | #handleRequest(String)
+
+    syntax Step ::= setLedgerSequence(Int)    [symbol(setLedgerSequence)]
+ // ----------------------------------------------------------------------
+    rule [setLedgerSequence]:
+        <k> setLedgerSequence(SEQ) => .K ... </k>
+        <ledgerSequenceNumber> _ => SEQ </ledgerSequenceNumber>
 ```
 
 HexBytes: decode a lowercase hex string to Bytes (big-endian, length = hex length / 2).
@@ -104,10 +110,11 @@ JSON request format (key order is significant — must match Python's json.dumps
 
 where each <step> is one of:
 
-  { "op": "setAccount",     "account": "<hex32>", "balance": <int> }
-  { "op": "deployContract", "from": "<hex32>", "address": "<hex32>", "wasmHash": "<hex32>" }
-  { "op": "callTx",         "from": "<hex32>", "fromIsContract": <bool>,
-                             "func": "<name>", "to": "<hex32>", "args": [ <scval>, ... ] }
+  { "op": "setLedgerSequence", "sequence": <int> }
+  { "op": "setAccount",        "account": "<hex32>", "balance": <int> }
+  { "op": "deployContract",    "from": "<hex32>", "address": "<hex32>", "wasmHash": "<hex32>" }
+  { "op": "callTx",            "from": "<hex32>", "fromIsContract": <bool>,
+                                "func": "<name>", "to": "<hex32>", "args": [ <scval>, ... ] }
 
 SCVal arg encoding (key order also significant):
 
@@ -130,6 +137,9 @@ SCVal arg encoding (key order also significant):
     rule #decodeRequest({ "steps" : [SS:JSONs] }) => #decodeSteps(SS)
     rule #decodeSteps(.JSONs)                     => .Steps
     rule #decodeSteps(S:JSON, SS:JSONs)           => #decodeStep(S) #decodeSteps(SS)
+
+    rule #decodeStep({ "op" : "setLedgerSequence" , "sequence" : SEQ:Int })
+        => setLedgerSequence(SEQ)
 
     rule #decodeStep({ "op" : "setAccount" , "account" : ACCT:String , "balance" : BAL:Int })
         => setAccount(Account(HexBytes(ACCT)), BAL)

@@ -73,7 +73,7 @@ class StellarRpcServer(JsonRpcServer):
         tx_hash = envelope.hash_hex()
 
         try:
-            result = self.interpreter.run_transaction(self.state_file, envelope.transaction)
+            result = self.interpreter.run_transaction(self.state_file, envelope.transaction, self.ledger_seq)
             self.state_file.write_text(result.final_kore)
             self.ledger_seq += 1
             self._transactions[tx_hash] = {
