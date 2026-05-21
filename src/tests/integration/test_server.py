@@ -171,3 +171,91 @@ def test_full_lifecycle_over_http(server: StellarRpcServer) -> None:
     # 4. Invoke foo()
     contract_address = server.interpreter.contract_address_from_deployer_address(keypair.public_key, salt)
     send(sign_and_xdr(builder().append_invoke_contract_function_op(contract_address, 'foo', [])))
+
+
+def test_trace_transaction_returns_result_directly(server: StellarRpcServer) -> None:
+    """traceTransaction returns status/ledger/trace immediately, not PENDING."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    envelope = (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
+        .set_timeout(30)
+        .build()
+    )
+    envelope.sign(keypair)
+
+    result = _rpc(server.port(), 'traceTransaction', {'transaction': envelope.to_xdr()})['result']
+
+    assert result['status'] == 'SUCCESS'
+    assert result['hash'] == envelope.hash_hex()
+    assert 'ledger' in result
+    assert 'trace' in result
+    assert 'latestLedger' in result
+
+
+def test_trace_transaction_stored_for_get_transaction(server: StellarRpcServer) -> None:
+    """traceTransaction stores the result so getTransaction can retrieve it."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    envelope = (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
+        .set_timeout(30)
+        .build()
+    )
+    envelope.sign(keypair)
+
+    trace_result = _rpc(server.port(), 'traceTransaction', {'transaction': envelope.to_xdr()})['result']
+    get_result = _rpc(server.port(), 'getTransaction', {'hash': trace_result['hash']})['result']
+
+    assert get_result['status'] == 'SUCCESS'
+    assert get_result['envelopeXdr'] == envelope.to_xdr()
+
+
+def test_trace_transaction_produces_trace_on_contract_invocation(server: StellarRpcServer) -> None:
+    """traceTransaction returns non-empty trace JSONL when a contract function is invoked."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    def sign_and_xdr(tb: TransactionBuilder) -> str:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        return env.to_xdr()
+
+    def send(xdr: str) -> None:
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': xdr})
+        assert res['result']['status'] == 'PENDING'
+        tx_hash = res['result']['hash']
+        assert _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']['status'] == 'SUCCESS'
+
+    # Set up: create account, upload wasm, deploy contract
+    send(sign_and_xdr(builder().append_create_account_op(keypair.public_key, '1000')))
+
+    wasm_bytecode = wat_to_wasm(EMPTY_CONTRACT_WAT)
+    send(sign_and_xdr(builder().append_upload_contract_wasm_op(wasm_bytecode)))
+
+    from stellar_sdk.utils import sha256
+    wasm_hash = sha256(wasm_bytecode)
+    salt = b'\x00' * 32
+    send(sign_and_xdr(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt)))
+
+    # Invoke via traceTransaction and check trace content
+    contract_address = server.interpreter.contract_address_from_deployer_address(keypair.public_key, salt)
+    invoke_xdr = sign_and_xdr(builder().append_invoke_contract_function_op(contract_address, 'foo', []))
+    result = _rpc(server.port(), 'traceTransaction', {'transaction': invoke_xdr})['result']
+
+    assert result['status'] == 'SUCCESS'
+    assert result['trace'] is not None
+    # Trace is newline-separated JSON records; verify each line parses as JSON
+    lines = [line for line in result['trace'].splitlines() if line.strip()]
+    assert len(lines) > 0
+    import json as _json
+    for line in lines:
+        record = _json.loads(line)
+        assert 'instr' in record
