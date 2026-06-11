@@ -8,14 +8,21 @@ version = "0.1.0"
 description = "Local development testnet for Stellar based on K semantics"
 readme = "README.md"
 requires-python = "~=3.10"
-dependencies = []
+dependencies = [
+    "stellar-sdk>=13.2.1",
+    "komet@git+https://github.com/runtimeverification/komet.git@v0.1.79",
+    "kframework>=7.1.318,<7.1.321",
+]
 
 [[project.authors]]
 name = "Runtime Verification, Inc."
 email = "contact@runtimeverification.com"
 
 [project.scripts]
-komet-node = "komet-node.__main__:main"
+komet-node = "komet_node.__main__:main"
+
+[project.entry-points.kdist]
+komet-node = "komet_node.kdist.plugin"
 
 [dependency-groups]
 dev = [

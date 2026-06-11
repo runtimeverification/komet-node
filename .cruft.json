@@ -1,0 +1,19 @@
+{
+  "template": "https://github.com/runtimeverification/python-project-template",
+  "commit": "7a095b4dd0a51916da0a728b8fdd9adf7e469a68",
+  "checkout": null,
+  "context": {
+    "cookiecutter": {
+      "project_name": "komet-node",
+      "project_slug": "komet-node",
+      "package_name": "komet_node",
+      "version": "0.1.0",
+      "description": "Local development testnet for Stellar based on K semantics",
+      "author_name": "Runtime Verification, Inc.",
+      "author_email": "contact@runtimeverification.com",
+      "_template": "https://github.com/runtimeverification/python-project-template",
+      "_commit": "7a095b4dd0a51916da0a728b8fdd9adf7e469a68"
+    }
+  },
+  "directory": null
+}
