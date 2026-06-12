@@ -36,9 +36,12 @@ RUN mkdir -m 0755 /nix \
 USER vscode
 WORKDIR /home/vscode
 
-# Single-user Nix install — the variant that works in containers without
-# systemd / a running daemon.
-RUN curl -fsSL https://nixos.org/nix/install | sh -s -- --no-daemon --no-channel-add
+# Single-user Nix install — pinned to a specific release for reproducibility
+# and supply-chain safety. Update the version when upgrading Nix.
+ARG NIX_VERSION=2.28.3
+RUN curl -fsSL "https://releases.nixos.org/nix/nix-${NIX_VERSION}/install" -o /tmp/nix-install \
+    && sh /tmp/nix-install --no-daemon --no-channel-add \
+    && rm /tmp/nix-install
 
 ENV PATH=/home/vscode/.nix-profile/bin:/home/vscode/.npm-global/bin:$PATH
 
