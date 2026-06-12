@@ -60,7 +60,7 @@ RUN . /home/vscode/.nix-profile/etc/profile.d/nix.sh \
 # Claude Code CLI — installed to a per-user prefix so root isn't required.
 RUN . /home/vscode/.nix-profile/etc/profile.d/nix.sh \
     && npm config set prefix /home/vscode/.npm-global \
-    && npm install -g @anthropic-ai/claude-code
+    && npm install -g @anthropic-ai/claude-code@2.1.175
 
 # Wire up nix-direnv, then hook direnv into interactive shells. Order matters:
 # Nix must be sourced before the direnv hook so the profile PATH is in place when
