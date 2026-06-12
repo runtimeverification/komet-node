@@ -1,0 +1,27 @@
+{
+  "name": "komet_node",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "remoteUser": "vscode",
+  "workspaceFolder": "/workspace",
+  "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
+  "init": true,
+  "mounts": [
+    "source=claude-code-config-${devcontainerId},target=/home/vscode/.claude,type=volume",
+    "source=${localEnv:HOME}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,readonly"
+  ],
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
+    "GIT_CONFIG_GLOBAL": "/home/vscode/.gitconfig.local"
+  },
+  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude && bash .devcontainer/setup-git.sh && direnv allow /workspace && nix develop /workspace --command bash -c 'uv sync --frozen'",
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "anthropic.claude-code",
+        "mkhl.direnv"
+      ]
+    }
+  }
+}
