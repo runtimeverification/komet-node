@@ -10,11 +10,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from stellar_sdk import Account, Keypair, Network, TransactionBuilder
+from stellar_sdk import Account, Keypair, Network, TransactionBuilder, xdr
+from stellar_sdk.xdr.sc_val_type import SCValType
 
 from komet_node.server import StellarRpcServer
 
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
+ADD_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'add.wat').resolve(strict=True)
 
 
 def wat_to_wasm(wat_path: Path) -> bytes:
@@ -253,6 +255,61 @@ def test_trace_transaction_produces_trace_on_contract_invocation(server: Stellar
     assert result['status'] == 'SUCCESS'
     assert result['trace'] is not None
     # Trace is newline-separated JSON records; verify each line parses as JSON
+    lines = [line for line in result['trace'].splitlines() if line.strip()]
+    assert len(lines) > 0
+    import json as _json
+    for line in lines:
+        record = _json.loads(line)
+        assert 'instr' in record
+
+
+def test_trace_transaction_value_returning_function(server: StellarRpcServer) -> None:
+    """Regression: invoking a function that returns a non-Void value (add(u32, u32) -> u32)
+    must succeed and produce a trace. Previously komet-node asserted the result against Void
+    (callTx(..., Void)), so any value-returning call got marked FAILED with no trace."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    def sign_and_xdr(tb: TransactionBuilder) -> str:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        return env.to_xdr()
+
+    def send(xdr_str: str) -> None:
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': xdr_str})
+        assert res['result']['status'] == 'PENDING'
+        tx_hash = res['result']['hash']
+        assert _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']['status'] == 'SUCCESS'
+
+    # Set up: create account, upload wasm, deploy the add contract
+    send(sign_and_xdr(builder().append_create_account_op(keypair.public_key, '1000')))
+
+    wasm_bytecode = wat_to_wasm(ADD_CONTRACT_WAT)
+    send(sign_and_xdr(builder().append_upload_contract_wasm_op(wasm_bytecode)))
+
+    from stellar_sdk.utils import sha256
+    wasm_hash = sha256(wasm_bytecode)
+    salt = b'\x00' * 32
+    send(sign_and_xdr(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt)))
+
+    # Invoke add(5, 6) -> 11 via traceTransaction
+    contract_address = server.interpreter.contract_address_from_deployer_address(keypair.public_key, salt)
+    invoke_xdr = sign_and_xdr(builder().append_invoke_contract_function_op(
+        contract_address,
+        'add',
+        [
+            xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(5)),
+            xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(6)),
+        ],
+    ))
+    result = _rpc(server.port(), 'traceTransaction', {'transaction': invoke_xdr})['result']
+
+    # Before the fix this came back as FAILED with trace == None ("returned no trace").
+    assert result['status'] == 'SUCCESS'
+    assert result['trace'] is not None
     lines = [line for line in result['trace'].splitlines() if line.strip()]
     assert len(lines) > 0
     import json as _json

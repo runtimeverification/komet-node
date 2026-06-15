@@ -7,9 +7,7 @@ from io import BytesIO
 from typing import TYPE_CHECKING, NamedTuple
 
 from komet.kast.syntax import (
-    SC_VOID,
     account_id,
-    call_tx,
     contract_id,
     deploy_contract,
     set_account,
@@ -17,13 +15,15 @@ from komet.kast.syntax import (
     steps_of,
     upload_wasm,
 )
-from pyk.kast.inner import KSort
+from pyk.kast.inner import KApply, KSort
+from pyk.kast.prelude.collections import list_of
 from pyk.kast.manip import Subst, split_config_from
 from pyk.konvert import kast_to_kore, kore_to_kast
 from pyk.kore.parser import KoreParser
 from pyk.kore.prelude import str_dv
 from pyk.kore.syntax import App, Pattern
 from pyk.ktool.krun import KRunOutput, _krun
+from pykwasm.kwasm_ast import wasm_string
 from pykwasm.wasm2kast import wasm2kast
 from stellar_sdk import Network, StrKey, xdr
 from stellar_sdk.operation import CreateAccount, InvokeHostFunction
@@ -50,6 +50,13 @@ REQUEST_FILE = 'request.json'
 
 
 _TRACE_FILE = 'trace.jsonl'
+
+
+def call_tx_no_check(from_addr: KInner, to_addr: KInner, func: str, args: Iterable[KInner]) -> KInner:
+    # Builds the `callTxNoCheck` step, a variant of komet's `callTx` that skips the
+    # transaction-result check. The corresponding K symbol/rule is defined locally in
+    # `kdist/node.md` (the NODE module), so this is intentionally not imported from komet.
+    return KApply('callTxNoCheck', [from_addr, to_addr, wasm_string(func), list_of(args)])
 
 
 class InterpreterResponse(NamedTuple):
@@ -243,12 +250,11 @@ class NodeInterpreter:
         assert dest_contract_id is not None, f'Contract address is None in invoke operation: {invoke}'
         callee_addr = contract_id(dest_contract_id.contract_id.hash)
 
-        step = call_tx(
+        step = call_tx_no_check(
             from_addr=self.address_to_kast(caller.universal_account_id),
             to_addr=callee_addr,
             func=invoke.function_name.sc_symbol.decode('ascii'), # TODO not sure if ascii is the correct encoding
             args=[scvalue_from_xdr(a).to_kast() for a in invoke.args],
-            result=SC_VOID, # This field is used for checking the tx result in komet. we should make it optional in komet semantics.
         )
         return [step]
 

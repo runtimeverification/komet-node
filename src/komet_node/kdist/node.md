@@ -38,6 +38,25 @@ module NODE
         <ledgerSequenceNumber> _ => SEQ </ledgerSequenceNumber>
 ```
 
+callTxNoCheck: a variant of KASMER's `callTx` that invokes a contract but does not
+check the transaction result against an expected `ScVal`. The node decodes every incoming
+`callTx` request to this step (see `#decodeStep` below), since responses are reported back
+to the caller rather than asserted in the semantics.
+
+```k
+    syntax Step ::= callTxNoCheck(from: Address, to: Address, func: WasmString, args: List)  [symbol(callTxNoCheck)]
+ // ---------------------------------------------------------------------------------------------------------------
+    rule [callTxNoCheck]:
+        <k> callTxNoCheck(FROM, TO, FUNC, ARGS)
+         => allocObjects(ARGS)
+         ~> callContractFromStack(FROM, TO, FUNC)
+         ~> #resetHost
+            ...
+        </k>
+        // clear the host cell before contract calls
+        (_:HostCell => <host> <hostStack> .HostStack </hostStack> ... </host>)
+```
+
 HexBytes: decode a lowercase hex string to Bytes (big-endian, length = hex length / 2).
 Relies on K's String2Base hook (base-16) and Int2Bytes with an explicit byte count so that
 leading zero bytes are preserved.
@@ -148,10 +167,10 @@ SCVal arg encoding (key order also significant):
         => deployContract(Account(HexBytes(FROM)), Contract(HexBytes(ADDR)), HexBytes(HASH))
 
     rule #decodeStep({ "op" : "callTx" , "from" : FROM:String , "fromIsContract" : false , "func" : FUNC:String , "to" : TO:String , "args" : [ARGS:JSONs] })
-        => callTx(Account(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""), #decodeArgList(ARGS), Void)
+        => callTxNoCheck(Account(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""), #decodeArgList(ARGS))
 
     rule #decodeStep({ "op" : "callTx" , "from" : FROM:String , "fromIsContract" : true , "func" : FUNC:String , "to" : TO:String , "args" : [ARGS:JSONs] })
-        => callTx(Contract(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""), #decodeArgList(ARGS), Void)
+        => callTxNoCheck(Contract(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""), #decodeArgList(ARGS))
 
     syntax List  ::= #decodeArgList(JSONs) [function]
     syntax ScVal ::= #decodeArg(JSON)      [function]
