@@ -45,8 +45,11 @@ RUN curl -fsSL "https://releases.nixos.org/nix/nix-${NIX_VERSION}/install" -o /t
 
 ENV PATH=/home/vscode/.nix-profile/bin:/home/vscode/.npm-global/bin:$PATH
 
-# Pin the `nixpkgs` flake to nixos-25.05 (matches the project's flake.nix), then
-# install only the container-level bootstrap/runtime tooling via Nix:
+# Point the `nixpkgs` flake registry at the nixos-25.05 release branch (matching
+# the project's flake.nix) — a stable channel, though not a frozen revision; it
+# only governs the container-level bootstrap tooling below, while the project
+# toolchain is pinned reproducibly via flake.nix/flake.lock. Then install only
+# that container-level bootstrap/runtime tooling via Nix:
 #   - direnv + nix-direnv → auto-load and cache the flake's `nix develop` shell on
 #                           entry to /workspace; this is what actually provides the
 #                           project toolchain (python, uv, make, wabt, K Framework),
