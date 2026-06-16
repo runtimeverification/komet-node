@@ -1,0 +1,17 @@
+# Build context hygiene: keep local dev cruft out of the Docker image.
+# Anything the package actually needs (src/, pyproject.toml, uv.lock) is kept.
+.git
+.github
+.devcontainer
+.direnv
+.venv
+.mypy_cache
+.pytest_cache
+**/__pycache__
+*.pyc
+dist
+cov-*
+.coverage
+result
+result-*
+state.kore
