@@ -20,9 +20,9 @@ jobs:
           set -x
           VERSION=v$(cat package/version)
           gh release create "${VERSION}"                \
-            --repo runtimeverification/komet-node        \
+            --repo "${GITHUB_REPOSITORY}"               \
             --draft                                     \
-            --title ${VERSION}                          \
+            --title "${VERSION}"                        \
             --target ${{ github.sha }}
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
@@ -82,8 +82,8 @@ jobs:
         run: |
           set -x
           VERSION=v$(cat package/version)
-          gh release delete ${VERSION}                  \
-            --repo runtimeverification/komet-node        \
+          gh release delete "${VERSION}"                  \
+            --repo "${GITHUB_REPOSITORY}"                \
             --yes                                       \
             --cleanup-tag
 
@@ -124,8 +124,8 @@ jobs:
         run: |
           set -x
           VERSION=v$(cat package/version)
-          gh release delete ${VERSION}                  \
-            --repo runtimeverification/komet-node        \
+          gh release delete "${VERSION}"                  \
+            --repo "${GITHUB_REPOSITORY}"                \
             --yes                                       \
             --cleanup-tag
 
@@ -146,6 +146,6 @@ jobs:
         run: |
           set -x
           VERSION=v$(cat package/version)
-          gh release edit ${VERSION}                    \
-            --repo runtimeverification/komet-node        \
+          gh release edit "${VERSION}"                    \
+            --repo "${GITHUB_REPOSITORY}"                 \
             --draft=false
