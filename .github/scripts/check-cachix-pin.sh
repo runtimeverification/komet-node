@@ -49,7 +49,15 @@ PIN_VISIBILITY_TIMEOUT_SECONDS=120 # 2 minutes
 PIN_VISIBILITY_INTERVAL_SECONDS=5  # 5 seconds
 PIN_VISIBILITY_ATTEMPTS=$((PIN_VISIBILITY_TIMEOUT_SECONDS / PIN_VISIBILITY_INTERVAL_SECONDS))
 for i in $(seq 1 "$PIN_VISIBILITY_ATTEMPTS"); do
-  PIN_JSON="$(curl -fsSL "${PIN_API_URL}?q=${REV}")"
+  # `|| true` keeps `set -e` from aborting the whole script on a transient
+  # network/API hiccup: an empty/failed response is treated as not-ready and
+  # retried, rather than failing the release outright.
+  PIN_JSON="$(curl -fsSL "${PIN_API_URL}?q=${REV}" || true)"
+  if [ -z "$PIN_JSON" ]; then
+    printf 'cachix-check-attempt-%s: pin-api-unreachable, retrying in %ss\n' "$i" "$PIN_VISIBILITY_INTERVAL_SECONDS" | summary_and_log
+    sleep "$PIN_VISIBILITY_INTERVAL_SECONDS"
+    continue
+  fi
   ALL_OK=1
 
   for PKG in "${CHECK_PACKAGES[@]}"; do

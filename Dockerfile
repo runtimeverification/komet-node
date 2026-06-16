@@ -13,16 +13,17 @@ FROM runtimeverificationinc/kframework-k:ubuntu-jammy-${K_VERSION}
 
 ARG PYTHON_VERSION=3.10
 
-RUN    apt-get -y update             \
-    && apt-get -y install            \
-         curl                        \
-         git                         \
-         graphviz                    \
-         python${PYTHON_VERSION}     \
-         python${PYTHON_VERSION}-dev \
-         python3-pip                 \
-         wabt                        \
-    && apt-get -y clean
+RUN    apt-get -y update                            \
+    && apt-get -y install --no-install-recommends   \
+         curl                                       \
+         git                                        \
+         graphviz                                   \
+         python${PYTHON_VERSION}                    \
+         python${PYTHON_VERSION}-dev                \
+         python3-pip                                \
+         wabt                                       \
+    && apt-get -y clean                             \
+    && rm -rf /var/lib/apt/lists/*
 
 ARG USER_ID=1010
 ARG GROUP_ID=1010
@@ -32,12 +33,14 @@ RUN    groupadd -g ${GROUP_ID} user \
 USER user
 WORKDIR /home/user
 
-ADD --chown=user:user . komet-node
+COPY --chown=user:user . komet-node
 
 ENV PATH=/home/user/.local/bin:${PATH}
 # Installs komet-node together with its dependencies (the `komet` package, which
 # carries the Soroban K semantics source, and the matching `kframework` pyk).
-RUN    pip install ./komet-node \
+# `--user` installs into ~/.local (already on PATH) and `--no-cache-dir` keeps
+# pip's download cache out of the image layer.
+RUN    pip install --no-cache-dir --user ./komet-node \
     && rm -rf komet-node
 
 # Pre-kompile the K semantics so the container is ready to serve immediately.

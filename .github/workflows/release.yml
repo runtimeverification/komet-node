@@ -39,7 +39,7 @@ jobs:
       - name: 'Check out code'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.push.head.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       # Build the komet-node derivation once, then push it to both the public
@@ -51,6 +51,10 @@ jobs:
         uses: workflow/nix-shell-action@v3
         env:
           GC_DONT_GC: '1'
+          # Enable flakes for every nix invocation in this step (the initial
+          # build, the kup build, and the builds kup runs internally) so the
+          # job does not depend on flakes being globally enabled on the runner.
+          NIX_CONFIG: 'extra-experimental-features = nix-command flakes'
           CACHIX_PUBLIC_TOKEN: '${{ secrets.CACHIX_PUBLIC_TOKEN }}'
           CACHIX_PRIVATE_KFB_TOKEN: '${{ secrets.CACHIX_PRIVATE_KFB_TOKEN }}'
           OWNER_REPO: '${{ github.repository }}'
@@ -58,7 +62,7 @@ jobs:
         with:
           packages: jq
           script: |
-            KOMET_NODE=$(nix build --extra-experimental-features 'nix-command flakes' .#komet-node --json | jq -r '.[].outputs | to_entries[].value')
+            KOMET_NODE=$(nix build .#komet-node --json | jq -r '.[].outputs | to_entries[].value')
             DRV=$(nix-store --query --deriver ${KOMET_NODE})
 
             # Push the full build closure to the public k-framework cache.
@@ -93,7 +97,7 @@ jobs:
       - name: 'Check out code'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.push.head.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: 'Set environment'
@@ -135,7 +139,7 @@ jobs:
       - name: 'Check out code'
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.push.head.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
 
       - name: 'Finalize Release'
