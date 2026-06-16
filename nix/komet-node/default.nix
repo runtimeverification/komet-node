@@ -32,9 +32,9 @@ let
 
   # create overlay
   lockFileOverlay = workspace.mkPyprojectOverlay {
-    # prefer "wheel" over "sdist" due to maintance overhead
-    # there is no bundled set of overlays for "sdist" in uv2nix, in contrast to poetry2nix
-    sourcePreference = "wheel";
+    # prefer sdist to avoid evaluating unsupported wheel arches in nixpkgs
+    # (e.g., manylinux riscv64 tags), which can break CI evaluation.
+    sourcePreference = "sdist";
   };
 
   buildSystemsOverlay = import ./build-systems-overlay.nix;
