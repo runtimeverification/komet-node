@@ -40,11 +40,12 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
 
-      # Build the komet-node derivation once, then push it to both the public
-      # k-framework cache (full build closure, via `cachix push`) and the
-      # private k-framework-binary cache (the kup-installable binary, via
-      # `kup publish`). Both pushes reuse the build output already present in
-      # this runner's Nix store, so the derivation is never built twice.
+      # Build the komet-node derivation once, then push it to the public
+      # k-framework cache (full build closure, via `cachix push`). If
+      # CACHIX_PRIVATE_KFB_TOKEN is configured, also publish the kup-installable
+      # binary to the private k-framework-binary cache. All pushes reuse the
+      # build output already present in this runner's Nix store, so the
+      # derivation is never built twice.
       - name: 'Build and publish komet-node to both Nix caches'
         uses: workflow/nix-shell-action@v3
         env:
@@ -67,13 +68,18 @@ jobs:
             export CACHIX_AUTH_TOKEN="${CACHIX_PUBLIC_TOKEN}"
             nix-store --query --requisites --include-outputs ${DRV} | cachix push k-framework
 
-            # Publish the binary to the private k-framework-binary cache. kup
-            # reuses the store paths built above.
-            export CACHIX_AUTH_TOKEN="${CACHIX_PRIVATE_KFB_TOKEN}"
-            export PATH="$(nix build github:runtimeverification/kup --no-link --json | jq -r '.[].outputs | to_entries[].value')/bin:$PATH"
-            kup publish k-framework-binary .#komet-node --keep-days 180
-            # Cachix has not been responding to 'cachix pin' requests made under the hood by kup. Verify the push and pin manually.
-            .github/scripts/check-cachix-pin.sh
+            # Publish the binary to the private k-framework-binary cache when
+            # the private cache token is available. kup reuses the store paths
+            # built above.
+            if [ -n "${CACHIX_PRIVATE_KFB_TOKEN}" ]; then
+              export CACHIX_AUTH_TOKEN="${CACHIX_PRIVATE_KFB_TOKEN}"
+              export PATH="$(nix build github:runtimeverification/kup --no-link --json | jq -r '.[].outputs | to_entries[].value')/bin:$PATH"
+              kup publish k-framework-binary .#komet-node --keep-days 180
+              # Cachix has not been responding to 'cachix pin' requests made under the hood by kup. Verify the push and pin manually.
+              .github/scripts/check-cachix-pin.sh
+            else
+              echo "CACHIX_PRIVATE_KFB_TOKEN is not set; skipping k-framework-binary publish."
+            fi
 
       - name: 'On failure, delete drafted release'
         if: failure()
