@@ -32,7 +32,7 @@ let
 
   # create overlay
   lockFileOverlay = workspace.mkPyprojectOverlay {
-    # prefer sdist to avoid evaluating unsupported wheel arches in nixpkgs
+    # prefer sdist to avoid evaluating unsupported wheel architectures in nixpkgs
     # (e.g., manylinux riscv64 tags), which can break CI evaluation.
     sourcePreference = "sdist";
   };
