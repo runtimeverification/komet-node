@@ -313,14 +313,17 @@
     "pyproject-build-systems_2": {
       "inputs": {
         "nixpkgs": [
+          "k-framework",
           "uv2nix",
           "nixpkgs"
         ],
         "pyproject-nix": [
+          "k-framework",
           "uv2nix",
           "pyproject-nix"
         ],
         "uv2nix": [
+          "k-framework",
           "uv2nix"
         ]
       },
@@ -361,27 +364,6 @@
         "type": "github"
       }
     },
-    "pyproject-nix_2": {
-      "inputs": {
-        "nixpkgs": [
-          "uv2nix",
-          "nixpkgs"
-        ]
-      },
-      "locked": {
-        "lastModified": 1745782090,
-        "narHash": "sha256-c/mqxgOVDcwrdcY3FqG22MwLPGY5rCz5gte1sxISKnM=",
-        "owner": "pyproject-nix",
-        "repo": "pyproject.nix",
-        "rev": "2db2d95ddbc4ff5e29730cb82fdba6647be258a7",
-        "type": "github"
-      },
-      "original": {
-        "owner": "pyproject-nix",
-        "repo": "pyproject.nix",
-        "type": "github"
-      }
-    },
     "rapidjson-src": {
       "flake": false,
       "locked": {
@@ -410,11 +392,15 @@
         "nixpkgs-unstable": "nixpkgs-unstable",
         "pyproject-build-systems": "pyproject-build-systems_2",
         "pyproject-nix": [
+          "k-framework",
           "uv2nix",
           "pyproject-nix"
         ],
         "rv-nix-tools": "rv-nix-tools",
-        "uv2nix": "uv2nix_2"
+        "uv2nix": [
+          "k-framework",
+          "uv2nix"
+        ]
       }
     },
     "rv-nix-tools": {
@@ -554,26 +540,6 @@
         "owner": "pyproject-nix",
         "repo": "uv2nix",
         "rev": "9d357f0d2ce6f5f35ec7959d7e704452352eb4da",
-        "type": "github"
-      }
-    },
-    "uv2nix_2": {
-      "inputs": {
-        "nixpkgs": "nixpkgs-unstable",
-        "pyproject-nix": "pyproject-nix_2"
-      },
-      "locked": {
-        "lastModified": 1746048139,
-        "narHash": "sha256-LdCLyiihLg6P2/mjzP0+W7RtraDSIaJJPTy6SCtW5Ag=",
-        "owner": "pyproject-nix",
-        "repo": "uv2nix",
-        "rev": "680e2f8e637bc79b84268949d2f2b2f5e5f1d81c",
-        "type": "github"
-      },
-      "original": {
-        "owner": "pyproject-nix",
-        "repo": "uv2nix",
-        "rev": "680e2f8e637bc79b84268949d2f2b2f5e5f1d81c",
         "type": "github"
       }
     },
