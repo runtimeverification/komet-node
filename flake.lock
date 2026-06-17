@@ -403,12 +403,17 @@
       "inputs": {
         "flake-utils": "flake-utils",
         "k-framework": "k-framework",
-        "nixpkgs": "nixpkgs_3",
+        "nixpkgs": [
+          "rv-nix-tools",
+          "nixpkgs"
+        ],
+        "nixpkgs-unstable": "nixpkgs-unstable",
         "pyproject-build-systems": "pyproject-build-systems_2",
         "pyproject-nix": [
           "uv2nix",
           "pyproject-nix"
         ],
+        "rv-nix-tools": "rv-nix-tools",
         "uv2nix": "uv2nix_2"
       }
     },
@@ -554,7 +559,7 @@
     },
     "uv2nix_2": {
       "inputs": {
-        "nixpkgs": "nixpkgs_4",
+        "nixpkgs": "nixpkgs-unstable",
         "pyproject-nix": "pyproject-nix_2"
       },
       "locked": {
