@@ -122,29 +122,6 @@ jobs:
           # Log in to Docker Hub
           echo "${DOCKERHUB_PASSWORD}" | docker login --username "${DOCKERHUB_USERNAME}" --password-stdin
 
-          # Ensure the Docker Hub repository exists (create if missing).
-          # Obtain a Docker Hub JWT for API access.
-          TOKEN=$(curl -s -H "Content-Type: application/json" \
-            -X POST -d "{\"username\":\"${DOCKERHUB_USERNAME}\",\"password\":\"${DOCKERHUB_PASSWORD}\"}" \
-            https://hub.docker.com/v2/users/login/ | jq -r '.token // empty')
-          if [ -z "${TOKEN}" ]; then
-            echo "::warning::Failed to obtain Docker Hub API token; skipping repo creation"
-          else
-            HTTP_CODE=$(curl -s -o /tmp/dockerhub-response.json -w "%{http_code}" \
-              -H "Authorization: JWT ${TOKEN}" \
-              -H "Content-Type: application/json" \
-              -X POST \
-              -d "{\"namespace\":\"${DOCKERHUB_NAMESPACE}\",\"name\":\"${DOCKERHUB_REPO}\",\"is_private\":false,\"description\":\"Komet Node — local Stellar testnet backed by K semantics\"}" \
-              "https://hub.docker.com/v2/repositories/")
-            if [ "${HTTP_CODE}" = "201" ]; then
-              echo "Docker Hub repository created successfully"
-            elif [ "${HTTP_CODE}" = "409" ]; then
-              echo "Docker Hub repository already exists"
-            else
-              echo "::warning::Docker Hub repo creation returned HTTP ${HTTP_CODE}: $(cat /tmp/dockerhub-response.json)"
-            fi
-          fi
-
           # Push the image
           docker image push ${TAG}
 
