@@ -85,7 +85,7 @@ jobs:
           gh release delete "${VERSION}"                  \
             --repo "${GITHUB_REPOSITORY}"                \
             --yes                                       \
-            --cleanup-tag
+            --cleanup-tag || true
 
   dockerhub:
     name: 'Build and Publish Docker Image'
@@ -135,7 +135,7 @@ jobs:
           gh release delete "${VERSION}"                  \
             --repo "${GITHUB_REPOSITORY}"                \
             --yes                                       \
-            --cleanup-tag
+            --cleanup-tag || true
 
   cut-release:
     name: 'Cut Release'
