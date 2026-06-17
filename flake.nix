@@ -10,11 +10,11 @@
     # nixpkgs is intentionally NOT followed, so the k-framework binary caches
     # are hit instead of rebuilding K against our nixpkgs.
     k-framework.url = "github:runtimeverification/k/v7.1.319";
-    uv2nix.url = "github:pyproject-nix/uv2nix/680e2f8e637bc79b84268949d2f2b2f5e5f1d81c";
-    # uv2nix requires a newer nixpkgs; we use nixpkgs-unstable as the primary
-    # package set to keep all Python packaging / PEP 600 logic coherent.
+    # Use the same uv2nix as k-framework so we inherit the pyproject-nix version
+    # that fixes the missing 'riscv64' attribute in pep600.nix (pep599.manyLinuxTargetMachines
+    # lookup now uses `or tagArch` as a safe default for unknown architectures).
+    uv2nix.follows = "k-framework/uv2nix";
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
-    uv2nix.inputs.nixpkgs.follows = "nixpkgs-unstable";
     pyproject-build-systems.url = "github:pyproject-nix/build-system-pkgs/7dba6dbc73120e15b558754c26024f6c93015dd7";
     pyproject-build-systems = {
       inputs.nixpkgs.follows = "uv2nix/nixpkgs";
@@ -39,11 +39,8 @@
           python = final."python${pythonVer}";
         };
       };
-      # Use nixpkgs-unstable directly to ensure the Python packaging / PEP 600
-      # evaluation path (including lib/pep600.nix) is coherent with uv2nix.
-      # The old approach of importing a pinned nixpkgs and patching in a partial
-      # compatibility overlay was insufficient on ARM64 where pep600.nix expects
-      # manyLinuxTargetMachines.riscv64 which the older revision lacked.
+      # Use nixpkgs-unstable for the package set so the Python environment is
+      # built against a modern stdenv on all platforms.
       pkgs = import nixpkgs-unstable {
         inherit system;
         overlays = [
