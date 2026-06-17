@@ -23,7 +23,7 @@
     };
     pyproject-nix.follows = "uv2nix/pyproject-nix";
   };
-  outputs = { self, nixpkgs, nixpkgs-unstable, flake-utils, pyproject-nix, pyproject-build-systems, uv2nix, k-framework }:
+  outputs = { self, nixpkgs, nixpkgs-unstable, flake-utils, pyproject-nix, pyproject-build-systems, uv2nix, k-framework, rv-nix-tools }:
   let
     pythonVer = "310";
   in flake-utils.lib.eachDefaultSystem (system:
