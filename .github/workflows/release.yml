@@ -58,7 +58,7 @@ jobs:
           OWNER_REPO: '${{ github.repository }}'
           REV: '${{ github.sha }}'
         with:
-          packages: jq
+          packages: nixpkgs#jq
           script: |
             KOMET_NODE=$(nix build .#komet-node --json | jq -r '.[].outputs | to_entries[].value')
             DRV=$(nix-store --query --deriver ${KOMET_NODE})

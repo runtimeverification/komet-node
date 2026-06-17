@@ -11,8 +11,8 @@
     # are hit instead of rebuilding K against our nixpkgs.
     k-framework.url = "github:runtimeverification/k/v7.1.319";
     uv2nix.url = "github:pyproject-nix/uv2nix/680e2f8e637bc79b84268949d2f2b2f5e5f1d81c";
-    # uv2nix requires a newer version of nixpkgs, so pin it separately and
-    # overlay only the missing compatibility helpers into our main package set.
+    # uv2nix requires a newer nixpkgs; we use nixpkgs-unstable as the primary
+    # package set to keep all Python packaging / PEP 600 logic coherent.
     nixpkgs-unstable.url = "github:NixOS/nixpkgs/nixos-unstable";
     uv2nix.inputs.nixpkgs.follows = "nixpkgs-unstable";
     pyproject-build-systems.url = "github:pyproject-nix/build-system-pkgs/7dba6dbc73120e15b558754c26024f6c93015dd7";
@@ -28,17 +28,8 @@
     pythonVer = "310";
   in flake-utils.lib.eachDefaultSystem (system:
     let
-      pkgs-unstable = import nixpkgs-unstable {
-        inherit system;
-      };
-      staleNixpkgsOverlay = final: prev: {
-        inherit (pkgs-unstable) replaceVars;
-        lib = prev.lib // {
-          match = builtins.match;
-        };
-      };
-      # due to the nixpkgs that we use in this flake being outdated, uv is also heavily outdated
-      # we can instead use the binary release of uv provided by uv2nix for now
+      # uv is heavily outdated in older nixpkgs revisions; use the binary
+      # release of uv provided by uv2nix instead.
       uvOverlay = final: prev: {
         uv = uv2nix.packages.${final.system}.uv-bin;
       };
@@ -48,10 +39,14 @@
           python = final."python${pythonVer}";
         };
       };
-      pkgs = import nixpkgs {
+      # Use nixpkgs-unstable directly to ensure the Python packaging / PEP 600
+      # evaluation path (including lib/pep600.nix) is coherent with uv2nix.
+      # The old approach of importing a pinned nixpkgs and patching in a partial
+      # compatibility overlay was insufficient on ARM64 where pep600.nix expects
+      # manyLinuxTargetMachines.riscv64 which the older revision lacked.
+      pkgs = import nixpkgs-unstable {
         inherit system;
         overlays = [
-          staleNixpkgsOverlay
           uvOverlay
           komet-nodeOverlay
         ];
