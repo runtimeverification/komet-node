@@ -54,7 +54,7 @@ jobs:
           # job does not depend on flakes being globally enabled on the runner.
           NIX_CONFIG: 'extra-experimental-features = nix-command flakes'
           CACHIX_PUBLIC_TOKEN: '${{ secrets.CACHIX_PUBLIC_TOKEN }}'
-          CACHIX_PRIVATE_TOKEN: '${{ secrets.CACHIX_PRIVATE_TOKEN }}'
+          CACHIX_PRIVATE_KFB_TOKEN: '${{ secrets.CACHIX_PRIVATE_KFB_TOKEN }}'
           OWNER_REPO: '${{ github.repository }}'
           REV: '${{ github.sha }}'
         run: |
@@ -67,7 +67,7 @@ jobs:
 
           # Publish the binary to the private k-framework-binary cache. kup
           # reuses the store paths built above.
-          export CACHIX_AUTH_TOKEN="${CACHIX_PRIVATE_TOKEN}"
+          export CACHIX_AUTH_TOKEN="${CACHIX_PRIVATE_KFB_TOKEN}"
           export PATH="$(nix build github:runtimeverification/kup --no-link --print-out-paths)/bin:$PATH"
           kup publish k-framework-binary .#komet-node --keep-days 180
           # Cachix has not been responding to 'cachix pin' requests made under the hood by kup. Verify the push and pin manually.
