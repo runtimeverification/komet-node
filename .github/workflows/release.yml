@@ -71,7 +71,7 @@ jobs:
           export PATH="$(nix build github:runtimeverification/kup --no-link --print-out-paths)/bin:$PATH"
           kup publish k-framework-binary .#komet-node --keep-days 180
           # Cachix has not been responding to 'cachix pin' requests made under the hood by kup. Verify the push and pin manually.
-          .github/scripts/check-cachix-pin.sh
+          bash .github/scripts/check-cachix-pin.sh
 
       - name: 'On failure, delete drafted release'
         if: failure()
