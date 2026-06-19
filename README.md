@@ -16,21 +16,13 @@
 
 ## 🌟 Overview
 
-`komet-node` is designed for Soroban developers who need advanced debugging capabilities. It extends the standard Stellar RPC with a `traceTransaction` method that provides instruction-level execution traces. The node's ledger state can be saved to and restored from a single file, enabling developers to reproduce exact network conditions and deterministically replay transactions.
+`komet-node` extends the standard Stellar RPC with a `traceTransaction` method that provides instruction-level execution traces. The node's ledger state can be saved to and restored from a single file, allowing the same ledger state to be reproduced and transactions to be replayed.
 
 ## 🚀 Quick Start
 
 ### Installation
 
-Pick the method that matches how you intend to use `komet-node`:
-
-| You are a… | Use |
-|---|---|
-| User who wants the `komet-node` binary | [**kup**](#install-with-kup-recommended) (recommended) |
-| User who prefers containers | [**Docker**](#run-with-docker) |
-| Developer hacking on `komet-node` | [**Dev Container**](#develop-with-the-dev-container) |
-
-#### Install with kup (recommended)
+#### Install with kup
 
 `komet-node` is distributed through [`kup`](https://github.com/runtimeverification/kup), Runtime Verification's Nix-based package manager. It pulls prebuilt binaries (including the matching K Framework and kompiled semantics) from RV's binary cache, so there is nothing to compile.
 
@@ -49,7 +41,7 @@ To upgrade later, run `kup update komet-node`.
 
 #### Run with Docker
 
-A prebuilt image is published to Docker Hub for each release. It bundles K, the kompiled semantics, and `komet-node` ready to serve.
+Alternatively, a prebuilt image is published to Docker Hub for each release. It bundles K, the kompiled semantics, and `komet-node` ready to serve.
 
 ```bash
 # Pull the image (replace the tag with the release you want)
@@ -87,7 +79,7 @@ On first start the server creates an empty `state.kore`. Delete that file to res
 
 #### Verify the server with `curl`
 
-The server is operated via the Stellar RPC protocol. The read-only methods below take no transaction payload, which makes them perfect for a quick health check:
+The server is operated via the Stellar RPC protocol. The read-only methods below take no transaction payload and can be used as a quick health check:
 
 ```bash
 # Is the server alive?
@@ -113,23 +105,60 @@ curl -s http://localhost:8000 \
 # => {"jsonrpc":"2.0","id":1,"result":{"id":"00...00","protocolVersion":"22","sequence":0}}
 ```
 
-Submitting transactions uses the standard two-step Stellar pattern — `sendTransaction` with a base64 XDR envelope, then poll `getTransaction` by hash:
+Submitting transactions uses the standard two-step Stellar pattern — `sendTransaction` with a base64 XDR envelope, then poll `getTransaction` by hash. Because there is no mempool, `komet-node` executes the transaction synchronously inside `sendTransaction`, so the result is already available by the time you poll. The trace example below shows this flow end-to-end with ready-to-run envelopes; see [docs/server.md](docs/server.md) for the full RPC reference.
+
+#### Trace a transaction
+
+`traceTransaction` executes a transaction and returns an instruction-level execution trace inline, in a single call. Tracing only applies to contract invocations, so the server must be started with `--trace`:
 
 ```bash
-# Submit a signed transaction (XDR envelope produced by a Stellar SDK)
-curl -s http://localhost:8000 \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":{"transaction":"<base64-XDR-envelope>"}}'
-# => {... "result":{"hash":"<64-char hex>","status":"PENDING", ...}}
-
-# Poll for the result using the returned hash
-curl -s http://localhost:8000 \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getTransaction","params":{"hash":"<64-char hex>"}}'
-# => {... "result":{"status":"SUCCESS","ledger":"1", ...}}
+komet-node --trace
 ```
 
-Because there is no mempool, `komet-node` executes the transaction synchronously inside `sendTransaction`; the result is already available by the time you poll. See [docs/server.md](docs/server.md) for the full RPC reference, including the `traceTransaction` method.
+A trace requires a deployed contract. The four envelopes below are pre-built and signed (a tiny contract whose `foo()` returns void, deployed from a fixed key) so you can paste them straight in — the local node does not check signatures, sequence numbers, or timebounds, so they work as-is on a fresh chain. Run them in order against the server above.
+
+```bash
+# 1. Create the deployer account
+curl -s http://localhost:8000 -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":{"transaction":"AAAAAgAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAGQAAAAAAAAAAQAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAAJUC+QAAAAAAAAAAAESVTG4AAAAQMOMXdUuK9E9tF0pgpqX+z+nXFlE6Mn5e7rqOFL8jIolInsXc7XHPgvYs4VWDqlCGI/fom9SpYiHOQYUqKTvDAc="}}'
+
+# 2. Upload the contract wasm
+curl -s http://localhost:8000 -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":{"transaction":"AAAAAgAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAGQAAAAAAAAAAgAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAGAAAAAIAAABzAGFzbQEAAAABCAJgAAF+YAAAAwMCAAEFAwEAEAYZA38BQYCAwAALfwBBgIDAAAt/AEGAgMAACwcvBQZtZW1vcnkCAANmb28AAAFfAAEKX19kYXRhX2VuZAMBC19faGVhcF9iYXNlAwIKCQIEAEICCwIACwAAAAAAAAAAAAAAAAESVTG4AAAAQOk89R0Qlko4dCBI3XziT3XTjdm4kyKtpy9ky3uVksIYsSFWXKHTHOiCDaxNKdecQKbhQnD/9ELWxxr98D5ecQ4="}}'
+
+# 3. Deploy a contract instance
+curl -s http://localhost:8000 -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":{"transaction":"AAAAAgAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAGQAAAAAAAAAAwAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAGAAAAAMAAAAAAAAAAAAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFdPOLtg6vmmrgodRyN6P3wk1UfHrQxVekpbnsYYOcpvAAAAAAAAAAAAAAAAAAAAARJVMbgAAABAnLtNirBI7XdD2xwH3ws3rTDEhCxJ8mCRNU66d7b4MR2Ih9WtZzqb6akBqK6yA1GIavzVa7ahq2FNBflk+JpOBg=="}}'
+
+# 4. Invoke foo() via traceTransaction — the trace comes back inline
+curl -s http://localhost:8000 -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"traceTransaction","params":{"transaction":"AAAAAgAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAGQAAAAAAAAABAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAGAAAAAAAAAABaiD+wakIF3Ol8jzjcPkl8jY0blEEON3W1A9rJxHBNOAAAAADZm9vAAAAAAAAAAAAAAAAAAAAAAESVTG4AAAAQKB9w/QmdK59UzXVbxXJp+5qfNpFSa495yajOyPM5KmYblE3/AbWqnnZMxTiBea0ShGZehgvo12AIyw48Lb1Xw0="}}'
+```
+
+The final call returns the result inline. The `trace` field is itself a JSONL string (one JSON record per executed WebAssembly instruction); it is shown decoded here for readability:
+
+```jsonc
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "hash": "c7099cbe10a9bfa1cdf9c9d368e1e1c932f535a70e4403b7aa409ce19fc36805",
+    "status": "SUCCESS",
+    "ledger": "4",
+    "latestLedger": "4",
+    "latestLedgerCloseTime": "1716000000",
+    "trace": [
+      {"pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
+      {"pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
+      {"pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
+      {"pos": null, "instr": ["block"],                 "stack": [], "locals": {}},
+      {"pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}}
+    ]
+  }
+}
+```
+
+Each trace record captures the VM state at instruction entry: `pos` is the instruction's byte offset in the binary (`null` for synthetic instructions), `instr` is the instruction and its operands, and `stack`/`locals` are the value stack and locals as `[type, value]` pairs. See [docs/interpreter.md](docs/interpreter.md) for the full trace format.
 
 #### Walk through a contract lifecycle
 
