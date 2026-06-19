@@ -21,14 +21,11 @@ stdenv.mkDerivation {
   pname = "komet-node";
   version = if (rev != null) then rev else "dirty";
 
-  outputs = [
-    "bin"
-    # contains kdist artifacts (the compiled K semantics)
-    "out"
-    # this empty `dev` output is required as we otherwise get cyclic dependencies between `bin` and `out`
-    # this is due to a setup-hook creating references in a new directory `nix-support` in either `out` or `dev`
-    "dev"
-  ];
+  # Single `out` output holding both the wrapper (`$out/bin/komet-node`) and the
+  # compiled semantics (`$out/kdist`). `kup publish`/`kup install` operate on the
+  # output literally named `out`, so the runnable artifact must live there. Keeping
+  # everything in one output also sidesteps the cross-output reference cycle that
+  # forces a separate `bin`/`dev` split (a wrapper in `$bin` referencing `$out`).
 
   # The K sources for every kdist target (`soroban-semantics.*` from the `komet`
   # dependency and `komet-node.*` from this project) ship inside `komet-node-pyk`,
@@ -75,14 +72,14 @@ stdenv.mkDerivation {
 
   installPhase = ''
     runHook preInstall
-    mkdir -p $bin/bin
+    mkdir -p $out/bin
     mkdir -p $out/kdist
 
     cp -r ./kdist-*/* $out/kdist/
 
     # Wrap the `komet-node` entrypoint so that, at runtime, it finds the compiled
     # semantics via `KDIST_DIR` and the K tools (krun/kore) via `PATH`.
-    makeWrapper ${komet-node-pyk}/bin/komet-node $bin/bin/komet-node \
+    makeWrapper ${komet-node-pyk}/bin/komet-node $out/bin/komet-node \
       --prefix PATH : ${lib.makeBinPath [ which k ]} \
       --set KDIST_DIR $out/kdist
     runHook postInstall
