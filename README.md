@@ -8,7 +8,7 @@
 [![Install](https://img.shields.io/badge/install-kup-blue)](https://kframework.org/install)
 [![Discord](https://img.shields.io/badge/discord-join-7289da)](https://discord.gg/CurfmXNtbN)
 
-[Installation](#installation) • [Usage](#usage) • [Contribute](#for-developers) • [Community](https://discord.gg/CurfmXNtbN)
+[Installation](#installation) • [Usage](#usage) • [Contribute](#for-developers)
 
 </div>
 
