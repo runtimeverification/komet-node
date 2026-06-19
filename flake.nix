@@ -33,18 +33,45 @@
       uvOverlay = final: prev: {
         uv = uv2nix.packages.${final.system}.uv-bin;
       };
-      komet-nodeOverlay = final: prev: {
-        komet-node = final.callPackage ./nix/komet-node {
+      # The k-framework overlay also pulls in a lot of unrelated packages, so we
+      # only expose the `k` binary that we actually consume.
+      kOverlay = final: prev: {
+        k = k-framework.packages.${final.system}.k;
+      };
+      komet-nodeOverlay = final: prev:
+      let
+        # The Python virtual environment, built against a modern stdenv from
+        # nixpkgs-unstable (see below). It carries the `komet-node` entrypoint
+        # together with the `kdist` tool and the K sources for every kdist target.
+        komet-node-pyk = pkgs.callPackage ./nix/komet-node-pyk {
           inherit pyproject-nix pyproject-build-systems uv2nix;
-          python = final."python${pythonVer}";
+          python = pkgs."python${pythonVer}";
+        };
+      in {
+        # Build the wrapper against `nixpkgs` (the RV-pinned package set that the K
+        # toolchain is built and tested against) rather than nixpkgs-unstable, so
+        # the C/C++ toolchain that kompiles the LLVM semantics matches `k`. The
+        # compiled semantics run as a subprocess (krun), so there is no ABI
+        # coupling with the nixpkgs-unstable Python environment.
+        komet-node = final.callPackage ./nix/komet-node {
+          inherit komet-node-pyk;
+          rev = self.rev or null;
         };
       };
-      # Use nixpkgs-unstable for the package set so the Python environment is
-      # built against a modern stdenv on all platforms.
+      # Use nixpkgs-unstable for the Python package set so the Python environment
+      # is built against a modern stdenv on all platforms.
       pkgs = import nixpkgs-unstable {
         inherit system;
         overlays = [
           uvOverlay
+        ];
+      };
+      # The native toolchain for kompiling the K semantics comes from the RV-pinned
+      # nixpkgs so it matches the `k` binary.
+      pkgsK = import nixpkgs {
+        inherit system;
+        overlays = [
+          kOverlay
           komet-nodeOverlay
         ];
       };
@@ -70,7 +97,7 @@
         '';
       };
       packages = rec {
-        inherit (pkgs) komet-node;
+        inherit (pkgsK) komet-node;
         default = komet-node;
       };
     }) // {
