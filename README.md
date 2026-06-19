@@ -8,7 +8,7 @@
 [![Install](https://img.shields.io/badge/install-kup-blue)](https://kframework.org/install)
 [![Discord](https://img.shields.io/badge/discord-join-7289da)](https://discord.gg/CurfmXNtbN)
 
-[Installation](#installation) • [Usage](#usage) • [Contribute](#for-developers)•  [Community](#community)
+[Installation](#installation) • [Usage](#usage) • [Contribute](#for-developers) • [Community](https://discord.gg/CurfmXNtbN)
 
 </div>
 
@@ -174,7 +174,7 @@ This produces `state.kore` plus `state_<n>_<step>.pretty` files under `./out`, l
 
 ## For Developers
 
-Prerequisites: `python >= 3.10`, [`uv`](https://docs.astral.sh/uv/), [`wabt`](https://github.com/WebAssembly/wabt) (for `wat2wasm`), and the K Framework. The [Dev Container](#develop-with-the-dev-container) provisions all of these for you.
+Prerequisites: `python >= 3.10`, [`uv`](https://docs.astral.sh/uv/), [`wabt`](https://github.com/WebAssembly/wabt) (for `wat2wasm`), and the K Framework. The [Dev Container](#for-developers) provisions all of these for you.
 
 1. Install [VS Code](https://code.visualstudio.com/) and the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers).
 2. Open this repository in VS Code and choose **Reopen in Container** when prompted.
