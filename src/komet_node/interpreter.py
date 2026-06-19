@@ -337,6 +337,10 @@ class NodeInterpreter:
         empty and request.json exists, reads the file, dispatches #handleRequest, then
         removes the file and halts — leaving the updated idle state as output.
         """
+        # Resolve to an absolute path before temp_working_directory() chdir's away,
+        # otherwise a relative state file (e.g. the default `state.kore`) would be
+        # looked up inside the temp dir and krun would fail with "File does not exist".
+        input_file = input_file.resolve()
         with temp_working_directory() as root:
             (root / REQUEST_FILE).write_text(request_str)
 
