@@ -24,8 +24,16 @@ _STROOPS_PER_XLM = Decimal('10000000')
 
 
 def _xlm_to_stroops(balance: object) -> int:
-    """Convert an XLM amount (which may carry decimals) to integer stroops."""
-    return int(Decimal(str(balance)) * _STROOPS_PER_XLM)
+    """Convert an XLM amount (which may carry up to 7 decimals) to integer stroops.
+
+    Stellar balances are denominated in stroops (1 XLM = 10^7 stroops), so an amount with
+    more than 7 decimal places cannot be represented exactly. Reject it rather than silently
+    truncating toward zero, which would put an incorrect balance on the ledger.
+    """
+    stroops = Decimal(str(balance)) * _STROOPS_PER_XLM
+    if stroops != stroops.to_integral_value():
+        raise NodeInterpreterError(f'XLM amount has sub-stroop precision: {balance!r}')
+    return int(stroops)
 
 
 class TransactionEncoder:

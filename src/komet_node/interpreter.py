@@ -33,12 +33,17 @@ def _llvm_interpret(definition_dir: Path, pattern: Pattern, *, cwd: Path | None 
     file-system hooks resolve their relative paths against the subprocess cwd, so the io-dir
     files are found without mutating the parent process's global cwd — which would otherwise
     race other threads (e.g. the server runs in a background thread in the tests).
+
+    The interpreter is run with ``check=True``: both a successful request and a failed
+    (stuck) transaction exit 0 — failure is signalled by the absence of ``response.json``,
+    not by the exit code — so a non-zero exit can only mean a genuine interpreter error,
+    which we surface rather than silently parsing whatever it emitted.
     """
     interpreter_file = definition_dir / 'interpreter'
     check_file_path(interpreter_file)
     args = [str(interpreter_file), '/dev/stdin', '-1', '/dev/stdout']
     try:
-        res = run_process_2(args, input=pattern.text, cwd=cwd, check=False)
+        res = run_process_2(args, input=pattern.text, cwd=cwd, check=True)
     except CalledProcessError as err:
         raise NodeInterpreterError(f'Interpreter failed with status {err.returncode}: {err.stderr}', err) from err
     if not res.stdout:

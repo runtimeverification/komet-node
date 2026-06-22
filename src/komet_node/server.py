@@ -108,11 +108,20 @@ class StellarRpcServer:
         if not isinstance(req, dict):
             return _error_bytes(None, -32600, 'Invalid Request')
         request_id = req.get('id')
+
+        # Validate the JSON-RPC frame before dispatch (JSON-RPC 2.0):
+        #   - wrong/missing protocol version or a non-string method => Invalid Request
+        #   - params, if present, must be a structured (object) value => else Invalid params
+        if req.get('jsonrpc') != '2.0' or not isinstance(req.get('method'), str):
+            return _error_bytes(request_id, -32600, 'Invalid Request')
         params = req.get('params')
+        if params is None:
+            params = {}
+        elif not isinstance(params, dict):
+            return _error_bytes(request_id, -32602, 'Invalid params')
+
         try:
-            return self.handle_rpc(req.get('method'), params if isinstance(params, dict) else {}, request_id).encode(
-                'utf-8'
-            )
+            return self.handle_rpc(req['method'], params, request_id).encode('utf-8')
         except Exception:
             # A malformed request must never take down the server thread.
             return _error_bytes(request_id, -32603, 'Internal error')

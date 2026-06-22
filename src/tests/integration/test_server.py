@@ -123,6 +123,26 @@ def test_non_object_frame_returns_invalid_request(server: StellarRpcServer) -> N
     assert result['error']['code'] == -32600
 
 
+def test_missing_method_returns_invalid_request(server: StellarRpcServer) -> None:
+    result = _post(server.port(), b'{"jsonrpc": "2.0", "id": 1}')
+    assert result['error']['code'] == -32600
+
+
+def test_non_string_method_returns_invalid_request(server: StellarRpcServer) -> None:
+    result = _post(server.port(), b'{"jsonrpc": "2.0", "id": 1, "method": 123}')
+    assert result['error']['code'] == -32600
+
+
+def test_wrong_jsonrpc_version_returns_invalid_request(server: StellarRpcServer) -> None:
+    result = _post(server.port(), b'{"jsonrpc": "1.0", "id": 1, "method": "getHealth"}')
+    assert result['error']['code'] == -32600
+
+
+def test_non_object_params_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _post(server.port(), b'{"jsonrpc": "2.0", "id": 1, "method": "getHealth", "params": "oops"}')
+    assert result['error']['code'] == -32602
+
+
 def test_send_transaction_and_get_result(server: StellarRpcServer) -> None:
     """Send a CreateAccount transaction through the HTTP server and poll for the result."""
     keypair = Keypair.random()
