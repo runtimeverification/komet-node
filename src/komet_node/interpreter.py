@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from subprocess import CalledProcessError
 from typing import TYPE_CHECKING, Final
 
@@ -25,7 +26,7 @@ if TYPE_CHECKING:
     from .utils import SimbolikDefinition
 
 
-def _llvm_interpret(definition_dir: Path, pattern: Pattern, *, cwd: Path | None = None) -> Pattern:
+def _llvm_interpret(definition_dir: Path, pattern: Pattern, *, cwd: str | Path | None = None) -> Pattern:
     """Run the LLVM interpreter binary on a KORE pattern, optionally in ``cwd``.
 
     This mirrors pyk's ``llvm_interpret`` but runs the interpreter *subprocess* with its
@@ -102,6 +103,12 @@ class NodeInterpreter:
         Built entirely in KORE (no kast conversion, no krun subprocess): the configuration
         is seeded with ``$PGM = setExitCode(0)`` and an empty ``$TRACE``, then run to its
         idle state by the LLVM interpreter.
+
+        The run happens in an isolated empty directory: the idle config ends with empty
+        ``<k>``/``<instrs>``/``<program>`` cells, which is exactly the precondition for the
+        ``insert-handleRequestFile`` rule. Were a stray ``request.json`` present in the
+        process's cwd, that rule would fire and dispatch it instead of stopping at the idle
+        state — corrupting the configuration we are about to persist as ``state.kore``.
         """
         config = top_cell_initializer(
             {
@@ -109,7 +116,8 @@ class NodeInterpreter:
                 '$TRACE': inj(_SORT_STRING, SORT_K_ITEM, str_dv('')),
             }
         )
-        return _llvm_interpret(self.definition.path, config).text
+        with tempfile.TemporaryDirectory() as isolated_dir:
+            return _llvm_interpret(self.definition.path, config, cwd=isolated_dir).text
 
     def run(
         self,

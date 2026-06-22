@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from stellar_sdk import Account, Keypair, Network, TransactionBuilder, xdr
+from stellar_sdk import Account, Keypair, Network, StrKey, TransactionBuilder, xdr
 from stellar_sdk.xdr.sc_val_type import SCValType
 
 from komet_node.server import StellarRpcServer
@@ -166,6 +166,39 @@ def test_send_transaction_and_get_result(server: StellarRpcServer) -> None:
     get_result = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})
     assert get_result['result']['status'] == 'SUCCESS'
     assert get_result['result']['envelopeXdr'] == xdr_str
+
+
+def test_failed_transaction_records_failed_receipt(server: StellarRpcServer) -> None:
+    """A transaction that gets stuck in the semantics is recorded as FAILED in Python.
+
+    Invoking a contract that was never deployed traps in the semantics, so no response.json
+    is produced and the server synthesises the FAILED receipt (the _failure_response path).
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    missing_contract = StrKey.encode_contract(b'\x11' * 32)  # valid C-strkey, never deployed
+    envelope = (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_invoke_contract_function_op(missing_contract, 'foo', [])
+        .set_timeout(30)
+        .build()
+    )
+    envelope.sign(keypair)
+    xdr_str = envelope.to_xdr()
+
+    # sendTransaction still returns PENDING, even though the tx will fail.
+    send_result = _rpc(server.port(), 'sendTransaction', {'transaction': xdr_str})
+    assert send_result['result']['status'] == 'PENDING'
+    tx_hash = send_result['result']['hash']
+
+    # The synthesised receipt is FAILED and echoes the envelope.
+    get_result = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
+    assert get_result['status'] == 'FAILED'
+    assert get_result['envelopeXdr'] == xdr_str
+
+    # A failed transaction must not advance the ledger.
+    assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 0
 
 
 def test_ledger_seq_increments(server: StellarRpcServer) -> None:

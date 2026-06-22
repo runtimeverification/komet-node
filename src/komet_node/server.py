@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
@@ -42,7 +43,7 @@ class StellarRpcServer:
         self,
         host: str = 'localhost',
         port: int = 8000,
-        state_file: Path = Path('state.kore'),
+        state_file: Path | None = None,
         network_passphrase: str = Network.TESTNET_NETWORK_PASSPHRASE,
         trace: bool = False,
     ) -> None:
@@ -50,7 +51,7 @@ class StellarRpcServer:
         self._port = port
         self.interpreter = NodeInterpreter()
         self.encoder = TransactionEncoder(network_passphrase, trace=trace)
-        self.state_file = state_file.resolve()
+        self.state_file = (state_file if state_file is not None else Path('state.kore')).resolve()
         self.io_dir = self.state_file.parent
         self.io_dir.mkdir(parents=True, exist_ok=True)
         self._httpd: HTTPServerType | None = None
@@ -82,6 +83,10 @@ class StellarRpcServer:
             def log_message(self, *args: Any) -> None:  # silence per-request logging
                 pass
 
+        # Intentionally a single-threaded HTTPServer: requests are serialised. The K node
+        # communicates through singleton files in the io dir (request.json / response.json /
+        # state.kore), so two requests in flight at once would clobber each other. Do not
+        # switch to ThreadingHTTPServer without reworking that file protocol.
         self._httpd = HTTPServer((self.host, int(self._port)), Handler)
         self._httpd.serve_forever()
 
@@ -123,7 +128,9 @@ class StellarRpcServer:
         try:
             return self.handle_rpc(req['method'], params, request_id).encode('utf-8')
         except Exception:
-            # A malformed request must never take down the server thread.
+            # An unexpected error must never take down the server thread, but it must not
+            # vanish silently either — log the traceback before returning Internal error.
+            traceback.print_exc()
             return _error_bytes(request_id, -32603, 'Internal error')
 
     def handle_rpc(self, method: str | None, params: dict[str, Any], request_id: Any = None) -> str:
@@ -141,8 +148,12 @@ class StellarRpcServer:
                 envelope, program_steps = self.encoder.build_tx_request(
                     method, request_id, transaction, now, force_trace=(method == 'traceTransaction')
                 )
-            except Exception as err:
-                return _error_str(request_id, -32602, f'Invalid params: could not decode transaction XDR ({err})')
+            except Exception:
+                # build_tx_request both decodes XDR and validates it (e.g. rejecting
+                # sub-stroop amounts); either is a client error. Log the detail, but keep
+                # the client-facing message neutral rather than leaking internal exceptions.
+                traceback.print_exc()
+                return _error_str(request_id, -32602, 'Invalid params: could not process transaction')
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
                 return json.dumps(self._failure_response(method, request_id, envelope, now))
@@ -191,6 +202,8 @@ class StellarRpcServer:
         ledger = metadata.get('latest_ledger', 0)
         tx_hash = envelope['txHash']
 
+        # This FAILED receipt mirrors the SUCCESS receipt the semantics build in
+        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule.
         receipt = {
             'status': 'FAILED',
             'ledger': str(ledger),
