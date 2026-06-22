@@ -43,6 +43,10 @@ def _wait_for_server(host: str, port: int, timeout: float = 10.0) -> None:
 
 def _rpc(port: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
     body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode()
+    return _post(port, body)
+
+
+def _post(port: int, body: bytes) -> dict[str, Any]:
     req = urllib.request.Request(
         f'http://localhost:{port}',
         data=body,
@@ -87,6 +91,36 @@ def test_get_latest_ledger_initial(server: StellarRpcServer) -> None:
 def test_get_transaction_not_found(server: StellarRpcServer) -> None:
     result = _rpc(server.port(), 'getTransaction', {'hash': '0' * 64})
     assert result['result']['status'] == 'NOT_FOUND'
+
+
+def test_unknown_method_returns_method_not_found(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'noSuchMethod', {})
+    assert result['error']['code'] == -32601
+
+
+def test_send_transaction_missing_params_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'sendTransaction', {})
+    assert result['error']['code'] == -32602
+
+
+def test_send_transaction_bad_xdr_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'sendTransaction', {'transaction': 'not-valid-xdr'})
+    assert result['error']['code'] == -32602
+
+
+def test_get_transaction_missing_hash_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'getTransaction', {})
+    assert result['error']['code'] == -32602
+
+
+def test_malformed_body_returns_parse_error(server: StellarRpcServer) -> None:
+    result = _post(server.port(), b'{ this is not json')
+    assert result['error']['code'] == -32700
+
+
+def test_non_object_frame_returns_invalid_request(server: StellarRpcServer) -> None:
+    result = _post(server.port(), b'[1, 2, 3]')
+    assert result['error']['code'] == -32600
 
 
 def test_send_transaction_and_get_result(server: StellarRpcServer) -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
+from subprocess import CalledProcessError
 from typing import TYPE_CHECKING, Final
 
 from komet.kast.syntax import steps_of
@@ -10,7 +10,8 @@ from pyk.konvert import kast_to_kore
 from pyk.kore.parser import KoreParser
 from pyk.kore.prelude import SORT_K_ITEM, inj, int_dv, str_dv, top_cell_initializer
 from pyk.kore.syntax import App, SortApp
-from pyk.ktool.krun import KRunOutput, _krun, llvm_interpret
+from pyk.ktool.krun import KRunOutput, _krun
+from pyk.utils import check_file_path, run_process_2
 
 from .utils import simbolik_definition, temp_working_directory
 
@@ -22,6 +23,27 @@ if TYPE_CHECKING:
     from pyk.kore.syntax import Pattern
 
     from .utils import SimbolikDefinition
+
+
+def _llvm_interpret(definition_dir: Path, pattern: Pattern, *, cwd: Path | None = None) -> Pattern:
+    """Run the LLVM interpreter binary on a KORE pattern, optionally in ``cwd``.
+
+    This mirrors pyk's ``llvm_interpret`` but runs the interpreter *subprocess* with its
+    working directory set to ``cwd`` (rather than ``os.chdir``-ing this process). The K
+    file-system hooks resolve their relative paths against the subprocess cwd, so the io-dir
+    files are found without mutating the parent process's global cwd — which would otherwise
+    race other threads (e.g. the server runs in a background thread in the tests).
+    """
+    interpreter_file = definition_dir / 'interpreter'
+    check_file_path(interpreter_file)
+    args = [str(interpreter_file), '/dev/stdin', '-1', '/dev/stdout']
+    try:
+        res = run_process_2(args, input=pattern.text, cwd=cwd, check=False)
+    except CalledProcessError as err:
+        raise NodeInterpreterError(f'Interpreter failed with status {err.returncode}: {err.stderr}', err) from err
+    if not res.stdout:
+        raise NodeInterpreterError(f'Interpreter produced no output: {res.stderr}', res)
+    return KoreParser(res.stdout).pattern()
 
 
 # KORE building blocks, used to construct the initial configuration and the <program>
@@ -82,7 +104,7 @@ class NodeInterpreter:
                 '$TRACE': inj(_SORT_STRING, SORT_K_ITEM, str_dv('')),
             }
         )
-        return llvm_interpret(self.definition.path, config, check=False).text
+        return _llvm_interpret(self.definition.path, config).text
 
     def run(
         self,
@@ -95,8 +117,9 @@ class NodeInterpreter:
         Run a single RPC request envelope against the saved KORE configuration.
 
         Writes ``request.json`` into ``io_dir``, runs the LLVM interpreter on the current
-        ``state.kore`` (with cwd set to ``io_dir`` so the K file-system hooks resolve the
-        relative paths), and returns the contents of ``response.json``.
+        ``state.kore`` (with the interpreter subprocess's working directory set to ``io_dir``
+        so the K file-system hooks resolve the relative paths), and returns the contents of
+        ``response.json``.
 
         On success the node writes ``response.json`` and removes ``request.json``; we then
         persist the new configuration to ``state.kore``. If ``response.json`` was not
@@ -115,12 +138,7 @@ class NodeInterpreter:
         if program_steps:
             pattern = self._inject_program(pattern, program_steps)
 
-        cwd = os.getcwd()
-        os.chdir(io_dir)
-        try:
-            result = llvm_interpret(self.definition.path, pattern, check=False)
-        finally:
-            os.chdir(cwd)
+        result = _llvm_interpret(self.definition.path, pattern, cwd=io_dir)
 
         if response_file.exists():
             state_file.write_text(result.text)

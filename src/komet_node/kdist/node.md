@@ -375,7 +375,8 @@ the steps completed without getting stuck, so the status is `SUCCESS`.
 # Step decoding
 
 Each step of a transaction is decoded from JSON into a kasmer `Step`. Key order is
-significant — it must match the Python encoder in `interpreter.py`.
+significant — it must match the Python encoders in `transaction.py` (`TransactionEncoder`)
+and `scval.py` (`scval_to_json`, for the `callTx` args).
 
   { "op": "setLedgerSequence", "sequence": <int> }
   { "op": "setAccount",        "account": "<hex32>", "balance": <int> }

@@ -93,6 +93,7 @@ class StellarRpcServer:
     def shutdown(self) -> None:
         if self._httpd is not None:
             self._httpd.shutdown()
+            self._httpd.server_close()  # release the listening socket so the port is freed
 
     # ------------------------------------------------------------------
     # Request handling
@@ -104,7 +105,17 @@ class StellarRpcServer:
             req = json.loads(body.decode('utf-8'))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return _error_bytes(None, -32700, 'Parse error')
-        return self.handle_rpc(req.get('method'), req.get('params') or {}, req.get('id')).encode('utf-8')
+        if not isinstance(req, dict):
+            return _error_bytes(None, -32600, 'Invalid Request')
+        request_id = req.get('id')
+        params = req.get('params')
+        try:
+            return self.handle_rpc(req.get('method'), params if isinstance(params, dict) else {}, request_id).encode(
+                'utf-8'
+            )
+        except Exception:
+            # A malformed request must never take down the server thread.
+            return _error_bytes(request_id, -32603, 'Internal error')
 
     def handle_rpc(self, method: str | None, params: dict[str, Any], request_id: Any = None) -> str:
         """Dispatch a single JSON-RPC call and return the response envelope as a JSON string.
@@ -114,15 +125,23 @@ class StellarRpcServer:
         now = str(int(time.time()))
 
         if method in _TX_METHODS:
-            envelope, program_steps = self.encoder.build_tx_request(
-                method, request_id, params['transaction'], now, force_trace=(method == 'traceTransaction')
-            )
+            transaction = params.get('transaction')
+            if not isinstance(transaction, str):
+                return _error_str(request_id, -32602, "Invalid params: 'transaction' (XDR string) is required")
+            try:
+                envelope, program_steps = self.encoder.build_tx_request(
+                    method, request_id, transaction, now, force_trace=(method == 'traceTransaction')
+                )
+            except Exception as err:
+                return _error_str(request_id, -32602, f'Invalid params: could not decode transaction XDR ({err})')
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
                 return json.dumps(self._failure_response(method, request_id, envelope, now))
             return response
 
         read_only_envelope = self._read_only_envelope(method, params, request_id, now)
+        if isinstance(read_only_envelope, str):  # a pre-formatted JSON-RPC error
+            return read_only_envelope
         if read_only_envelope is None:
             return _error_str(request_id, -32601, 'Method not found')
         response = self.interpreter.run(self.state_file, self.io_dir, read_only_envelope, None)
@@ -132,7 +151,12 @@ class StellarRpcServer:
 
     def _read_only_envelope(
         self, method: str | None, params: dict[str, Any], request_id: Any, now: str
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any] | str | None:
+        """Build the request envelope for a read-only method.
+
+        Returns the envelope dict, ``None`` if the method is unknown, or a pre-formatted
+        JSON-RPC error string for a recognised method with invalid params.
+        """
         base = {'method': method, 'id': request_id, 'now': now}
         if method == 'getHealth':
             return base
@@ -141,7 +165,10 @@ class StellarRpcServer:
         if method == 'getLatestLedger':
             return {**base, 'protocolVersion': _PROTOCOL_VERSION}
         if method == 'getTransaction':
-            return {**base, 'hash': params['hash']}
+            tx_hash = params.get('hash')
+            if not isinstance(tx_hash, str):
+                return _error_str(request_id, -32602, "Invalid params: 'hash' (string) is required")
+            return {**base, 'hash': tx_hash}
         return None
 
     def _failure_response(self, method: str, rpc_id: Any, envelope: dict[str, Any], now: str) -> dict[str, Any]:
