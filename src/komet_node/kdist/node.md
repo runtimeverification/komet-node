@@ -1,15 +1,24 @@
 
-This module implements the komet-node request lifecycle:
-  1. On startup, check for "request.json"
-  2. If found: read it, remove it, handle the request, write response to a file.
-  3. If not found: halt — the empty <k>, <instrs>, and <program> cells
-     represent the idle/ready state, awaiting the next invocation with a new request.json
+This module implements the komet-node JSON-RPC request lifecycle in K.
 
-This design avoids generating or processing Kore files at runtime. Instead:
-  - A one-time initial Kore configuration is produced at startup
-  - Each request cycle runs that configuration against request.json
-  - The final configuration (idle state) is saved and reused for the next request
+The Python server is a thin shim: it decodes the Stellar XDR envelope (which K cannot
+parse), builds a JSON *request envelope* describing the RPC call, writes it to
+`request.json`, runs this semantics against the saved KORE configuration, and reads back
+`response.json`.
 
+All RPC dispatch, transaction bookkeeping, ledger-sequence accounting and JSON-RPC
+response formatting live here in K:
+  - The semantic world state (accounts, contracts, uploaded wasm) round-trips through the
+    KORE configuration (`state.kore`), because uploaded wasm is a `ModuleDecl` that cannot
+    be reconstructed from bytes by the semantics.
+  - The RPC bookkeeping (the transaction store and the latest-ledger counter) is persisted
+    as small JSON files (`transactions.json`, `metadata.json`) in the working directory,
+    read and written by these rules via the file-system hooks.
+
+Lifecycle: on each invocation, if `request.json` exists, read it, dispatch on the
+`method` field, write `response.json`, remove `request.json`, and halt. The empty `<k>`,
+`<instrs>`, and `<program>` cells with no `request.json` present represent the idle/ready
+state that is saved and reused for the next request.
 
 ```k
 requires "soroban-semantics/kasmer.md"
@@ -25,11 +34,25 @@ module NODE
     imports FILE-OPERATIONS
     imports JSON
     imports BYTES
+    imports K-EQUAL
+    imports STRING
+
+    // Allow parenthesising JSON and JSONs (needed to group JSONs as a single
+    // argument to the helper functions below).
+    syntax JSON  ::= "(" JSON  ")" [bracket]
+    syntax JSONs ::= "(" JSONs ")" [bracket]
 
     // Internal control-flow items for the node request lifecycle.
     syntax KItem ::= "#handleRequestFile"
-                   | "#removeRequestFile"
-                   | #handleRequest(String)
+                   | #dispatch( JSON )
+                   | #dispatchMethod( String, JSON )
+                   | #runTx( JSON, String )
+                   | #finalizeTx( JSON, String )
+                   | #recordAndRespond( JSON, String, Int, JSON, JSON )
+                   | #respondTx( JSON, String, Int, JSON )
+                   | #maybeEnableTrace( JSON, String )
+                   | #getTxResult( String, String, JSON, JSON, Int )
+                   | #respond( JSON, JSON )
 
     syntax Step ::= setLedgerSequence(Int)    [symbol(setLedgerSequence)]
  // ----------------------------------------------------------------------
@@ -56,10 +79,61 @@ produce a WasmStringToken using K's generic string-to-token hook.
     syntax WasmStringToken ::= string2WasmToken(String) [function, hook(STRING.string2token)]
 ```
 
-insert-handleRequestFile: This rule fires when all three cells empty and the `request.json` file is present, which is the initial state.
+###############################################################################
+# JSON helpers
 
-If `request.json` does NOT exist, this rule does not fire and the execution terminates.
-This is the idle state after a completed request, and the Node can save this configuration for reuse.
+Order-independent accessors over JSON objects, and an upsert helper for the transaction
+store. Ported from kontrol-node's `json-utils.md`.
+
+```k
+    syntax JSON ::= #getJSON( JSONKey, JSON )       [function, symbol(getJSON)]
+                  | #getJSON( JSONKey, JSON, JSON ) [function, symbol(getJSONDefault)]
+ // ----------------------------------------------------------------------------------
+    rule #getJSON( KEY, { KEY  : J, _    }, _   ) => J
+    rule #getJSON(   _, { .JSONs         }, DEF ) => DEF
+    rule #getJSON( KEY, { KEY2 : _, REST }, DEF ) => #getJSON( KEY, { REST }, DEF )
+      requires KEY =/=K KEY2
+    rule #getJSON( KEY, J ) => #getJSON( KEY, J, null )
+
+    syntax String ::= #getString( JSONKey, JSON ) [function, symbol(getString)]
+ // ---------------------------------------------------------------------------
+    rule #getString( KEY, J ) => {#getJSON( KEY, J )}:>String
+
+    syntax Int ::= #getInt( JSONKey, JSON ) [function, symbol(getInt)]
+ // -----------------------------------------------------------------
+    rule #getInt( KEY, J ) => {#getJSON( KEY, J )}:>Int
+
+    // Upsert KEY |-> VAL into a JSON object, dropping any existing entry for KEY.
+    syntax JSON  ::= #putJSON( JSONKey, JSON, JSON )   [function, symbol(putJSON)]
+    syntax JSONs ::= #removeKeyJSONs( JSONKey, JSONs ) [function, symbol(removeKeyJSONs)]
+ // ------------------------------------------------------------------------------------
+    rule #putJSON( KEY, VAL, { OBJ } ) => { KEY : VAL , #removeKeyJSONs( KEY, OBJ ) }
+
+    rule #removeKeyJSONs( _, .JSONs ) => .JSONs
+    rule #removeKeyJSONs( KEY, ( KEY  : _, REST ) ) => #removeKeyJSONs( KEY, REST )
+    rule #removeKeyJSONs( KEY, ( KEY2 : V, REST ) ) => ( KEY2 : V , #removeKeyJSONs( KEY, REST ) )
+      requires KEY =/=K KEY2
+
+    // Append the entries of TAIL after the entries of HEAD.
+    syntax JSONs ::= #concatJSONs( JSONs, JSONs ) [function, symbol(concatJSONs)]
+ // ----------------------------------------------------------------------------
+    rule #concatJSONs( .JSONs, TAIL ) => TAIL
+    rule #concatJSONs( ( J, REST ), TAIL ) => ( J , #concatJSONs( REST, TAIL ) )
+```
+
+###############################################################################
+# Request lifecycle
+
+insert-handleRequestFile fires when the `<k>`, `<instrs>` and `<program>` cells are empty
+and `request.json` is present (the initial/idle state). If `request.json` does not exist,
+this rule does not fire and execution halts — this is the idle state the node saves for
+reuse.
+
+For transactions that carry uploaded wasm, the Python shim injects the kasmer steps into
+the `<program>` cell directly (the wasm `ModuleDecl` cannot be JSON-encoded). Those steps
+run first via KASMER's `load-program` rule (which requires a non-empty `<program>`); once
+`<program>` drains to `.Steps`, this rule fires and the request envelope drives the
+bookkeeping.
 
 ```k
     rule [insert-handleRequestFile]:
@@ -67,22 +141,12 @@ This is the idle state after a completed request, and the Node can save this con
         <instrs> .K </instrs>
         <program> .Steps </program>
       requires #fileExists("request.json")
-```
 
-handleRequestFile: wraps the request lifecycle in an exit-code guard.
-
-```k
     rule [handleRequestFile]:
         <k> #handleRequestFile
-         => setExitCode(1)
-         ~> #handleRequest({#readFile("request.json")}:>String)
-         ~> #removeRequestFile
-         ~> setExitCode(0) 
+         => #dispatch( String2JSON( {#readFile("request.json")}:>String ) )
             ...
         </k>
-
-    rule [removeRequestFile]:
-        <k> #removeRequestFile => #remove("request.json") ... </k>
 
     // KASMER's steps-empty requires <k> .Steps </k> exactly (no frame).
     // When steps are injected into <k> with a continuation, we need this rule
@@ -92,23 +156,226 @@ handleRequestFile: wraps the request lifecycle in an exit-code guard.
         <instrs> .K </instrs>
 ```
 
-handleRequest: parse the JSON request body and inject the decoded Steps directly into
-`<k>`. `steps-seq` executes each step; `steps-done` (above) consumes the final `.Steps`
-so the continuation (`#removeRequestFile ~> setExitCode(0)`) can proceed.
+#dispatch reads the `method` field of the request envelope and routes to a per-method
+rule. `#respond(ID, RESULT)` writes the JSON-RPC envelope to `response.json`, removes
+`request.json`, and marks the run successful (exit code 0).
 
 ```k
-    rule [handleRequest]:
-        <k> #handleRequest(S:String)
-         => #decodeRequest(String2JSON(S))
-            ...
-        </k>
+    rule <k> #dispatch( REQ ) => #dispatchMethod( #getString( "method", REQ ), REQ ) ... </k>
+
+    rule <k> #respond( ID, RESULT )
+          => #writeFile( "response.json", JSON2String({
+                 "jsonrpc" : "2.0",
+                 "id"      : ID,
+                 "result"  : RESULT
+             }))
+          ~> #remove( "request.json" )
+             ...
+         </k>
+         <exitCode> _ => 0 </exitCode>
 ```
 
-JSON request format (key order is significant — must match Python's json.dumps output):
+###############################################################################
+## Read-only methods
 
-  { "steps": [ <step>, ... ] }
+```k
+    rule <k> #dispatchMethod( "getHealth", REQ )
+          => #respond( #getJSON( "id", REQ ), { "status" : "healthy" } )
+             ...
+         </k>
 
-where each <step> is one of:
+    rule <k> #dispatchMethod( "getNetwork", REQ )
+          => #respond( #getJSON( "id", REQ ), {
+                 "friendbotUrl"    : null,
+                 "passphrase"      : #getString( "passphrase", REQ ),
+                 "protocolVersion" : #getString( "protocolVersion", REQ )
+             })
+             ...
+         </k>
+
+    rule <k> #dispatchMethod( "getLatestLedger", REQ )
+          => #respond( #getJSON( "id", REQ ), {
+                 "id"              : "0000000000000000000000000000000000000000000000000000000000000000",
+                 "protocolVersion" : #getString( "protocolVersion", REQ ),
+                 "sequence"        : #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) )
+             })
+             ...
+         </k>
+```
+
+## getTransaction
+
+Look up the stored receipt by hash in `transactions.json`. If present, return it merged
+with the current `latestLedger`/`latestLedgerCloseTime`; otherwise return `NOT_FOUND`.
+
+```k
+    rule <k> #dispatchMethod( "getTransaction", REQ )
+          => #getTxResult(
+                 #getString( "hash", REQ ),
+                 #getString( "now", REQ ),
+                 #getJSON( "id", REQ ),
+                 String2JSON( {#readFile("transactions.json")}:>String ),
+                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) )
+             )
+             ...
+         </k>
+
+    rule <k> #getTxResult( HASH, NOW, ID, { TXS }, LL )
+          => #respond( ID, { #concatJSONs(
+                 #recordOf( #getJSON( HASH, { TXS } ) ),
+                 ( "latestLedger"          : Int2String( LL ) ,
+                   "latestLedgerCloseTime" : NOW ,
+                   .JSONs )
+             )})
+             ...
+         </k>
+      requires #getJSON( HASH, { TXS } ) =/=K null
+
+    rule <k> #getTxResult( HASH, NOW, ID, { TXS }, LL )
+          => #respond( ID, {
+                 "status"                : "NOT_FOUND",
+                 "latestLedger"          : Int2String( LL ),
+                 "latestLedgerCloseTime" : NOW
+             })
+             ...
+         </k>
+      requires #getJSON( HASH, { TXS } ) ==K null
+
+    // Extract the entries of a stored receipt object so they can be concatenated.
+    syntax JSONs ::= #recordOf( JSON ) [function, symbol(recordOf)]
+ // --------------------------------------------------------------
+    rule #recordOf( { OBJ } ) => OBJ
+```
+
+###############################################################################
+## sendTransaction / traceTransaction
+
+Both run the decoded steps, then record a receipt, bump the ledger, and respond. The only
+differences are whether instruction tracing is enabled and the shape of the immediate
+response (`PENDING` for sendTransaction, the result + trace for traceTransaction).
+
+The steps come either from the `steps` array of the request envelope (the common path) or
+from the `<program>` cell (the wasm-upload path, where they were pre-injected and have
+already run by the time we get here, leaving `steps` empty).
+
+```k
+    rule <k> #dispatchMethod( "sendTransaction",  REQ ) => #runTx( REQ, "sendTransaction" )  ... </k>
+    rule <k> #dispatchMethod( "traceTransaction", REQ ) => #runTx( REQ, "traceTransaction" ) ... </k>
+
+    // Unknown method — respond with a null result.
+    rule <k> #dispatchMethod( _, REQ ) => #respond( #getJSON( "id", REQ ), null ) ... </k> [owise]
+
+    rule <k> #runTx( REQ, METHOD )
+          => #maybeEnableTrace( REQ, METHOD )
+          ~> setLedgerSequence( #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ) )
+          ~> #decodeSteps( #stepsJSONs( #getJSON( "steps", REQ, [ .JSONs ] ) ) )
+          ~> #finalizeTx( REQ, METHOD )
+             ...
+         </k>
+
+    syntax JSONs ::= #stepsJSONs( JSON ) [function, symbol(stepsJSONs)]
+ // ------------------------------------------------------------------
+    rule #stepsJSONs( [ SS ] ) => SS
+    rule #stepsJSONs( _ )      => .JSONs [owise]
+```
+
+Tracing is enabled for `traceTransaction` and for any request that carries `"trace": true`
+(set by the `--trace` server flag). When enabled we clear the trace file and point the
+trace `<ioDir>` at it; otherwise tracing stays disabled.
+
+```k
+    syntax Bool ::= #tracingOn( JSON, String ) [function, symbol(tracingOn)]
+ // -----------------------------------------------------------------------
+    rule #tracingOn( _, METHOD ) => true
+      requires METHOD ==String "traceTransaction"
+    rule #tracingOn( REQ, METHOD ) => #getJSON( "trace", REQ, false ) ==K true
+      requires METHOD =/=String "traceTransaction"
+
+    rule <k> #maybeEnableTrace( REQ, METHOD ) => #writeFile( "trace.jsonl", "" ) ... </k>
+         <ioDir> _ => "trace.jsonl" </ioDir>
+      requires #tracingOn( REQ, METHOD )
+
+    rule <k> #maybeEnableTrace( REQ, METHOD ) => .K ... </k>
+         <ioDir> _ => "" </ioDir>
+      requires notBool #tracingOn( REQ, METHOD )
+```
+
+After the steps run, read the current bookkeeping, capture the trace (if tracing was on),
+record the receipt, write the new ledger counter, and respond. Reaching this point means
+the steps completed without getting stuck, so the status is `SUCCESS`.
+
+```k
+    rule <k> #finalizeTx( REQ, METHOD )
+          => #recordAndRespond(
+                 REQ, METHOD,
+                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ),
+                 String2JSON( {#readFile("transactions.json")}:>String ),
+                 {#readFile("trace.jsonl")}:>String
+             )
+             ...
+         </k>
+         <ioDir> _ => "" </ioDir>
+      requires #tracingOn( REQ, METHOD )
+
+    rule <k> #finalizeTx( REQ, METHOD )
+          => #recordAndRespond(
+                 REQ, METHOD,
+                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ),
+                 String2JSON( {#readFile("transactions.json")}:>String ),
+                 null
+             )
+             ...
+         </k>
+      requires notBool #tracingOn( REQ, METHOD )
+
+    rule <k> #recordAndRespond( REQ, METHOD, L, TXS, TRACE )
+          => #writeFile( "metadata.json", JSON2String({ "latest_ledger" : L +Int 1 }) )
+          ~> #writeFile( "transactions.json",
+                 JSON2String( #putJSON( #getString( "txHash", REQ ), #txReceipt( REQ, L +Int 1, TRACE ), TXS ) ) )
+          ~> #respondTx( REQ, METHOD, L +Int 1, TRACE )
+             ...
+         </k>
+
+    syntax JSON ::= #txReceipt( JSON, Int, JSON ) [function, symbol(txReceipt)]
+ // ---------------------------------------------------------------------------
+    rule #txReceipt( REQ, NEWL, TRACE ) => {
+            "status"        : "SUCCESS",
+            "ledger"        : Int2String( NEWL ),
+            "createdAt"     : #getString( "now", REQ ),
+            "envelopeXdr"   : #getString( "envelopeXdr", REQ ),
+            "resultXdr"     : "",
+            "resultMetaXdr" : "",
+            "trace"         : TRACE
+        }
+
+    rule <k> #respondTx( REQ, "sendTransaction", NEWL, _TRACE )
+          => #respond( #getJSON( "id", REQ ), {
+                 "hash"                  : #getString( "txHash", REQ ),
+                 "status"                : "PENDING",
+                 "latestLedger"          : Int2String( NEWL ),
+                 "latestLedgerCloseTime" : #getString( "now", REQ )
+             })
+             ...
+         </k>
+
+    rule <k> #respondTx( REQ, "traceTransaction", NEWL, TRACE )
+          => #respond( #getJSON( "id", REQ ), {
+                 "hash"                  : #getString( "txHash", REQ ),
+                 "status"                : "SUCCESS",
+                 "ledger"                : Int2String( NEWL ),
+                 "trace"                 : TRACE,
+                 "latestLedger"          : Int2String( NEWL ),
+                 "latestLedgerCloseTime" : #getString( "now", REQ )
+             })
+             ...
+         </k>
+```
+
+###############################################################################
+# Step decoding
+
+Each step of a transaction is decoded from JSON into a kasmer `Step`. Key order is
+significant — it must match the Python encoder in `interpreter.py`.
 
   { "op": "setLedgerSequence", "sequence": <int> }
   { "op": "setAccount",        "account": "<hex32>", "balance": <int> }
@@ -130,11 +397,9 @@ SCVal arg encoding (key order also significant):
   { "type": "address", "addrType": "account"|"contract", "value": "<hex32>" }
 
 ```k
-    syntax Steps ::= #decodeRequest(JSON)  [function]
-                   | #decodeSteps(JSONs)   [function]
+    syntax Steps ::= #decodeSteps(JSONs)   [function]
     syntax Step  ::= #decodeStep(JSON)     [function]
 
-    rule #decodeRequest({ "steps" : [SS:JSONs] }) => #decodeSteps(SS)
     rule #decodeSteps(.JSONs)                     => .Steps
     rule #decodeSteps(S:JSON, SS:JSONs)           => #decodeStep(S) #decodeSteps(SS)
 

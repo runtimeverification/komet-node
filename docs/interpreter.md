@@ -1,6 +1,6 @@
 # `interpreter.py` — `NodeInterpreter`
 
-`NodeInterpreter` is the core of komet-node. It translates a `stellar_sdk.Transaction` into K execution steps, runs them through the compiled K semantics via `krun`, and returns the updated blockchain state.
+`NodeInterpreter` is the K-execution boundary of komet-node. It builds the initial configuration, runs RPC request envelopes through the compiled K semantics with the LLVM backend, and persists the resulting world state. It knows nothing about Stellar — XDR decoding lives in [`TransactionEncoder`](transaction.md), and RPC dispatch / bookkeeping / response formatting live in [`node.md`](node-semantics.md).
 
 ---
 
@@ -9,169 +9,72 @@
 ```python
 class NodeInterpreter:
     definition: SimbolikDefinition   # compiled K definition (komet-node.simbolik)
-    network_passphrase: str
-    trace: bool                      # whether to enable instruction tracing
 ```
 
-`SimbolikDefinition` is a thin subclass of `komet.SorobanDefinition`, pointing to the `komet-node.simbolik` compiled K definition (cached under `~/.cache/kdist-*/komet-node/simbolik/`).
+`SimbolikDefinition` is a thin subclass of `komet.SorobanDefinition`, pointing to the `komet-node.simbolik` compiled K definition (cached under `~/.cache/kdist-*/komet-node/simbolik/`). Note there is no `network_passphrase` or `trace` here — those belong to the request side (`TransactionEncoder`); the interpreter is purely about running K.
 
 ---
 
-## Execution paths
+## No `kast`↔`kore` conversions
 
-`run_transaction(state_file, transaction)` is the main entry point. It chooses between two execution strategies depending on the transaction content:
+A guiding constraint: whole-configuration `kore_to_kast` / `kast_to_kore` conversions take seconds and get slower as the configuration grows, so the interpreter avoids them entirely. `state.kore` is only ever parsed with `KoreParser` (KORE text → KORE AST, which is cheap) and handed straight to `llvm_interpret`. Terms that must be constructed are built directly in KORE.
 
-```
-Transaction
-    │
-    ├─ can encode to JSON? ──yes──► JSON fast path (run_request_file)
-    │                                   writes request.json, krun reads it
-    │
-    └─ no (wasm upload) ────────► KORE round-trip (run_steps)
-                                    Python parses state.kore, mutates AST,
-                                    re-serializes, krun on full KORE term
-```
+### `empty_config()`
 
-### JSON fast path (`run_request_file`)
-
-Used for all operations except wasm upload. The goal is to avoid Python-side KORE parsing and AST manipulation entirely.
-
-1. `encode_transaction_to_json(transaction)` serializes the transaction as a JSON string. Returns `None` if any operation cannot be expressed as JSON (currently only wasm upload).
-2. A temporary working directory is created. `request.json` is written there.
-3. `krun` is invoked with the current `state.kore` as input (`--term`). The K semantics detect `request.json`, read and decode it, execute the steps, remove the file, and halt. The updated state is captured from stdout.
-4. If tracing is enabled, `trace.jsonl` is read from the temp dir and included in the response.
+Produces the initial blank-slate `state.kore`. It builds the top-cell initializer **in KORE** — seeding `$PGM` with a single `setExitCode(0)` step and `$TRACE` with an empty string — and runs it through `llvm_interpret`. No `krun` subprocess and no kast conversion are involved.
 
 ```python
-with temp_working_directory() as root:
-    (root / 'request.json').write_text(request_str)
-    res = _krun(input_file=state_file, definition_dir=..., term=True, output=KORE)
-    trace = (root / 'trace.jsonl').read_text() if tracing else None
-    return InterpreterResponse(final_kore=res.stdout, trace=trace)
+config = top_cell_initializer({
+    '$PGM':   inj(SortSteps, K_ITEM, kasmerSteps(setExitCode(0), .Steps)),  # built in KORE
+    '$TRACE': inj(SortString, K_ITEM, str_dv('')),
+})
+return llvm_interpret(self.definition.path, config, check=False).text
 ```
 
-Each request runs in its own temp dir so that concurrent requests (if added) and trace files are isolated.
+The result is the empty idle K configuration — no accounts, no contracts, no storage.
 
-### KORE round-trip (`run_steps`)
+### `run(state_file, io_dir, request, program_steps=None)`
 
-Used only for wasm upload. Wasm upload requires embedding a parsed `ModuleDecl` (the Wasm AST) directly into the K configuration — something that cannot be expressed as a flat JSON string.
+The main entry point. Runs a single RPC request envelope:
 
-1. Parse `state.kore` into a Python KORE AST.
-2. Convert the AST to KAst (`kore_to_kast`).
-3. Inject K steps (including the `ModuleDecl`) into the `<program>` cell.
-4. Re-serialize to KORE (`kast_to_kore`) and run krun on the full term.
+1. Write the request envelope to `request.json` in `io_dir`, and delete any stale `response.json`.
+2. Parse `state.kore` with `KoreParser` (no kast conversion).
+3. For a wasm upload only, splice the upload steps into the `<program>` cell (see below).
+4. `chdir` into `io_dir` (so the K file-system hooks resolve the relative paths `request.json`, `response.json`, `metadata.json`, `transactions.json`, `trace.jsonl`) and call `llvm_interpret`.
+5. If the semantics wrote `response.json`, persist the new configuration to `state.kore` and return the response text. If not, the transaction got stuck (failed) — leave `state.kore` unchanged and return `None`, so the caller can synthesise a failure response.
 
-This path is slower because it involves full KORE parsing and re-serialization on every wasm upload, but it is only triggered once per contract deployment.
+### `_inject_program(pattern, steps)` — the wasm-upload path
+
+A wasm upload cannot be expressed as a JSON step, because the resulting `ModuleDecl` (the parsed Wasm AST from `wasm2kast`) has no JSON form. Instead the steps are injected directly into the `<program>` cell of the already-parsed configuration, so KASMER runs them before the request is dispatched.
+
+The injection is done at the **KORE level**: the small steps term is converted to KORE and spliced into the `<program>` cell of the parsed pattern. The whole-configuration round-trip is deliberately avoided. The one remaining `kast_to_kore` call here is bounded by the size of the uploaded module (the only thing that can originate solely as KAST), not by the accumulated world state.
+
+```python
+steps_kore = kast_to_kore(self.definition.kdefinition, steps_of(steps), KSort('Steps'))
+return _set_cell(pattern, "<program> cell symbol", steps_kore)   # KORE-level splice
+```
+
+Because Soroban allows only a single host-function operation per transaction, a wasm-upload transaction is exactly one `uploadWasm` op — this path never carries anything else.
+
+### `pretty_print(kore_str)`
+
+A debugging helper that pretty-prints a KORE configuration string using `krun --output pretty --depth 0`. Used by `demo.py` to render each step of a contract lifecycle.
 
 ---
 
 ## Supported operations
 
-| Stellar operation | K step | Execution path |
+The mapping from Stellar operations to kasmer steps is performed by [`TransactionEncoder`](transaction.md); the interpreter only runs the result.
+
+| Stellar operation | kasmer step | Delivered via |
 |---|---|---|
-| `CreateAccount` | `setAccount(Account(bytes), stroops)` | JSON |
-| `InvokeHostFunction` / upload wasm | `uploadWasm(hash, ModuleDecl)` | KORE round-trip |
-| `InvokeHostFunction` / create contract (V1, V2) | `deployContract(from, address, wasmHash)` | JSON |
-| `InvokeHostFunction` / invoke contract | `callTx(from, to, func, args, Void)` | JSON |
-
----
-
-## JSON request format
-
-The JSON fast path writes `request.json` with the following structure. **Key ordering is significant**: the K JSON sort is ordered, so Python dicts must produce keys in the same order as the K pattern-match rules in `node.md`.
-
-```json
-{
-  "steps": [
-    { "op": "setAccount",     "account": "<hex32>", "balance": <int> },
-    { "op": "deployContract", "from": "<hex32>", "address": "<hex32>", "wasmHash": "<hex32>" },
-    { "op": "callTx",         "from": "<hex32>", "fromIsContract": <bool>,
-                               "func": "<name>", "to": "<hex32>", "args": [ ... ] }
-  ]
-}
-```
-
-### SCVal argument encoding
-
-Contract function arguments (`callTx` args) are encoded as JSON dicts:
-
-| SCVal type | JSON encoding |
-|---|---|
-| `SCV_BOOL` | `{"type": "bool", "value": true\|false}` |
-| `SCV_I32` / `SCV_U32` | `{"type": "i32"\|"u32", "value": <int>}` |
-| `SCV_I64` / `SCV_U64` | `{"type": "i64"\|"u64", "value": <int>}` |
-| `SCV_I128` / `SCV_U128` | `{"type": "i128"\|"u128", "value": <int>}` (combined hi/lo) |
-| `SCV_SYMBOL` | `{"type": "symbol", "value": "<str>"}` |
-| `SCV_BYTES` | `{"type": "bytes", "value": "<lowercase hex>"}` |
-| `SCV_ADDRESS` (account) | `{"type": "address", "addrType": "account", "value": "<hex32>"}` |
-| `SCV_ADDRESS` (contract) | `{"type": "address", "addrType": "contract", "value": "<hex32>"}` |
-
----
-
-## Initial configuration (`empty_config`)
-
-`empty_config()` produces the initial blank-slate `state.kore` by running krun with a single `setExitCode(0)` step. The output is the empty idle K configuration — no accounts, no contracts, no storage — which the server writes to `state.kore` on first startup.
-
-When `trace=True`, `empty_config` passes two extra arguments to krun:
-
-```python
-cmap = {'TRACE': str_dv('trace.jsonl').text}   # K string token
-pmap = {'TRACE': 'cat'}                         # parser: pass through as-is
-```
-
-These initialize the `<ioDir>` configuration cell (part of the `<trace>` cell, compiled in from the `k-tracing` selector) to `"trace.jsonl"`. Because this value is baked into `state.kore`, every subsequent krun invocation reads it and writes traces to `trace.jsonl` in the current working directory — which is the per-request temp dir.
-
----
-
-## Tracing
-
-When the server is started with `--trace`, every `callTx` (contract invocation) produces an instruction-level execution trace. The trace records the VM state at each WebAssembly instruction.
-
-**How it works**:
-
-1. `empty_config()` bakes `<ioDir>trace.jsonl</ioDir>` into `state.kore`.
-2. For each transaction, `run_request_file` creates a temp dir, runs krun from it.
-3. The tracing K rules (from `soroban-semantics.tracing`) detect the non-empty `<ioDir>` and append one JSON record per instruction to `trace.jsonl` in the temp dir.
-4. After krun finishes, the trace file is read and returned in `InterpreterResponse.trace`.
-5. The server stores the trace string in `_transactions[hash]['trace']`, retrievable via `getTransaction`.
-
-**Trace format** (one JSON record per line):
-
-```json
-{"pos": 597, "instr": ["local.get", 0], "stack": [["i64", 4]], "locals": {"0": ["i64", 4]}}
-```
-
-| Field | Description |
-|---|---|
-| `pos` | Byte offset of the instruction in the binary, or `null` for synthetic instructions |
-| `instr` | Instruction name and operands as a JSON array |
-| `stack` | Value stack at instruction entry, as `[type, value]` pairs |
-| `locals` | Local variable bindings, keyed by index, as `[type, value]` pairs |
-
-Tracing is only active for the LLVM backend. The `komet-node.simbolik` definition is compiled with `md_selector: 'k | k-tracing'`, so the tracing rules are always present; they are activated solely by `<ioDir>` being non-empty.
-
----
-
-## `InterpreterResponse`
-
-```python
-class InterpreterResponse(NamedTuple):
-    final_kore: str        # updated K configuration (to write back to state.kore)
-    trace: str | None      # JSONL trace string, or None if tracing is disabled
-```
+| `CreateAccount` | `setAccount(Account(bytes), stroops)` | JSON step in `request.json` |
+| `InvokeHostFunction` / upload wasm | `uploadWasm(hash, ModuleDecl)` | `<program>` cell (KORE) |
+| `InvokeHostFunction` / create contract (V1, V2) | `deployContract(from, address, wasmHash)` | JSON step in `request.json` |
+| `InvokeHostFunction` / invoke contract | `callTx(from, to, func, args, Void)` | JSON step in `request.json` |
 
 ---
 
 ## Error handling
 
-`NodeInterpreterError` is raised when krun exits with a non-zero return code. The server catches this, stores a `FAILED` result for the transaction, and leaves `state.kore` unchanged (the state effectively rolls back).
-
----
-
-## Address utilities
-
-`NodeInterpreter` also provides helpers for Stellar address encoding/decoding:
-
-- `decode_account_id(addr)` — G-strkey → 32-byte public key
-- `decode_contract_id(addr)` — C-strkey → 32-byte contract ID
-- `contract_address_from_deployer_address(deployer, salt)` — computes the C-strkey that `CREATE_CONTRACT` will assign
-- `contract_id_from_preimage(preimage)` — SHA-256 of the `HashIDPreimage` as used by Stellar
+`NodeInterpreterError` is raised for interpreter-level failures (e.g. `pretty_print`). A *transaction* failure is not an exception: the semantics simply get stuck without writing `response.json`, so `run` returns `None` and the server records a `FAILED` receipt while leaving `state.kore` unchanged (the state effectively rolls back).

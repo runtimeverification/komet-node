@@ -16,7 +16,7 @@
 
 ## 🌟 Overview
 
-`komet-node` extends the standard Stellar RPC with a `traceTransaction` method that provides instruction-level execution traces. The node's ledger state can be saved to and restored from a single file, allowing the same ledger state to be reproduced and transactions to be replayed.
+`komet-node` extends the standard Stellar RPC with a `traceTransaction` method that provides instruction-level execution traces. The node's state is persisted to disk, allowing the same ledger state to be reproduced and transactions to be replayed. The RPC logic itself runs inside the K formal semantics — Python is only a thin shim that decodes Stellar XDR.
 
 ## 🚀 Quick Start
 
@@ -75,7 +75,7 @@ komet-node --trace               # enable instruction-level execution tracing
 | `--state-file` | `state.kore` | Path to the persistent state file |
 | `--trace` | off | Enable instruction-level execution tracing |
 
-On first start the server creates an empty `state.kore`. Delete that file to reset the chain, or point `--state-file` at a pre-built configuration to resume from a snapshot.
+On first start the server creates an empty `state.kore`, alongside `metadata.json` (the ledger counter) and `transactions.json` (the transaction store). Delete `state.kore` to reset the chain (the sidecar files are re-seeded), or point `--state-file` at a pre-built configuration to resume from a snapshot.
 
 #### Verify the server with `curl`
 
@@ -208,9 +208,10 @@ pip install dist/*.whl
 ### Documentation
 
 - [Architecture overview](docs/architecture.md) — how the pieces fit together
-- [Server](docs/server.md) — the RPC layer, state lifecycle, and full method reference
-- [Interpreter](docs/interpreter.md) — transaction → K step translation
-- [K semantics](docs/node-semantics.md) — the on-chain execution model
+- [Server](docs/server.md) — the HTTP/RPC shim, state lifecycle, and full method reference
+- [Transaction encoding](docs/transaction.md) — Stellar XDR → K request envelope
+- [Interpreter](docs/interpreter.md) — running request envelopes through the K semantics
+- [K semantics](docs/node-semantics.md) — the on-chain RPC dispatch and execution model
 
 ---
 

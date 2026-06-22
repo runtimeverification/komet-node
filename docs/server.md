@@ -1,22 +1,31 @@
 # `server.py` — `StellarRpcServer`
 
-`StellarRpcServer` is the outermost layer of komet-node. 
-It exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC, handling incoming requests and owning the request/response lifecycle.
-It translates incoming requests into calls to `NodeInterpreter` and manages the shared state file. 
+`StellarRpcServer` is the outermost layer of komet-node. It exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC and owns the request/response lifecycle. It is a thin shim: it decodes the XDR envelope (via `TransactionEncoder`), runs the request through the K semantics (via `NodeInterpreter`), and returns whatever `response.json` the semantics produced. All RPC dispatch, the transaction store, ledger accounting, and response formatting happen in K — the server holds none of that state.
 
 ---
 
 ## Class structure
 
-```
-StellarRpcServer(JsonRpcServer)   ← pyk.rpc.rpc.JsonRpcServer
-    interpreter: NodeInterpreter
-    state_file:  Path             ← state.kore on disk
-    ledger_seq:  int              ← incremented per committed transaction
-    _transactions: dict           ← in-memory tx results, keyed by hash
+```python
+class StellarRpcServer:
+    interpreter: NodeInterpreter     # the K runner
+    encoder:     TransactionEncoder  # the XDR → request-envelope decoder
+    state_file:  Path                # state.kore on disk
+    io_dir:      Path                # state_file.parent — also holds metadata.json / transactions.json
 ```
 
-The server extends pyk's `JsonRpcServer`, which handles HTTP, JSON-RPC framing, and method dispatch. Each Stellar RPC method is registered with `register_method(name, fn)`.
+The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `BaseHTTPRequestHandler` reads each POST body and calls `_handle`, which parses the JSON-RPC frame and delegates to `handle_rpc`.
+
+### `handle_rpc(method, params, request_id) -> str`
+
+The dispatch entry point, returning the JSON-RPC response envelope as a string. It is usable **without** the HTTP layer, which is convenient for scripts and tests:
+
+```python
+server = StellarRpcServer(state_file=Path('out/state.kore'))
+server.handle_rpc('sendTransaction', {'transaction': xdr})
+```
+
+For `sendTransaction` / `traceTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run`; for the read-only methods it builds a small envelope and runs it. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the one exception is the failure fallback (below).
 
 ---
 
@@ -33,134 +42,106 @@ server = StellarRpcServer(
 server.serve()
 ```
 
-At construction time, the server checks whether `state_file` exists:
+At construction the server prepares the *io dir* (`state_file.parent`):
 
-- **File does not exist**: `interpreter.empty_config()` is called to produce the initial idle K configuration — a blank-slate blockchain state with no accounts, contracts, or storage — and written to disk.
-- **File exists**: it is used as-is. This allows you to start the server against any pre-built state, for example a state snapshotted from mainnet and converted to KORE format, to debug a transaction against realistic data.
+- **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}` and `transactions.json` with `{}`.
+- **`state.kore` present** — it is used as-is, and the sidecar files are seeded only if missing. This lets you resume a previous session (ledger counter and transaction store included) or start against a pre-built state.
 
-The `trace` flag controls whether instruction-level execution traces are generated. When `True`, the initial `state.kore` is produced with `<ioDir>trace.jsonl</ioDir>` baked in, enabling the tracing K rules for all subsequent transactions. See [interpreter.md](interpreter.md) for details.
+The `trace` flag is passed to `TransactionEncoder`; when set, every transaction request carries `"trace": true`, so the semantics enable instruction tracing. (Tracing only produces records for contract invocations.)
 
 ---
 
 ## State file lifecycle
 
-`state.kore` is the single file representing the entire blockchain state. It is a serialized K configuration (KORE format) containing all accounts, contract code, contract storage, and ledger metadata.
+Server state is split across three files in the io dir; see [architecture.md](architecture.md#state-management) for the full table.
 
 ```
-startup:  if state.kore does not exist
-          → server calls interpreter.empty_config()
-          → writes the initial empty K configuration to state.kore
+startup (state.kore absent):
+          → empty_config() → state.kore ; metadata.json {latest_ledger:0} ; transactions.json {}
 
 per successful transaction:
-          → NodeInterpreter reads state.kore (krun input) and translates transaction steps
-          → krun executes the transaction steps
-          → krun outputs the updated configuration to stdout
-          → server overwrites state.kore with the new configuration
-          → ledger_seq incremented
+          → the semantics run the steps, append a SUCCESS receipt to transactions.json,
+            bump latest_ledger in metadata.json, and write response.json
+          → NodeInterpreter persists the new state.kore
 
-per failed transaction:
-          → state.kore is NOT updated (state rolls back implicitly)
-          → ledger_seq is NOT incremented
+per failed (stuck) transaction:
+          → no response.json is produced; state.kore and metadata.json are left unchanged
+          → the server synthesises a FAILED receipt (see below)
 ```
 
-Because `state.kore` lives on disk, the server can be stopped and restarted between transactions without losing state. To start fresh, delete `state.kore`. To resume from a checkpoint, provide a pre-built kore file via `--state-file`.
+Because all three files live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the transaction store.
 
 ---
 
 ## RPC methods
 
-All methods follow the [Stellar RPC specification](https://developers.stellar.org/docs/data/apis/rpc/methods).
+All methods are answered by the K semantics and follow the [Stellar RPC specification](https://developers.stellar.org/docs/data/apis/rpc/methods).
 
 ### `getHealth`
 
-Returns `{"status": "healthy"}`. Used by clients to check server liveness.
+Returns `{"status": "healthy"}`.
 
 ### `getNetwork`
 
-Returns the network passphrase and protocol version. Clients use this to verify they are connected to the expected network.
-
 ```json
-{
-  "friendbotUrl": null,
-  "passphrase": "Test SDF Network ; September 2015",
-  "protocolVersion": "22"
-}
+{ "friendbotUrl": null, "passphrase": "Test SDF Network ; September 2015", "protocolVersion": "22" }
 ```
 
 ### `getLatestLedger`
 
-Returns the current ledger sequence number. This increments by 1 for each successfully committed transaction.
+Returns the current ledger sequence (the `latest_ledger` from `metadata.json`), which increments by 1 per successfully committed transaction.
 
 ```json
-{
-  "id": "0000...0000",
-  "protocolVersion": "22",
-  "sequence": 4
-}
+{ "id": "0000...0000", "protocolVersion": "22", "sequence": 4 }
 ```
 
 ### `sendTransaction`
 
-The main entry point for submitting transactions. Accepts a base64-encoded XDR transaction envelope.
+Submits a base64-encoded XDR transaction envelope.
 
-**Execution model**: The Stellar RPC API was designed for a real Stellar validator, where transactions enter a mempool and are only executed after a ledger close (which takes a few seconds). The API contract therefore requires `sendTransaction` to always return `PENDING`, with clients expected to poll `getTransaction` for the final outcome.
-
-In komet-node there is no mempool or ledger close. krun executes the transaction immediately, inside the `sendTransaction` call itself. By the time the method returns, the result is already known and stored internally — but we still return `PENDING` to stay compatible with Stellar clients that expect the two-step pattern.
-
-**Flow**:
-1. Decode the XDR envelope via `TransactionEnvelope.from_xdr`
-2. Compute `tx_hash = envelope.hash_hex()`
-3. Call `interpreter.run_transaction(state_file, envelope.transaction)`
-4. On success: overwrite `state.kore`, increment `ledger_seq`, store `SUCCESS` result
-5. On `NodeInterpreterError`: store `FAILED` result (state unchanged)
-6. Return `{hash, status: "PENDING", latestLedger, latestLedgerCloseTime}`
+**Execution model**: real Stellar RPC was designed around a mempool and ledger close, so the API requires `sendTransaction` to return `PENDING` and have clients poll `getTransaction`. komet-node has no mempool — the semantics execute the transaction immediately — but it still returns `PENDING` to stay compatible with the two-step pattern.
 
 **Response**:
 ```json
-{
-  "hash": "<64-char hex>",
-  "status": "PENDING",
-  "latestLedger": "5",
-  "latestLedgerCloseTime": "1716000000"
-}
+{ "hash": "<64-char hex>", "status": "PENDING", "latestLedger": "5", "latestLedgerCloseTime": "1716000000" }
+```
+
+### `traceTransaction`
+
+Like `sendTransaction`, but enables instruction tracing and returns the result **inline** in a single call (no polling). The `trace` field is a JSONL string, one record per executed WebAssembly instruction.
+
+```json
+{ "hash": "<hex>", "status": "SUCCESS", "ledger": "5", "trace": "<jsonl>",
+  "latestLedger": "5", "latestLedgerCloseTime": "1716000000" }
 ```
 
 ### `getTransaction`
 
-Returns the stored result for a previously submitted transaction.
-
-**Statuses**:
+Looks up the stored receipt in `transactions.json`.
 
 | Status | Meaning |
 |---|---|
-| `NOT_FOUND` | Hash not in `_transactions` (never submitted, or server restarted) |
+| `NOT_FOUND` | Hash not in `transactions.json` |
 | `SUCCESS` | Transaction executed successfully |
-| `FAILED` | Transaction was submitted but krun returned an error |
+| `FAILED` | Transaction was submitted but got stuck in the semantics |
 
 **`SUCCESS` response**:
 ```json
 {
-  "status": "SUCCESS",
-  "ledger": "5",
-  "createdAt": "1716000000",
-  "envelopeXdr": "<base64 XDR>",
-  "resultXdr": "",
-  "resultMetaXdr": "",
+  "status": "SUCCESS", "ledger": "5", "createdAt": "1716000000",
+  "envelopeXdr": "<base64 XDR>", "resultXdr": "", "resultMetaXdr": "",
   "trace": "<jsonl string or null>",
-  "latestLedger": "5",
-  "latestLedgerCloseTime": "1716000000"
+  "latestLedger": "5", "latestLedgerCloseTime": "1716000000"
 }
 ```
 
-The `trace` field is `null` unless the server was started with `--trace`. When tracing is enabled, it contains newline-separated JSON records, one per executed WebAssembly instruction. See [interpreter.md](interpreter.md) for the trace format.
-
-Note: `resultXdr` and `resultMetaXdr` are currently empty stubs. Contract return values are not yet surfaced.
+`resultXdr` and `resultMetaXdr` are currently empty stubs.
 
 ---
 
-## Transaction storage
+## Failure fallback
 
-`_transactions` is an in-memory dict keyed by transaction hash. It is not persisted to disk, so results are lost on server restart. Only the blockchain state (`state.kore`) survives restarts.
+A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. The server then synthesises the response in Python: it records a `FAILED` receipt in `transactions.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING` (for `sendTransaction`) or the `FAILED` result (for `traceTransaction`). This is the only response content the server builds itself.
 
 ---
 
@@ -174,5 +155,5 @@ komet-node [--host HOST] [--port PORT] [--state-file PATH] [--trace]
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port |
-| `--state-file` | `state.kore` | Path to the persistent state file |
+| `--state-file` | `state.kore` | Path to the persistent state file (its directory also holds `metadata.json` / `transactions.json`) |
 | `--trace` | off | Enable instruction-level execution tracing |

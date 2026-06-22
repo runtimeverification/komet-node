@@ -1,25 +1,42 @@
 from __future__ import annotations
 
+import json
 import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from pyk.rpc.rpc import JsonRpcServer, ServeRpcOptions
-from stellar_sdk import Network, TransactionEnvelope
+from stellar_sdk import Network
 
-from komet_node.interpreter import NodeInterpreter, NodeInterpreterError
+from komet_node.interpreter import NodeInterpreter
+from komet_node.transaction import TransactionEncoder
 
 if TYPE_CHECKING:
-    pass
+    from http.server import HTTPServer as HTTPServerType
 
 _PROTOCOL_VERSION: Final = '22'
 
+_TX_METHODS: Final = ('sendTransaction', 'traceTransaction')
 
-class StellarRpcServer(JsonRpcServer):
+
+class StellarRpcServer:
+    """
+    Thin HTTP/JSON-RPC shim in front of the K node semantics.
+
+    It decodes the Stellar XDR envelope (:class:`TransactionEncoder`), then runs the
+    request envelope through the semantics (:class:`NodeInterpreter`). All RPC dispatch,
+    the transaction store, ledger accounting and response formatting are performed in K
+    (``node.md``). The persistent state lives in ``io_dir``:
+
+      - ``state.kore``        — the KORE world-state configuration (accounts, contracts, wasm)
+      - ``metadata.json``     — ``{"latest_ledger": N}``
+      - ``transactions.json`` — map from tx hash to stored receipt
+    """
+
     interpreter: NodeInterpreter
+    encoder: TransactionEncoder
     state_file: Path
-    ledger_seq: int
-    _transactions: dict[str, dict[str, Any]]
+    io_dir: Path
 
     def __init__(
         self,
@@ -29,133 +46,151 @@ class StellarRpcServer(JsonRpcServer):
         network_passphrase: str = Network.TESTNET_NETWORK_PASSPHRASE,
         trace: bool = False,
     ) -> None:
-        super().__init__(ServeRpcOptions({'addr': host, 'port': port, 'definition_dir': None}))
-        self.interpreter = NodeInterpreter(network_passphrase, trace=trace)
-        self.state_file = state_file
-        self.ledger_seq = 0
-        self._transactions = {}
+        self.host = host
+        self._port = port
+        self.interpreter = NodeInterpreter()
+        self.encoder = TransactionEncoder(network_passphrase, trace=trace)
+        self.state_file = state_file.resolve()
+        self.io_dir = self.state_file.parent
+        self.io_dir.mkdir(parents=True, exist_ok=True)
+        self._httpd: HTTPServerType | None = None
 
-        if not self.state_file.exists():
+        fresh = not self.state_file.exists()
+        if fresh:
             self.state_file.write_text(self.interpreter.empty_config())
+        metadata_file = self.io_dir / 'metadata.json'
+        if fresh or not metadata_file.exists():
+            metadata_file.write_text(json.dumps({'latest_ledger': 0}))
+        transactions_file = self.io_dir / 'transactions.json'
+        if fresh or not transactions_file.exists():
+            transactions_file.write_text(json.dumps({}))
 
-        self._register_stellar_methods()
+    def serve(self) -> None:
+        server = self
 
-    def _register_stellar_methods(self) -> None:
-        for name, fn in {
-            'getHealth': self.exec_get_health,
-            'getNetwork': self.exec_get_network,
-            'getLatestLedger': self.exec_get_latest_ledger,
-            'sendTransaction': self.exec_send_transaction,
-            'getTransaction': self.exec_get_transaction,
-            'traceTransaction': self.exec_trace_transaction,
-        }.items():
-            self.register_method(name, fn)
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802
+                length = int(self.headers.get('Content-Length', 0))
+                body = self.rfile.read(length)
+                response = server._handle(body)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(response)))
+                self.end_headers()
+                self.wfile.write(response)
 
-    def exec_get_health(self) -> dict[str, Any]:
-        return {'status': 'healthy'}
+            def log_message(self, *args: Any) -> None:  # silence per-request logging
+                pass
 
-    def exec_get_network(self) -> dict[str, Any]:
-        return {
-            'friendbotUrl': None,
-            'passphrase': self.interpreter.network_passphrase,
-            'protocolVersion': _PROTOCOL_VERSION,
-        }
+        self._httpd = HTTPServer((self.host, int(self._port)), Handler)
+        self._httpd.serve_forever()
 
-    def exec_get_latest_ledger(self) -> dict[str, Any]:
-        return {
-            'id': '0' * 64,
-            'protocolVersion': _PROTOCOL_VERSION,
-            'sequence': self.ledger_seq,
-        }
+    def port(self) -> int:
+        if self._httpd is not None:
+            return self._httpd.server_port
+        return int(self._port)
 
-    def exec_send_transaction(self, transaction: str) -> dict[str, Any]:
-        now = str(int(time.time()))
-        envelope = TransactionEnvelope.from_xdr(transaction, self.interpreter.network_passphrase)
-        tx_hash = envelope.hash_hex()
+    def shutdown(self) -> None:
+        if self._httpd is not None:
+            self._httpd.shutdown()
 
+    # ------------------------------------------------------------------
+    # Request handling
+    # ------------------------------------------------------------------
+
+    def _handle(self, body: bytes) -> bytes:
+        """Parse a raw JSON-RPC body and return the response bytes (the HTTP entry point)."""
         try:
-            result = self.interpreter.run_transaction(self.state_file, envelope.transaction, self.ledger_seq)
-            self.state_file.write_text(result.final_kore)
-            self.ledger_seq += 1
-            self._transactions[tx_hash] = {
-                'status': 'SUCCESS',
-                'ledger': str(self.ledger_seq),
-                'createdAt': now,
-                'envelopeXdr': transaction,
-                'resultXdr': '',
-                'resultMetaXdr': '',
-                'trace': result.trace,
-            }
-        except NodeInterpreterError:
-            self._transactions[tx_hash] = {
-                'status': 'FAILED',
-                'ledger': str(self.ledger_seq),
-                'createdAt': now,
-                'envelopeXdr': transaction,
-                'resultXdr': '',
-                'resultMetaXdr': '',
-                'trace': None,
-            }
+            req = json.loads(body.decode('utf-8'))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return _error_bytes(None, -32700, 'Parse error')
+        return self.handle_rpc(req.get('method'), req.get('params') or {}, req.get('id')).encode('utf-8')
 
-        return {
-            'hash': tx_hash,
-            'status': 'PENDING',
-            'latestLedger': str(self.ledger_seq),
-            'latestLedgerCloseTime': now,
-        }
+    def handle_rpc(self, method: str | None, params: dict[str, Any], request_id: Any = None) -> str:
+        """Dispatch a single JSON-RPC call and return the response envelope as a JSON string.
 
-    def exec_trace_transaction(self, transaction: str) -> dict[str, Any]:
+        Usable without the HTTP layer (e.g. from scripts and tests).
+        """
         now = str(int(time.time()))
-        envelope = TransactionEnvelope.from_xdr(transaction, self.interpreter.network_passphrase)
-        tx_hash = envelope.hash_hex()
 
-        try:
-            result = self.interpreter.run_transaction_with_trace(
-                self.state_file, envelope.transaction, self.ledger_seq
+        if method in _TX_METHODS:
+            envelope, program_steps = self.encoder.build_tx_request(
+                method, request_id, params['transaction'], now, force_trace=(method == 'traceTransaction')
             )
-            self.state_file.write_text(result.final_kore)
-            self.ledger_seq += 1
-            self._transactions[tx_hash] = {
-                'status': 'SUCCESS',
-                'ledger': str(self.ledger_seq),
-                'createdAt': now,
-                'envelopeXdr': transaction,
-                'resultXdr': '',
-                'resultMetaXdr': '',
-                'trace': result.trace,
-            }
-        except NodeInterpreterError:
-            self._transactions[tx_hash] = {
-                'status': 'FAILED',
-                'ledger': str(self.ledger_seq),
-                'createdAt': now,
-                'envelopeXdr': transaction,
-                'resultXdr': '',
-                'resultMetaXdr': '',
-                'trace': None,
-            }
+            response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
+            if response is None:
+                return json.dumps(self._failure_response(method, request_id, envelope, now))
+            return response
 
-        return {
-            'hash': tx_hash,
-            'status': self._transactions[tx_hash]['status'],
-            'ledger': self._transactions[tx_hash]['ledger'],
-            'trace': self._transactions[tx_hash]['trace'],
-            'latestLedger': str(self.ledger_seq),
-            'latestLedgerCloseTime': now,
+        read_only_envelope = self._read_only_envelope(method, params, request_id, now)
+        if read_only_envelope is None:
+            return _error_str(request_id, -32601, 'Method not found')
+        response = self.interpreter.run(self.state_file, self.io_dir, read_only_envelope, None)
+        if response is None:
+            return _error_str(request_id, -32603, 'Internal error')
+        return response
+
+    def _read_only_envelope(
+        self, method: str | None, params: dict[str, Any], request_id: Any, now: str
+    ) -> dict[str, Any] | None:
+        base = {'method': method, 'id': request_id, 'now': now}
+        if method == 'getHealth':
+            return base
+        if method == 'getNetwork':
+            return {**base, 'passphrase': self.encoder.network_passphrase, 'protocolVersion': _PROTOCOL_VERSION}
+        if method == 'getLatestLedger':
+            return {**base, 'protocolVersion': _PROTOCOL_VERSION}
+        if method == 'getTransaction':
+            return {**base, 'hash': params['hash']}
+        return None
+
+    def _failure_response(self, method: str, rpc_id: Any, envelope: dict[str, Any], now: str) -> dict[str, Any]:
+        """Synthesise the response for a transaction that got stuck (failed) in the semantics.
+
+        The K run does not produce a ``response.json`` for a failed transaction and the
+        world state is left unchanged. We record a FAILED receipt so a later getTransaction
+        finds it, without bumping the ledger.
+        """
+        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
+        ledger = metadata.get('latest_ledger', 0)
+        tx_hash = envelope['txHash']
+
+        receipt = {
+            'status': 'FAILED',
+            'ledger': str(ledger),
+            'createdAt': now,
+            'envelopeXdr': envelope['envelopeXdr'],
+            'resultXdr': '',
+            'resultMetaXdr': '',
+            'trace': None,
         }
+        transactions_file = self.io_dir / 'transactions.json'
+        transactions = json.loads(transactions_file.read_text())
+        transactions[tx_hash] = receipt
+        transactions_file.write_text(json.dumps(transactions))
 
-    def exec_get_transaction(self, hash: str) -> dict[str, Any]:
-        now = str(int(time.time()))
-        result = self._transactions.get(hash)
-
-        if result is None:
-            return {
-                'status': 'NOT_FOUND',
-                'latestLedger': str(self.ledger_seq),
+        if method == 'sendTransaction':
+            result = {
+                'hash': tx_hash,
+                'status': 'PENDING',
+                'latestLedger': str(ledger),
                 'latestLedgerCloseTime': now,
             }
+        else:
+            result = {
+                'hash': tx_hash,
+                'status': 'FAILED',
+                'ledger': str(ledger),
+                'trace': None,
+                'latestLedger': str(ledger),
+                'latestLedgerCloseTime': now,
+            }
+        return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
 
-        return result | {
-            'latestLedger': str(self.ledger_seq),
-            'latestLedgerCloseTime': now,
-        }
+
+def _error_str(rpc_id: Any, code: int, message: str) -> str:
+    return json.dumps({'jsonrpc': '2.0', 'id': rpc_id, 'error': {'code': code, 'message': message}})
+
+
+def _error_bytes(rpc_id: Any, code: int, message: str) -> bytes:
+    return _error_str(rpc_id, code, message).encode('utf-8')

@@ -10,11 +10,13 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from stellar_sdk import Account, Keypair, Network, TransactionBuilder
+from stellar_sdk import Account, Keypair, Network, TransactionBuilder, xdr
+from stellar_sdk.xdr.sc_val_type import SCValType
 
 from komet_node.server import StellarRpcServer
 
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
+ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resolve(strict=True)
 
 
 def wat_to_wasm(wat_path: Path) -> bytes:
@@ -144,7 +146,7 @@ def test_full_lifecycle_over_http(server: StellarRpcServer) -> None:
         assert send_res['result']['status'] == 'PENDING'
         tx_hash = send_res['result']['hash']
         get_res = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})
-        assert get_res['result']['status'] == 'SUCCESS', f"Transaction failed: {get_res}"
+        assert get_res['result']['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
         return get_res['result']
 
     def builder() -> TransactionBuilder:
@@ -164,12 +166,13 @@ def test_full_lifecycle_over_http(server: StellarRpcServer) -> None:
 
     # 3. Deploy contract
     from stellar_sdk.utils import sha256
+
     wasm_hash = sha256(wasm_bytecode)
     salt = b'\x00' * 32
     send(sign_and_xdr(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt)))
 
     # 4. Invoke foo()
-    contract_address = server.interpreter.contract_address_from_deployer_address(keypair.public_key, salt)
+    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
     send(sign_and_xdr(builder().append_invoke_contract_function_op(contract_address, 'foo', [])))
 
 
@@ -241,12 +244,13 @@ def test_trace_transaction_produces_trace_on_contract_invocation(server: Stellar
     send(sign_and_xdr(builder().append_upload_contract_wasm_op(wasm_bytecode)))
 
     from stellar_sdk.utils import sha256
+
     wasm_hash = sha256(wasm_bytecode)
     salt = b'\x00' * 32
     send(sign_and_xdr(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt)))
 
     # Invoke via traceTransaction and check trace content
-    contract_address = server.interpreter.contract_address_from_deployer_address(keypair.public_key, salt)
+    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
     invoke_xdr = sign_and_xdr(builder().append_invoke_contract_function_op(contract_address, 'foo', []))
     result = _rpc(server.port(), 'traceTransaction', {'transaction': invoke_xdr})['result']
 
@@ -256,6 +260,65 @@ def test_trace_transaction_produces_trace_on_contract_invocation(server: Stellar
     lines = [line for line in result['trace'].splitlines() if line.strip()]
     assert len(lines) > 0
     import json as _json
+
     for line in lines:
         record = _json.loads(line)
         assert 'instr' in record
+
+
+def test_call_tx_with_args(server: StellarRpcServer) -> None:
+    """Exercise the scval_to_json / #decodeArg pipeline for each supported SCVal type.
+
+    Uses a minimal contract (args.wat) whose functions accept various arg types and return
+    Void. Covers: bool, u32, i32, u64, i64, u128, i128, symbol.
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    def send(tb: TransactionBuilder) -> None:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
+        assert res['result']['status'] == 'PENDING'
+        tx_hash = res['result']['hash']
+        get_res = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
+        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+
+    # Set up: create account, upload args.wat, deploy contract
+    send(builder().append_create_account_op(keypair.public_key, '1000'))
+
+    wasm_bytecode = wat_to_wasm(ARGS_CONTRACT_WAT)
+    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
+
+    from stellar_sdk.utils import sha256
+
+    wasm_hash = sha256(wasm_bytecode)
+    salt = b'\x00' * 32
+    send(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
+
+    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+
+    def invoke(func: str, args: list[xdr.SCVal]) -> None:
+        send(builder().append_invoke_contract_function_op(contract_address, func, args))
+
+    invoke('test_bool', [xdr.SCVal(type=SCValType.SCV_BOOL, b=True)])
+    invoke(
+        'test_integers',
+        [
+            xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(42)),
+            xdr.SCVal(type=SCValType.SCV_I32, i32=xdr.Int32(-7)),
+            xdr.SCVal(type=SCValType.SCV_U64, u64=xdr.Uint64(100)),
+            xdr.SCVal(type=SCValType.SCV_I64, i64=xdr.Int64(-200)),
+        ],
+    )
+    invoke(
+        'test_wide_integers',
+        [
+            xdr.SCVal(type=SCValType.SCV_U128, u128=xdr.UInt128Parts(hi=xdr.Uint64(0), lo=xdr.Uint64(999))),
+            xdr.SCVal(type=SCValType.SCV_I128, i128=xdr.Int128Parts(hi=xdr.Int64(0), lo=xdr.Uint64(888))),
+        ],
+    )
+    invoke('test_symbol', [xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(sc_symbol=b'hello'))])
