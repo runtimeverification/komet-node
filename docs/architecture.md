@@ -6,23 +6,37 @@ komet-node is a local Stellar testnet whose execution engine is the [K formal se
 
 The split between Python and K follows one rule: K does everything that is part of the Soroban/Stellar protocol, and Python does only what K structurally cannot. The compiled K semantics are a *one-shot interpreter* — one invocation runs one request to completion and exits, with no network, no memory between invocations, and no decoder for Stellar's binary XDR format. Python supplies exactly those three missing pieces: it is the long-running process that holds the HTTP socket, it keeps the world state on disk between invocations, and it decodes the XDR envelope (and parses uploaded wasm). Everything else — RPC method dispatch, the transaction store, ledger-sequence accounting, status determination, and JSON-RPC response formatting — runs inside the K semantics (`node.md`).
 
-```
-Stellar client
-     │  JSON-RPC request (base64 XDR transaction)
-     ▼
-StellarRpcServer                    ← server.py   (long-running http.server; holds the socket + state files)
-     │
-     ├─ TransactionEncoder          ← transaction.py
-     │     XDR → request envelope (+ kasmer steps for wasm uploads)
-     │
-     └─ NodeInterpreter             ← interpreter.py
-           request.json + state.kore  →  llvm_interpret  →  response.json
-                  ▼
-        K semantics (LLVM backend)  ← kdist/node.md + soroban-semantics
-           reads request.json, dispatches the RPC method, updates the
-           world state + bookkeeping files, writes response.json
-                  ▼
-        state.kore · metadata.json · transactions.json   (persisted in the io dir)
+```mermaid
+flowchart TB
+    client(["Stellar client"])
+
+    subgraph py["Python — StellarRpcServer process (long-running)"]
+        direction TB
+        server["server.py — StellarRpcServer<br/>HTTP/JSON-RPC, owns the socket"]
+        encoder["transaction.py — TransactionEncoder<br/>XDR → request envelope<br/>(+ kasmer steps for wasm uploads)"]
+        interp["interpreter.py — NodeInterpreter<br/>runs the LLVM interpreter"]
+        server -->|"1 — build envelope"| encoder
+        server -->|"2 — run(envelope)"| interp
+    end
+
+    subgraph ksem["K semantics — LLVM backend (kdist/node.md + soroban-semantics)"]
+        node["dispatch RPC method · run steps via KASMER<br/>update bookkeeping · format response"]
+    end
+
+    subgraph iodir["io dir (on disk)"]
+        direction LR
+        state[("state.kore")]
+        meta[("metadata.json")]
+        txs[("transactions.json")]
+    end
+
+    client -->|"JSON-RPC (base64 XDR)"| server
+    interp -->|"request.json + state.kore"| node
+    node -->|"response.json"| interp
+    node <-->|"read / write"| meta
+    node <-->|"read / write"| txs
+    interp <-->|"round-trip"| state
+    server -->|"JSON-RPC response"| client
 ```
 
 ---
@@ -79,21 +93,21 @@ Server state is split across the *io dir* (the directory containing the state fi
 
 The world state stays in KORE (rather than a JSON snapshot) because an uploaded wasm module is a `ModuleDecl` that the semantics cannot reconstruct from bytes — only `wasm2kast` (Python) can produce it. The RPC bookkeeping, by contrast, is plain data and lives in the two JSON sidecar files, which the semantics read and write directly via the file-system hooks.
 
-```
-startup (state.kore absent):
-          → NodeInterpreter.empty_config() builds the idle K configuration in KORE
-            and runs it through llvm_interpret (no krun, no kast conversion)
-          → server writes state.kore, and seeds metadata.json ({latest_ledger: 0})
-            and transactions.json ({})
+```mermaid
+flowchart TB
+    boot(["server start"]) --> exists{"state.kore exists?"}
+    exists -->|"no"| init["empty_config() builds the idle K config in KORE<br/>write state.kore · seed metadata.json {latest_ledger: 0} · transactions.json {}"]
+    exists -->|"yes"| reuse["use existing state.kore<br/>seed sidecar files only if missing"]
+    init --> ready(["ready for requests"])
+    reuse --> ready
 
-per successful transaction:
-          → the semantics execute the steps, append a SUCCESS receipt to
-            transactions.json, bump latest_ledger in metadata.json, and write
-            response.json; NodeInterpreter persists the new state.kore
-
-per failed (stuck) transaction:
-          → no response.json is produced; state.kore is left unchanged and the
-            ledger is not bumped. The server synthesises a FAILED receipt.
+    ready --> tx(["transaction submitted"])
+    tx --> run["semantics run the decoded steps"]
+    run --> stuck{"steps completed<br/>without getting stuck?"}
+    stuck -->|"yes — SUCCESS"| ok["append SUCCESS receipt → transactions.json<br/>bump latest_ledger → metadata.json<br/>write response.json · persist new state.kore"]
+    stuck -->|"no — FAILED"| fail["no response.json<br/>state.kore and ledger left unchanged<br/>server synthesises a FAILED receipt"]
+    ok --> ready
+    fail --> ready
 ```
 
 Because all three files live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the transaction store. To resume a session, point `--state-file` at a saved `state.kore` (its sidecar files are read if present). To start fresh, delete the files.
@@ -102,30 +116,41 @@ Because all three files live on disk, the server can be stopped and restarted wi
 
 ## Request flow (end to end)
 
-```
-1. Client: POST {"method": "sendTransaction", "params": {"transaction": "<base64 XDR>"}}
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Server as StellarRpcServer
+    participant Enc as TransactionEncoder
+    participant Interp as NodeInterpreter
+    participant K as node.md (K semantics)
+    participant FS as io dir files
 
-2. StellarRpcServer.handle_rpc:
-   - TransactionEncoder.build_tx_request("sendTransaction", id, xdr, now, force_trace=False)
-       → ( request envelope {method, id, now, txHash, envelopeXdr, trace, steps},
-           program_steps )   # program_steps is None unless the tx uploads wasm
+    Note over Client,FS: Submit
+    Client->>Server: sendTransaction { transaction: base64 XDR }
+    Server->>Enc: build_tx_request(...)
+    Enc-->>Server: request envelope (+ program_steps if wasm upload)
+    Server->>Interp: run(state_file, io_dir, envelope, program_steps)
+    Interp->>FS: write request.json
+    Note right of Interp: wasm only — splice upload steps into the program cell, in KORE
+    Interp->>K: llvm_interpret on state.kore
+    Note over K: insert-handleRequestFile → dispatch → dispatchMethod
+    K->>FS: run steps, append SUCCESS receipt to transactions.json
+    K->>FS: bump latest_ledger in metadata.json
+    K->>FS: write response.json { status: PENDING, ... }
+    K-->>Interp: updated configuration
+    Interp->>FS: persist new state.kore
+    Interp-->>Server: response.json (verbatim)
+    Server-->>Client: { hash, status: PENDING, latestLedger, ... }
 
-3. NodeInterpreter.run(state_file, io_dir, envelope, program_steps):
-   - writes request.json
-   - (wasm only) splices the upload steps into the <program> cell, in KORE
-   - llvm_interpret on state.kore  → the semantics handle the request
-
-4. node.md:
-   - insert-handleRequestFile → #dispatch → #dispatchMethod("sendTransaction")
-   - run steps → record a SUCCESS receipt in transactions.json
-   - bump latest_ledger in metadata.json
-   - write response.json: {hash, status: "PENDING", latestLedger, latestLedgerCloseTime}
-
-5. NodeInterpreter persists the new state.kore and returns response.json verbatim.
-
-6. Client: POST {"method": "getTransaction", "params": {"hash": "<hash>"}}
-   → the semantics look up transactions.json and return
-     {status: SUCCESS, ledger, createdAt, envelopeXdr, trace, ...}
+    Note over Client,FS: Poll for the result
+    Client->>Server: getTransaction { hash }
+    Server->>Interp: run(read-only envelope)
+    Interp->>K: llvm_interpret on state.kore
+    K->>FS: look up hash in transactions.json
+    K-->>Interp: response.json
+    Interp-->>Server: response.json
+    Server-->>Client: { status: SUCCESS, ledger, createdAt, envelopeXdr, trace, ... }
 ```
 
 ---
