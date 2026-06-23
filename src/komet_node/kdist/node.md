@@ -1,10 +1,10 @@
 
 This module implements the komet-node JSON-RPC request lifecycle in K.
 
-The Python server is a thin shim: it decodes the Stellar XDR envelope (which K cannot
-parse), builds a JSON *request envelope* describing the RPC call, writes it to
-`request.json`, runs this semantics against the saved KORE configuration, and reads back
-`response.json`.
+The Python server wraps this semantics in a long-running process: it decodes the Stellar
+XDR envelope (which K cannot parse), builds a JSON *request envelope* describing the RPC
+call, writes it to `request.json`, runs this semantics against the saved KORE
+configuration, and reads back `response.json`.
 
 All RPC dispatch, transaction bookkeeping, ledger-sequence accounting and JSON-RPC
 response formatting live here in K:
@@ -61,9 +61,9 @@ module NODE
         <ledgerSequenceNumber> _ => SEQ </ledgerSequenceNumber>
 ```
 
-HexBytes: decode a lowercase hex string to Bytes (big-endian, length = hex length / 2).
-Relies on K's String2Base hook (base-16) and Int2Bytes with an explicit byte count so that
-leading zero bytes are preserved.
+`HexBytes` decodes a lowercase hex string to Bytes (big-endian, with length = hex length / 2).
+It relies on K's String2Base hook (base 16) and on Int2Bytes with an explicit byte count, so
+that leading zero bytes are preserved.
 
 ```k
     syntax Bytes ::= HexBytes(String) [function]
@@ -72,8 +72,8 @@ leading zero bytes are preserved.
       requires lengthString(S) >Int 0
 ```
 
-string2WasmToken: wrap a plain K String (e.g. "foo") in double-quote delimiters and
-produce a WasmStringToken using K's generic string-to-token hook.
+`string2WasmToken` wraps a plain K String (for example, "foo") in double-quote delimiters and
+produces a WasmStringToken using K's generic string-to-token hook.
 
 ```k
     syntax WasmStringToken ::= string2WasmToken(String) [function, hook(STRING.string2token)]
@@ -82,8 +82,8 @@ produce a WasmStringToken using K's generic string-to-token hook.
 ###############################################################################
 # JSON helpers
 
-Order-independent accessors over JSON objects, and an upsert helper for the transaction
-store. Ported from kontrol-node's `json-utils.md`.
+These rules provide order-independent accessors over JSON objects, plus an upsert helper for
+the transaction store, ported from kontrol-node's `json-utils.md`.
 
 ```k
     syntax JSON ::= #getJSON( JSONKey, JSON )       [function, symbol(getJSON)]
@@ -129,7 +129,7 @@ and `request.json` is present (the initial/idle state). If `request.json` does n
 this rule does not fire and execution halts — this is the idle state the node saves for
 reuse.
 
-For transactions that carry uploaded wasm, the Python shim injects the kasmer steps into
+For transactions that carry uploaded wasm, the Python server injects the kasmer steps into
 the `<program>` cell directly (the wasm `ModuleDecl` cannot be JSON-encoded). Those steps
 run first via KASMER's `load-program` rule (which requires a non-empty `<program>`); once
 `<program>` drains to `.Steps`, this rule fires and the request envelope drives the

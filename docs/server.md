@@ -1,6 +1,6 @@
 # `server.py` — `StellarRpcServer`
 
-`StellarRpcServer` is the outermost layer of komet-node. It exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC and owns the request/response lifecycle. It is a thin shim: it decodes the XDR envelope (via `TransactionEncoder`), runs the request through the K semantics (via `NodeInterpreter`), and returns whatever `response.json` the semantics produced. All RPC dispatch, the transaction store, ledger accounting, and response formatting happen in K — the server holds none of that state.
+`StellarRpcServer` exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC. Its job is to make the K semantics usable as a server. The compiled semantics are a one-shot interpreter — one process invocation per request, with no networking and no memory between runs — and `StellarRpcServer` is the long-running process wrapped around them: it keeps the HTTP socket open and the state files on disk, decodes the XDR envelope (via `TransactionEncoder`), runs each request through the semantics (via `NodeInterpreter`), and returns whatever `response.json` the semantics produced. All RPC dispatch, the transaction store, ledger accounting, and response formatting happen in K — the server holds none of that state itself.
 
 ---
 
@@ -18,7 +18,7 @@ The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `B
 
 ### `handle_rpc(method, params, request_id) -> str`
 
-The dispatch entry point, returning the JSON-RPC response envelope as a string. It is usable **without** the HTTP layer, which is convenient for scripts and tests:
+`handle_rpc` is the dispatch entry point; it returns the JSON-RPC response envelope as a string. You can call it **without** the HTTP layer, which is convenient for scripts and tests:
 
 ```python
 server = StellarRpcServer(state_file=Path('out/state.kore'))
@@ -79,7 +79,7 @@ All methods are answered by the K semantics and follow the [Stellar RPC specific
 
 ### `getHealth`
 
-Returns `{"status": "healthy"}`.
+`getHealth` returns `{"status": "healthy"}`.
 
 ### `getNetwork`
 
@@ -89,7 +89,7 @@ Returns `{"status": "healthy"}`.
 
 ### `getLatestLedger`
 
-Returns the current ledger sequence (the `latest_ledger` from `metadata.json`), which increments by 1 per successfully committed transaction.
+`getLatestLedger` returns the current ledger sequence (the `latest_ledger` from `metadata.json`), which increments by 1 per successfully committed transaction.
 
 ```json
 { "id": "0000...0000", "protocolVersion": "22", "sequence": 4 }
@@ -97,7 +97,7 @@ Returns the current ledger sequence (the `latest_ledger` from `metadata.json`), 
 
 ### `sendTransaction`
 
-Submits a base64-encoded XDR transaction envelope.
+`sendTransaction` submits a base64-encoded XDR transaction envelope.
 
 **Execution model**: real Stellar RPC was designed around a mempool and ledger close, so the API requires `sendTransaction` to return `PENDING` and have clients poll `getTransaction`. komet-node has no mempool — the semantics execute the transaction immediately — but it still returns `PENDING` to stay compatible with the two-step pattern.
 
@@ -108,7 +108,7 @@ Submits a base64-encoded XDR transaction envelope.
 
 ### `traceTransaction`
 
-Like `sendTransaction`, but enables instruction tracing and returns the result **inline** in a single call (no polling). The `trace` field is a JSONL string, one record per executed WebAssembly instruction.
+`traceTransaction` behaves like `sendTransaction`, but it enables instruction tracing and returns the result **inline** in a single call, with no polling. The `trace` field is a JSONL string with one record per executed WebAssembly instruction.
 
 ```json
 { "hash": "<hex>", "status": "SUCCESS", "ledger": "5", "trace": "<jsonl>",
@@ -117,7 +117,7 @@ Like `sendTransaction`, but enables instruction tracing and returns the result *
 
 ### `getTransaction`
 
-Looks up the stored receipt in `transactions.json`.
+`getTransaction` looks up the stored receipt in `transactions.json`.
 
 | Status | Meaning |
 |---|---|

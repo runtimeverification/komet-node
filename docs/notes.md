@@ -2,7 +2,7 @@
 
 ## What this does
 
-`komet-node` is a local Stellar testnet backed by the K semantics of Soroban. Python is a thin shim that decodes Stellar XDR and shuttles bytes; the RPC layer itself — method dispatch, the transaction store, ledger accounting, status, and response formatting — runs inside the K semantics ([`node.md`](node-semantics.md)).
+`komet-node` is a local Stellar testnet backed by the K semantics of Soroban. The compiled semantics are a one-shot interpreter (one process per request, no networking, no state between runs), so Python wraps them into a long-running server: it holds the HTTP socket, keeps state on disk between runs, and decodes Stellar XDR, which K cannot. The RPC layer itself — method dispatch, the transaction store, ledger accounting, status, and response formatting — runs inside the K semantics ([`node.md`](node-semantics.md)).
 
 See `src/komet_node/demo.py` for an end-to-end example: empty state → create account → upload wasm → deploy contract → call `foo()`, with each step's K configuration pretty-printed.
 
@@ -12,7 +12,7 @@ See `src/komet_node/demo.py` for an end-to-end example: empty state → create a
 
 | Module | Role |
 |---|---|
-| [`server.py`](server.md) — `StellarRpcServer` | Raw HTTP/JSON-RPC shim; `handle_rpc` dispatch; owns the io-dir files. Holds no ledger or tx state. |
+| [`server.py`](server.md) — `StellarRpcServer` | Long-running HTTP/JSON-RPC server wrapping the one-shot K interpreter; `handle_rpc` dispatch; owns the io-dir files. Holds no ledger or tx state. |
 | [`transaction.py`](transaction.md) — `TransactionEncoder` | XDR → request envelope + (for wasm uploads) kasmer steps; address/contract-id helpers. |
 | [`interpreter.py`](interpreter.md) — `NodeInterpreter` | Runs request envelopes through `llvm_interpret`; persists `state.kore`. No `kast`↔`kore` whole-config conversions. |
 | `scval.py` | XDR `SCVal` ↔ Komet `SCValue` (`scvalue_from_xdr`) and XDR `SCVal` → request JSON (`scval_to_json`). |
@@ -24,12 +24,12 @@ State lives in the io dir as `state.kore` (KORE world state), `metadata.json` (l
 
 ## Tests (`src/tests/integration/`)
 
-- `test_server.py` — drives the running HTTP server end-to-end: the read-only methods, `sendTransaction` + `getTransaction`, ledger increments, the full lifecycle (create → upload wasm → deploy → invoke), the `traceTransaction` flows, and `test_call_tx_with_args` (deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` args — the `scval_to_json` / `#decodeArg` pipeline).
-- `test_integration.py` / `test_unit.py` — small sanity checks.
+- `test_server.py` drives the running HTTP server end-to-end. It exercises the read-only methods, `sendTransaction` + `getTransaction`, ledger increments, the full lifecycle (create → upload wasm → deploy → invoke), and the `traceTransaction` flows. `test_call_tx_with_args` deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` arguments, exercising the `scval_to_json` / `#decodeArg` pipeline.
+- `test_integration.py` and `test_unit.py` hold small sanity checks.
 
 Run with `make test` (requires `make kdist-build` first).
 
-Not yet covered: `bytes` / `address` SCVal args, and `SCVec` / `SCMap` (the latter are not yet encoded by `scval_to_json`).
+The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCMap` (and `scval_to_json` does not yet encode the latter).
 
 ---
 
@@ -37,4 +37,4 @@ Not yet covered: `bytes` / `address` SCVal args, and `SCVec` / `SCMap` (the latt
 
 - `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
-- No `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, or TTL/footprint operations.
+- `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.

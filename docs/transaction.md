@@ -18,7 +18,7 @@ The encoder is stateless apart from these two configuration values; it holds no 
 
 ## `build_tx_request(method, rpc_id, transaction_xdr, now, force_trace)`
 
-The entry point. Decodes the XDR envelope and returns a `(request, program_steps)` pair:
+`build_tx_request` is the entry point. It decodes the XDR envelope and returns a `(request, program_steps)` pair:
 
 ```python
 request = {

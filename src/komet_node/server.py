@@ -22,12 +22,15 @@ _TX_METHODS: Final = ('sendTransaction', 'traceTransaction')
 
 class StellarRpcServer:
     """
-    Thin HTTP/JSON-RPC shim in front of the K node semantics.
+    Long-running HTTP/JSON-RPC server that wraps the one-shot K node semantics.
 
-    It decodes the Stellar XDR envelope (:class:`TransactionEncoder`), then runs the
-    request envelope through the semantics (:class:`NodeInterpreter`). All RPC dispatch,
-    the transaction store, ledger accounting and response formatting are performed in K
-    (``node.md``). The persistent state lives in ``io_dir``:
+    The compiled semantics run one request per process invocation and hold no state
+    between runs, so this server supplies what they lack: it keeps the HTTP socket open,
+    persists state to disk, and decodes the Stellar XDR envelope (:class:`TransactionEncoder`)
+    that K cannot parse. It then runs the request envelope through the semantics
+    (:class:`NodeInterpreter`). All RPC dispatch, the transaction store, ledger accounting,
+    and response formatting are performed in K (``node.md``). The persistent state lives in
+    ``io_dir``:
 
       - ``state.kore``        — the KORE world-state configuration (accounts, contracts, wasm)
       - ``metadata.json``     — ``{"latest_ledger": N}``

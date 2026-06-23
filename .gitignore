@@ -2,3 +2,10 @@
 __pycache__/
 .coverage
 .direnv/
+
+# Runtime artifacts written by the server / interpreter in the io dir
+metadata.json
+response.json
+state.kore
+trace.jsonl
+transactions.json

@@ -11,36 +11,39 @@ class NodeInterpreter:
     definition: SimbolikDefinition   # compiled K definition (komet-node.simbolik)
 ```
 
-`SimbolikDefinition` is a thin subclass of `komet.SorobanDefinition`, pointing to the `komet-node.simbolik` compiled K definition (cached under `~/.cache/kdist-*/komet-node/simbolik/`). Note there is no `network_passphrase` or `trace` here — those belong to the request side (`TransactionEncoder`); the interpreter is purely about running K.
+`SimbolikDefinition` is a thin subclass of `komet.SorobanDefinition`, pointing to the `komet-node.simbolik` compiled K definition (cached under `~/.cache/kdist-*/komet-node/simbolik/`). There is no `network_passphrase` or `trace` here — those belong to the request side (`TransactionEncoder`); the interpreter only runs K.
 
 ---
 
 ## No `kast`↔`kore` conversions
 
-A guiding constraint: whole-configuration `kore_to_kast` / `kast_to_kore` conversions take seconds and get slower as the configuration grows, so the interpreter avoids them entirely. `state.kore` is only ever parsed with `KoreParser` (KORE text → KORE AST, which is cheap) and handed straight to `llvm_interpret`. Terms that must be constructed are built directly in KORE.
+Whole-configuration `kore_to_kast` / `kast_to_kore` conversions take seconds and get slower as the configuration grows, so the interpreter avoids them entirely. `state.kore` is only ever parsed with `KoreParser` (KORE text → KORE AST, which is cheap) and handed straight to `llvm_interpret`. Terms that must be constructed are built directly in KORE.
 
 ### `empty_config()`
 
-Produces the initial blank-slate `state.kore`. It builds the top-cell initializer **in KORE** — seeding `$PGM` with a single `setExitCode(0)` step and `$TRACE` with an empty string — and runs it through `llvm_interpret`. No `krun` subprocess and no kast conversion are involved.
+`empty_config()` produces the initial blank-slate `state.kore`. It builds the top-cell initializer **in KORE** — seeding `$PGM` with a single `setExitCode(0)` step and `$TRACE` with an empty string — and runs it through the interpreter. No `krun` subprocess and no kast conversion are involved.
 
 ```python
 config = top_cell_initializer({
     '$PGM':   inj(SortSteps, K_ITEM, kasmerSteps(setExitCode(0), .Steps)),  # built in KORE
     '$TRACE': inj(SortString, K_ITEM, str_dv('')),
 })
-return llvm_interpret(self.definition.path, config, check=False).text
+with tempfile.TemporaryDirectory() as isolated_dir:        # see note below
+    return _llvm_interpret(self.definition.path, config, cwd=isolated_dir).text
 ```
 
 The result is the empty idle K configuration — no accounts, no contracts, no storage.
 
+The run happens in a throwaway empty directory on purpose. The idle configuration ends with empty `<k>`/`<program>` cells, which is exactly the precondition that makes the request-handling rule fire if a `request.json` is present. Running in an empty directory guarantees no stray `request.json` is picked up and dispatched into the configuration that is about to be saved as `state.kore`.
+
 ### `run(state_file, io_dir, request, program_steps=None)`
 
-The main entry point. Runs a single RPC request envelope:
+`run` is the main entry point. It runs a single RPC request envelope through the following steps:
 
 1. Write the request envelope to `request.json` in `io_dir`, and delete any stale `response.json`.
 2. Parse `state.kore` with `KoreParser` (no kast conversion).
 3. For a wasm upload only, splice the upload steps into the `<program>` cell (see below).
-4. `chdir` into `io_dir` (so the K file-system hooks resolve the relative paths `request.json`, `response.json`, `metadata.json`, `transactions.json`, `trace.jsonl`) and call `llvm_interpret`.
+4. Run the interpreter with its subprocess working directory set to `io_dir` (so the K file-system hooks resolve the relative paths `request.json`, `response.json`, `metadata.json`, `transactions.json`, `trace.jsonl`). The directory is set on the subprocess only — the server's own process never `chdir`s, so concurrent requests in other threads are unaffected.
 5. If the semantics wrote `response.json`, persist the new configuration to `state.kore` and return the response text. If not, the transaction got stuck (failed) — leave `state.kore` unchanged and return `None`, so the caller can synthesise a failure response.
 
 ### `_inject_program(pattern, steps)` — the wasm-upload path
@@ -58,7 +61,7 @@ Because Soroban allows only a single host-function operation per transaction, a 
 
 ### `pretty_print(kore_str)`
 
-A debugging helper that pretty-prints a KORE configuration string using `krun --output pretty --depth 0`. Used by `demo.py` to render each step of a contract lifecycle.
+`pretty_print` is a debugging helper that pretty-prints a KORE configuration string using `krun --output pretty --depth 0`. `demo.py` uses it to render each step of a contract lifecycle.
 
 ---
 
@@ -77,4 +80,4 @@ The mapping from Stellar operations to kasmer steps is performed by [`Transactio
 
 ## Error handling
 
-`NodeInterpreterError` is raised for interpreter-level failures (e.g. `pretty_print`). A *transaction* failure is not an exception: the semantics simply get stuck without writing `response.json`, so `run` returns `None` and the server records a `FAILED` receipt while leaving `state.kore` unchanged (the state effectively rolls back).
+`NodeInterpreterError` is raised for interpreter-level failures (e.g. `pretty_print`). A *transaction* failure is not an exception: the semantics get stuck without writing `response.json`, so `run` returns `None` and the server records a `FAILED` receipt while leaving `state.kore` unchanged (the state effectively rolls back).

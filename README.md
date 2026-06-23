@@ -16,7 +16,7 @@
 
 ## 🌟 Overview
 
-`komet-node` extends the standard Stellar RPC with a `traceTransaction` method that provides instruction-level execution traces. The node's state is persisted to disk, allowing the same ledger state to be reproduced and transactions to be replayed. The RPC logic itself runs inside the K formal semantics — Python is only a thin shim that decodes Stellar XDR.
+`komet-node` extends the standard Stellar RPC with a `traceTransaction` method that provides instruction-level execution traces. The node's state is persisted to disk, allowing the same ledger state to be reproduced and transactions to be replayed. The RPC logic itself runs inside the K formal semantics. The compiled semantics are a one-shot interpreter — given a state, it runs a single request to completion and exits — so a small Python program wraps it into a long-running server: it holds the HTTP connection, keeps the ledger state on disk between runs, and decodes Stellar's binary XDR transaction format, which K cannot read.
 
 ## 🚀 Quick Start
 
@@ -75,7 +75,7 @@ komet-node --trace               # enable instruction-level execution tracing
 | `--state-file` | `state.kore` | Path to the persistent state file |
 | `--trace` | off | Enable instruction-level execution tracing |
 
-On first start the server creates an empty `state.kore`, alongside `metadata.json` (the ledger counter) and `transactions.json` (the transaction store). Delete `state.kore` to reset the chain (the sidecar files are re-seeded), or point `--state-file` at a pre-built configuration to resume from a snapshot.
+On first start the server creates a fresh `state.kore` (the idle configuration — an empty chain), alongside `metadata.json` (the ledger counter) and `transactions.json` (the transaction store). Delete `state.kore` to reset the chain (the sidecar files are re-seeded), or point `--state-file` at a pre-built configuration to resume from a snapshot.
 
 #### Verify the server with `curl`
 
@@ -174,7 +174,7 @@ This produces `state.kore` plus `state_<n>_<step>.pretty` files under `./out`, l
 
 ## For Developers
 
-Prerequisites: `python >= 3.10`, [`uv`](https://docs.astral.sh/uv/), [`wabt`](https://github.com/WebAssembly/wabt) (for `wat2wasm`), and the K Framework. The [Dev Container](#for-developers) provisions all of these for you.
+Prerequisites: `python >= 3.10`, [`uv`](https://docs.astral.sh/uv/), [`wabt`](https://github.com/WebAssembly/wabt) (for `wat2wasm`), and the K Framework. The Dev Container provisions all of these for you.
 
 1. Install [VS Code](https://code.visualstudio.com/) and the [Dev Containers extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-containers).
 2. Open this repository in VS Code and choose **Reopen in Container** when prompted.
@@ -201,6 +201,7 @@ Common tasks are driven by `make` (see the [Makefile](Makefile) for the complete
 To build the node from source use:
 
 ```bash
+make build-kdist
 make build
 pip install dist/*.whl
 ```
@@ -208,7 +209,7 @@ pip install dist/*.whl
 ### Documentation
 
 - [Architecture overview](docs/architecture.md) — how the pieces fit together
-- [Server](docs/server.md) — the HTTP/RPC shim, state lifecycle, and full method reference
+- [Server](docs/server.md) — the long-running HTTP server that wraps the K interpreter, state lifecycle, and full method reference
 - [Transaction encoding](docs/transaction.md) — Stellar XDR → K request envelope
 - [Interpreter](docs/interpreter.md) — running request envelopes through the K semantics
 - [K semantics](docs/node-semantics.md) — the on-chain RPC dispatch and execution model

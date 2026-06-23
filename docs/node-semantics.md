@@ -1,6 +1,6 @@
 # `kdist/node.md` — K Semantics
 
-`node.md` is the K module that implements the **entire RPC layer** on the K side. It reads `request.json`, dispatches on the RPC method, reads and updates the bookkeeping files, executes transaction steps via KASMER, and writes the JSON-RPC `response.json`. Everything that is grounded in the formal semantics — method dispatch, the transaction store, ledger accounting, status determination, response formatting — lives here rather than in Python.
+`node.md` is the K module that implements the **entire RPC layer** on the K side. It reads `request.json`, dispatches on the RPC method, reads and updates the bookkeeping files, executes transaction steps via KASMER, and writes the JSON-RPC `response.json`. Everything that is part of the Soroban/Stellar protocol — method dispatch, the transaction store, ledger accounting, status determination, response formatting — lives here rather than in Python.
 
 It is compiled by `kdist/plugin.py` into the `komet-node.simbolik` LLVM binary, cached under `~/.cache/kdist-*/komet-node/simbolik/`.
 
@@ -8,7 +8,7 @@ It is compiled by `kdist/plugin.py` into the `komet-node.simbolik` LLVM binary, 
 
 ## Files
 
-The semantics communicate with the Python shim through files in the working directory (the io dir), using the file-system hooks. All paths are relative, resolved against the cwd that `NodeInterpreter` sets before each run.
+The semantics communicate with the Python process through files in the working directory (the io dir), using the file-system hooks. All paths are relative, resolved against the cwd that `NodeInterpreter` sets before each run.
 
 | File | Direction | Contents |
 |---|---|---|
@@ -86,7 +86,7 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
    `{ status: "SUCCESS", ledger, createdAt, envelopeXdr, resultXdr: "", resultMetaXdr: "", trace }`,
 3. responds — `{hash, status: "PENDING", ...}` for `sendTransaction`, or the inline `{hash, status, ledger, trace, ...}` for `traceTransaction`.
 
-Reaching `#finalizeTx` means the steps completed without getting stuck, so the status is `SUCCESS`. A failed transaction gets stuck before this point, `response.json` is never written, and the Python shim records the `FAILED` receipt instead.
+Reaching `#finalizeTx` means the steps completed without getting stuck, so the status is `SUCCESS`. A failed transaction gets stuck before this point, `response.json` is never written, and the Python server records the `FAILED` receipt instead.
 
 ### Two ways steps are delivered
 
@@ -129,7 +129,7 @@ The `steps-done` rule (mirroring KASMER's `steps-empty` but with a `...` frame) 
 
 ### `HexBytes(String) → Bytes`
 
-Decodes a lowercase hex string to `Bytes` (big-endian), preserving leading zero bytes via an explicit byte count.
+`HexBytes` decodes a lowercase hex string to `Bytes` (big-endian), preserving leading zero bytes via an explicit byte count.
 
 ```k
 rule HexBytes("") => .Bytes
@@ -139,7 +139,7 @@ rule HexBytes(S)  => Int2Bytes(lengthString(S) /Int 2, String2Base(S, 16), BE)
 
 ### `string2WasmToken(String) → WasmStringToken`
 
-Wraps a K `String` into a `WasmStringToken` (`hook(STRING.string2token)`), required because `callTx` expects a `WasmString` for the function name.
+`string2WasmToken` wraps a K `String` into a `WasmStringToken` (`hook(STRING.string2token)`). It is required because `callTx` expects a `WasmString` for the function name.
 
 ---
 
@@ -147,11 +147,11 @@ Wraps a K `String` into a `WasmStringToken` (`hook(STRING.string2token)`), requi
 
 ### `fs.md` — `FILE-OPERATIONS`
 
-Provides `#readFile`, `#writeFile`, `#appendFile`, `#fileExists`, and `#remove` as K functions backed by K's built-in I/O hooks (`#open`, `#read`, `#write`, `#close`). Used for the request/response and bookkeeping files, and by the tracing rules.
+`fs.md` provides `#readFile`, `#writeFile`, `#appendFile`, `#fileExists`, and `#remove` as K functions backed by K's built-in I/O hooks (`#open`, `#read`, `#write`, `#close`). The request/response files, the bookkeeping files, and the tracing rules all use them.
 
 ### `json.md` — JSON sort
 
-Provides the `JSON` sort with `String2JSON` / `JSON2String`, used to parse `request.json` and serialize `response.json` and the bookkeeping files.
+`json.md` is K Framework's built-in JSON module (not a project file). It provides the `JSON` sort with `String2JSON` / `JSON2String`, which the semantics use to parse `request.json` and to serialize `response.json` and the bookkeeping files.
 
 ---
 
@@ -184,7 +184,7 @@ make kdist-build
 uv run kdist build komet-node.simbolik
 ```
 
-Defined in `kdist/plugin.py`:
+`kdist/plugin.py` defines the build:
 - Backend: LLVM
 - Main file: `node.md`
 - Syntax module: `NODE-SYNTAX`

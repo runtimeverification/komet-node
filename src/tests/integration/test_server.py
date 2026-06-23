@@ -162,7 +162,7 @@ def test_send_transaction_and_get_result(server: StellarRpcServer) -> None:
     assert send_result['result']['status'] == 'PENDING'
     tx_hash = send_result['result']['hash']
 
-    # since krun runs synchronously, the result is already stored
+    # since the interpreter runs synchronously, the result is already stored
     get_result = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})
     assert get_result['result']['status'] == 'SUCCESS'
     assert get_result['result']['envelopeXdr'] == xdr_str
@@ -202,7 +202,7 @@ def test_failed_transaction_records_failed_receipt(server: StellarRpcServer) -> 
 
 
 def test_ledger_seq_increments(server: StellarRpcServer) -> None:
-    """ledger_seq increments by 1 for each successful transaction."""
+    """The ledger sequence increments by 1 for each successful transaction."""
     keypair = Keypair.random()
     account = Account(keypair.public_key, sequence=0)
 
