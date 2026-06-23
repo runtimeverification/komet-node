@@ -22,6 +22,7 @@ Output (written to --out-dir, default ./out):
   state_3_create_contract.pretty
   state_4_call_foo.pretty
 """
+
 from __future__ import annotations
 
 import argparse
@@ -31,7 +32,7 @@ from pathlib import Path
 from stellar_sdk import Account, Keypair, Network, TransactionBuilder
 from stellar_sdk.utils import sha256
 
-from komet_node.interpreter import NodeInterpreter
+from komet_node.server import StellarRpcServer
 
 
 def wat_to_wasm(wat_path: Path) -> bytes:
@@ -47,60 +48,56 @@ def main(wasm_wat: Path, out_dir: Path) -> None:
     root_keypair = Keypair.random()
     root_account = Account(root_keypair.public_key, sequence=0)
 
-    interpreter = NodeInterpreter()
+    # The server owns the io_dir lifecycle (state.kore, metadata.json, transactions.json);
+    # we drive it directly via handle_rpc, no HTTP server needed.
+    server = StellarRpcServer(state_file=state_file)
 
     step = 0
 
-    def save(kore_str: str, label: str) -> None:
+    def save(label: str) -> None:
         nonlocal step
-        state_file.write_text(kore_str)
         pretty_file = out_dir / f'state_{step}_{label}.pretty'
-        pretty_file.write_text(interpreter.pretty_print(kore_str))
+        pretty_file.write_text(server.interpreter.pretty_print(state_file.read_text()))
         print(f'[{step}] {label} -> {pretty_file.name}')
         step += 1
 
-    def run(tx: object, label: str) -> None:
-        result = interpreter.run_transaction(state_file, tx)  # type: ignore[arg-type]
-        save(result.final_kore, label)
+    def run(builder: TransactionBuilder, label: str) -> None:
+        envelope = builder.set_timeout(30).build()
+        envelope.sign(root_keypair)
+        server.handle_rpc('sendTransaction', {'transaction': envelope.to_xdr()})
+        save(label)
 
     def builder() -> TransactionBuilder:
         return TransactionBuilder(root_account, Network.TESTNET_NETWORK_PASSPHRASE, base_fee=100)
 
-    # 0. Generate initial (empty) K configuration and save it as the starting state
-    save(interpreter.empty_config(), 'initial')
+    # 0. The server initialised state.kore to the idle configuration; record it.
+    save('initial')
 
     # 1. Create root account
     run(
-        builder().append_create_account_op(destination=root_keypair.public_key, starting_balance='1000').set_timeout(30).build().transaction,
+        builder().append_create_account_op(destination=root_keypair.public_key, starting_balance='1000'),
         'create_account',
     )
 
     # 2. Upload wasm bytecode to the ledger (stores code keyed by its sha256 hash)
     wasm_bytecode = wat_to_wasm(wasm_wat)
-    run(
-        builder().append_upload_contract_wasm_op(wasm_bytecode).set_timeout(30).build().transaction,
-        'upload_wasm',
-    )
+    run(builder().append_upload_contract_wasm_op(wasm_bytecode), 'upload_wasm')
 
     # 3. Deploy a contract instance from the uploaded wasm
     wasm_hash = sha256(wasm_bytecode)
     salt = b'\x00' * 32
-    run(
-        builder().append_create_contract_op(wasm_hash, root_keypair.public_key, None, salt).set_timeout(30).build().transaction,
-        'create_contract',
-    )
+    run(builder().append_create_contract_op(wasm_hash, root_keypair.public_key, None, salt), 'create_contract')
 
     # 4. Invoke foo() — takes no args, returns Void (i64 value 2 in Soroban encoding)
-    contract_address = interpreter.contract_address_from_deployer_address(root_keypair.public_key, salt)
-    run(
-        builder().append_invoke_contract_function_op(contract_address, 'foo', []).set_timeout(30).build().transaction,
-        'call_foo',
-    )
+    contract_address = server.encoder.contract_address_from_deployer_address(root_keypair.public_key, salt)
+    run(builder().append_invoke_contract_function_op(contract_address, 'foo', []), 'call_foo')
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Deploy and invoke a Soroban contract through the Komet semantics.')
     parser.add_argument('wasm_wat', type=Path, help='Path to the .wat contract source file')
-    parser.add_argument('--out-dir', type=Path, default=Path('out'), help='Output directory for state files (default: ./out)')
+    parser.add_argument(
+        '--out-dir', type=Path, default=Path('out'), help='Output directory for state files (default: ./out)'
+    )
     args = parser.parse_args()
     main(args.wasm_wat, args.out_dir)

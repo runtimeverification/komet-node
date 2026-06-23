@@ -1,127 +1,127 @@
 # `kdist/node.md` — K Semantics
 
-`node.md` is the K module that implements the JSON fast path on the K side. It defines the request lifecycle rules that fire when `request.json` is present and execute the decoded steps against the Soroban state.
+`node.md` is the K module that implements the **entire RPC layer** on the K side. It reads `request.json`, dispatches on the RPC method, reads and updates the bookkeeping files, executes transaction steps via KASMER (Komet's harness for running Soroban operations as `Step`s), and writes the JSON-RPC `response.json`. Everything that is part of the Soroban/Stellar protocol — method dispatch, the transaction store, ledger accounting, status determination, response formatting — lives here rather than in Python.
 
 It is compiled by `kdist/plugin.py` into the `komet-node.simbolik` LLVM binary, cached under `~/.cache/kdist-*/komet-node/simbolik/`.
 
 ---
 
+## Files
+
+The semantics communicate with the Python process through files in the working directory (the io dir), using the file-system hooks. All paths are relative, resolved against the cwd that `NodeInterpreter` sets before each run.
+
+| File | Direction | Contents |
+|---|---|---|
+| `request.json` | Python → K | the request envelope (`method`, `id`, `now`, and method-specific fields) |
+| `response.json` | K → Python | the JSON-RPC response (`{jsonrpc, id, result}`) |
+| `metadata.json` | K ↔ K | `{"latest_ledger": N}` — the ledger counter |
+| `transactions.json` | K ↔ K | map from tx hash → stored receipt |
+| `trace.jsonl` | K → Python | per-instruction trace records, when tracing is enabled |
+
+---
+
 ## Request lifecycle
 
-The lifecycle fires when K starts in the idle state: `<k>`, `<instrs>`, and `<program>` are all empty.
+The lifecycle fires when K starts in the idle state — `<k>`, `<instrs>`, and `<program>` all empty — and `request.json` is present.
 
 ```
 K starts (idle state read from state.kore)
          │
-         ├─ request.json exists? ──no──► halt immediately
-         │                               (idle state is the output — saved as state.kore)
+         ├─ request.json exists? ──no──► halt immediately (idle state is the output)
          │
          yes
+         ▼
+insert-handleRequestFile → handleRequestFile
          │
          ▼
-insert-handleRequestFile
-    <k> .K => #handleRequestFile </k>
+#dispatch(String2JSON(#readFile("request.json")))
          │
          ▼
-handleRequestFile
-    setExitCode(1)                  ← guard: non-zero means "in progress"
-    ~> #handleRequest(file_contents)
-    ~> #removeRequestFile
-    ~> setExitCode(0)               ← success marker
+#dispatchMethod(method, request)        ← routes on the "method" field
          │
-         ▼
-handleRequest
-    String2JSON(S) → #decodeRequest → Steps injected into <k>
+         ├─ getHealth / getNetwork / getLatestLedger / getTransaction → #respond(...)
          │
+         └─ sendTransaction / traceTransaction → #runTx → run steps
+                → #finalizeTx → record receipt + bump ledger → #respond(...)
          ▼
-steps-seq / steps-done
-    KASMER executes each Step; steps-done consumes .Steps
-    and lets the continuation (#removeRequestFile ~> setExitCode(0)) proceed
-         │
+#respond(id, result)
+    write response.json {jsonrpc, id, result} ; remove request.json ; exitCode 0
          ▼
-removeRequestFile
-    #remove("request.json")
-         │
-         ▼
-setExitCode(0)
-    K halts with exitCode=0 — the idle state is the output
+K halts — the updated idle state is the output, saved as state.kore
 ```
 
-If `request.json` does not exist when K starts, `insert-handleRequestFile` does not fire and K halts immediately with the idle state as output. This idle state is then saved as `state.kore` and reused for the next request.
+If `request.json` is absent, `insert-handleRequestFile` does not fire and K halts immediately with the idle state.
 
 ---
 
-## Rules
+## Dispatch and the read-only methods
 
-### `insert-handleRequestFile`
+`#dispatch` reads the `method` field and routes to a per-method rule. The read-only methods answer directly from constants and the bookkeeping files:
 
-```k
-rule [insert-handleRequestFile]:
-    <k> .K => #handleRequestFile </k>
-    <instrs> .K </instrs>
-    <program> .Steps </program>
-  requires #fileExists("request.json")
-```
+- `getHealth` → `{ "status": "healthy" }`
+- `getNetwork` → `{ "friendbotUrl": null, "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic)
+- `getLatestLedger` → reads `metadata.json` and returns `{ "id": <64 zeros>, "protocolVersion": ..., "sequence": <latest_ledger> }`
+- `getTransaction` → looks up the hash in `transactions.json`; returns the stored receipt merged with the current `latestLedger`/`latestLedgerCloseTime`, or `{ "status": "NOT_FOUND", ... }`
 
-Entry point. Fires only when all three cells are empty **and** `request.json` is present. If the file is absent, this rule does not fire and execution terminates (idle state).
-
-### `handleRequestFile`
-
-```k
-rule [handleRequestFile]:
-    <k> #handleRequestFile
-     => setExitCode(1)
-     ~> #handleRequest({#readFile("request.json")}:>String)
-     ~> #removeRequestFile
-     ~> setExitCode(0) ...
-    </k>
-```
-
-Reads the file and sets up the full execution pipeline with an exit-code guard. `setExitCode(1)` means "execution in progress / failed"; it is overwritten to `0` only if all steps complete without error.
-
-### `handleRequest` / `#decodeRequest`
-
-```k
-rule [handleRequest]:
-    <k> #handleRequest(S:String) => #decodeRequest(String2JSON(S)) ... </k>
-```
-
-Parses the JSON string and decodes it into a `Steps` sequence using `#decodeRequest` → `#decodeSteps` → `#decodeStep`.
-
-### `steps-done`
-
-```k
-rule [steps-done]:
-    <k> .Steps => .K ... </k>
-    <instrs> .K </instrs>
-```
-
-KASMER's standard `steps-empty` rule requires `<k> .Steps </k>` with no frame (exact match). In the JSON path, steps are injected into `<k>` with a continuation (`#removeRequestFile ~> setExitCode(0)`), so `steps-empty` would never fire. This supplementary rule handles `.Steps` when a continuation follows, consuming it and allowing the rest to proceed.
-
-### `removeRequestFile`
-
-```k
-rule [removeRequestFile]:
-    <k> #removeRequestFile => #remove("request.json") ... </k>
-```
-
-Deletes `request.json` after the steps have been executed, cleaning up the temp dir.
+`#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0.
 
 ---
 
-## JSON decoding
+## Transaction methods
 
-JSON decoding is a chain of pure K functions that pattern-match on the `JSON` sort. Key order in the JSON objects **must** match the order of keys in the K patterns exactly, because K's `JSON` sort is ordered (backed by an ordered list of key-value pairs).
+`sendTransaction` and `traceTransaction` share one rule (`#runTx`); they differ only in whether tracing is enabled and the shape of the immediate response.
 
 ```
-#decodeRequest({ "steps": [SS] })  →  #decodeSteps(SS)
-#decodeSteps(S, SS)                →  #decodeStep(S) #decodeSteps(SS)
-#decodeStep({ "op": "setAccount",     ... })  →  setAccount(...)
-#decodeStep({ "op": "deployContract", ... })  →  deployContract(...)
-#decodeStep({ "op": "callTx",         ... })  →  callTx(...)
+#runTx(request, method)
+   => #maybeEnableTrace(request, method)         ← point <ioDir> at trace.jsonl, or leave it ""
+   ~> setLedgerSequence(<latest_ledger from metadata.json>)
+   ~> #decodeSteps(<the "steps" array>)          ← KASMER runs each decoded step
+   ~> #finalizeTx(request, method)
 ```
 
-SCVal arguments are decoded by `#decodeArg`, which pattern-matches on `"type"` and produces a K `ScVal` constructor (`SCBool`, `I32`, `U32`, `I64`, `U64`, `I128`, `U128`, `Symbol`, `ScBytes`, `ScAddress`).
+`#finalizeTx` reads `metadata.json` and `transactions.json` (and `trace.jsonl` if tracing was on), then:
+
+1. writes `metadata.json` with `latest_ledger + 1`,
+2. upserts a receipt into `transactions.json` under the tx hash:
+   `{ status: "SUCCESS", ledger, createdAt, envelopeXdr, resultXdr: "", resultMetaXdr: "", trace }`,
+3. responds — `{hash, status: "PENDING", ...}` for `sendTransaction`, or the inline `{hash, status, ledger, trace, ...}` for `traceTransaction`.
+
+Reaching `#finalizeTx` means the steps completed without getting stuck, so the status is `SUCCESS`. A failed transaction gets stuck before this point, `response.json` is never written, and the Python server records the `FAILED` receipt instead.
+
+### Two ways steps are delivered
+
+- **JSON steps** (the common case): the operations are decoded from the `"steps"` array of the request envelope by `#decodeSteps` / `#decodeStep`.
+- **`<program>` injection** (wasm uploads only): the `uploadWasm` step — whose `ModuleDecl` has no JSON form — is spliced into the `<program>` cell by `NodeInterpreter` before the run. KASMER's `load-program` rule runs it first; once `<program>` drains, `insert-handleRequestFile` fires and the request envelope (with an empty `"steps"`) drives the bookkeeping. Both paths converge on `#finalizeTx`.
+
+---
+
+## JSON helpers
+
+`node.md` carries a small set of order-independent JSON accessors used for the request envelope and the bookkeeping files:
+
+- `#getJSON(key, obj[, default])`, `#getString(key, obj)`, `#getInt(key, obj)` — read a field
+- `#putJSON(key, value, obj)` — upsert into an object (used to add a receipt to `transactions.json`)
+- `#concatJSONs(a, b)` — append object entries (used to merge `latestLedger` fields into a stored receipt)
+
+These complement the **order-sensitive** step decoders below.
+
+---
+
+## JSON step decoding
+
+Step decoding pattern-matches on the `JSON` sort. Key order in the step objects **must** match the order of keys in the K patterns exactly, because K's `JSON` sort is ordered.
+
+```
+#decodeSteps(S, SS)                            →  #decodeStep(S) #decodeSteps(SS)
+#decodeStep({ "op": "setLedgerSequence", ... })→  setLedgerSequence(...)
+#decodeStep({ "op": "setAccount",        ... })→  setAccount(...)
+#decodeStep({ "op": "deployContract",    ... })→  deployContract(...)
+#decodeStep({ "op": "callTx",            ... })→  callTx(...)
+```
+
+SCVal arguments are decoded by `#decodeArg`, which matches on `"type"` and produces a K `ScVal` constructor (`SCBool`, `I32`, `U32`, `I64`, `U64`, `I128`, `U128`, `Symbol`, `ScBytes`, `ScAddress`).
+
+The `steps-done` rule (mirroring KASMER's `steps-empty` but with a `...` frame) consumes the final `.Steps` so the `#finalizeTx` continuation can proceed.
 
 ---
 
@@ -129,7 +129,7 @@ SCVal arguments are decoded by `#decodeArg`, which pattern-matches on `"type"` a
 
 ### `HexBytes(String) → Bytes`
 
-Decodes a lowercase hex string to `Bytes` (big-endian, length = `hex_length / 2`). Uses `String2Base(S, 16)` for the integer value and `Int2Bytes` with an explicit byte count to preserve leading zero bytes.
+`HexBytes` decodes a lowercase hex string to `Bytes` (big-endian), preserving leading zero bytes via an explicit byte count.
 
 ```k
 rule HexBytes("") => .Bytes
@@ -139,7 +139,7 @@ rule HexBytes(S)  => Int2Bytes(lengthString(S) /Int 2, String2Base(S, 16), BE)
 
 ### `string2WasmToken(String) → WasmStringToken`
 
-Wraps a K `String` into a `WasmStringToken` using `hook(STRING.string2token)`. Required because `callTx` expects a `WasmString` (the function name), not a plain K `String`.
+`string2WasmToken` wraps a K `String` into a `WasmStringToken` (`hook(STRING.string2token)`). It is required because `callTx` expects a `WasmString` for the function name.
 
 ---
 
@@ -147,19 +147,32 @@ Wraps a K `String` into a `WasmStringToken` using `hook(STRING.string2token)`. R
 
 ### `fs.md` — `FILE-OPERATIONS`
 
-Provides `#readFile`, `#writeFile`, `#appendFile`, `#fileExists`, and `#remove` as K functions backed by K's built-in I/O hooks (`#open`, `#read`, `#write`, `#close`). Used by `node.md` for the `request.json` lifecycle and by the tracing rules for appending trace records.
+`fs.md` provides `#readFile`, `#writeFile`, `#appendFile`, `#fileExists`, and `#remove` as K functions backed by K's built-in I/O hooks (`#open`, `#read`, `#write`, `#close`). The request/response files, the bookkeeping files, and the tracing rules all use them.
 
 ### `json.md` — JSON sort
 
-Provides the `JSON` sort and `String2JSON` used by `handleRequest` to parse the request body.
+`json.md` is K Framework's built-in JSON module (not a project file). It provides the `JSON` sort with `String2JSON` / `JSON2String`, which the semantics use to parse `request.json` and to serialize `response.json` and the bookkeeping files.
 
 ---
 
 ## Tracing integration
 
-`node.md` is compiled with `md_selector: 'k | k-tracing'`, which includes the tracing K rules from `soroban-semantics`. These rules intercept each WebAssembly instruction before execution and append a JSON record to the file at path `<ioDir>`.
+`node.md` is compiled with `md_selector: 'k | k-tracing'`, which includes the tracing rules from `soroban-semantics`. They intercept each WebAssembly instruction and append a JSON record to the file named by the `<ioDir>` cell.
 
-Tracing is activated by `<ioDir>` being non-empty. When the server is started with `--trace`, `empty_config()` bakes `<ioDir>trace.jsonl</ioDir>` into `state.kore`, enabling tracing for all subsequent transactions. See [interpreter.md](interpreter.md) for details.
+Tracing is activated per-request: when the request envelope carries `"trace": true` (set by `traceTransaction`, or by the `--trace` flag for every transaction), `#maybeEnableTrace` clears `trace.jsonl` and points `<ioDir>` at it; otherwise `<ioDir>` is left empty and tracing is off. After the steps run, `#finalizeTx` reads `trace.jsonl` back and stores it in the receipt's `trace` field.
+
+**Trace format** (one JSON record per line):
+
+```json
+{"pos": 597, "instr": ["local.get", 0], "stack": [["i64", 4]], "locals": {"0": ["i64", 4]}}
+```
+
+| Field | Description |
+|---|---|
+| `pos` | Byte offset of the instruction in the binary, or `null` for synthetic instructions |
+| `instr` | Instruction name and operands as a JSON array |
+| `stack` | Value stack at instruction entry, as `[type, value]` pairs |
+| `locals` | Local variable bindings, keyed by index, as `[type, value]` pairs |
 
 ---
 
@@ -171,7 +184,7 @@ make kdist-build
 uv run kdist build komet-node.simbolik
 ```
 
-Defined in `kdist/plugin.py`:
+`kdist/plugin.py` defines the build:
 - Backend: LLVM
 - Main file: `node.md`
 - Syntax module: `NODE-SYNTAX`

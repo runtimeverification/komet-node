@@ -1,65 +1,40 @@
-# komet-node: Handoff Notes
+# komet-node: Status Notes
 
 ## What this does
 
-`komet-node` is a Stellar node backed by the K semantics. The core component is `NodeInterpreter`, which takes a `.kore` file (blockchain state) and a Stellar `Transaction`, executes the operations through `krun`, and returns the updated state as kore text. A server that listens for incoming transactions, manages state persistence, and calls `NodeInterpreter` is yet to be built.
+`komet-node` is a local Stellar testnet backed by the K semantics of Soroban. The compiled semantics are a one-shot interpreter (one process per request, no networking, no state between runs), so Python wraps them into a long-running server: it holds the HTTP socket, keeps state on disk between runs, and decodes Stellar XDR, which K cannot. The RPC layer itself — method dispatch, the transaction store, ledger accounting, status, and response formatting — runs inside the K semantics ([`node.md`](node-semantics.md)).
 
-See `src/komet_node/demo.py` for an end-to-end example: empty state → create account → upload wasm → deploy contract → call `foo()`.
+See `src/komet_node/demo.py` for an end-to-end example: empty state → create account → upload wasm → deploy contract → call `foo()`, with each step's K configuration pretty-printed.
 
 ---
 
-## What's implemented
+## Module map
 
-### `NodeInterpreter` (`src/komet_node/interpreter.py`)
-
-Responsible for translating a Stellar `Transaction` into K steps and executing it against a given `.kore` state file. It is not the top-level entry point — a server (not yet implemented) will sit above it, handling incoming requests, managing the state file on disk, and owning the request/response lifecycle.
-
-`run_transaction(input_file, transaction)` translates each Stellar operation to a K step and runs it.
-
-Supported operations:
-
-| Stellar operation | K step |
+| Module | Role |
 |---|---|
-| `CreateAccount` | `setAccount(Account(bytes), stroops)` |
-| `InvokeHostFunction` / upload wasm | `uploadWasm(hash, ModuleDecl)` |
-| `InvokeHostFunction` / create contract (V1, V2) | `deployContract(from, address, wasmHash)` |
-| `InvokeHostFunction` / invoke contract | `callTx(from, to, func, args, Void)` |
+| [`server.py`](server.md) — `StellarRpcServer` | Long-running HTTP/JSON-RPC server wrapping the one-shot K interpreter; `handle_rpc` dispatch; owns the io-dir files. Holds no ledger or tx state. |
+| [`transaction.py`](transaction.md) — `TransactionEncoder` | XDR → request envelope + (for wasm uploads) kasmer steps; address/contract-id helpers. |
+| [`interpreter.py`](interpreter.md) — `NodeInterpreter` | Runs request envelopes through `llvm_interpret`; persists `state.kore`. No `kast`↔`kore` whole-config conversions. |
+| `scval.py` | XDR `SCVal` ↔ Komet `SCValue` (`scvalue_from_xdr`) and XDR `SCVal` → request JSON (`scval_to_json`). |
+| [`kdist/node.md`](node-semantics.md) | The K RPC layer: reads `request.json`, dispatches, updates `metadata.json` / `transactions.json`, writes `response.json`. |
 
-Execution paths:
-
-**JSON fast path** (`run_request_file`) — used for all operations except wasm upload:
-1. Encode the transaction as a JSON string (`encode_transaction_to_json`)
-2. Write it as `request.json` in a temp working directory
-3. Run `krun` on the idle `.kore` state — K reads the file, decodes it, executes the steps, removes the file, and halts
-
-**KORE round-trip** (`run_steps`) — used only for wasm upload, which must embed a `ModuleDecl` in the K AST:
-1. Parse `input.kore` → Python AST (`kore_to_kast`)
-2. Inject K steps into the `PROGRAM_CELL` of the config
-3. Re-serialize to KORE and run `krun`
-
-### `scval.py`
-
-Converts Stellar XDR `SCVal` to Komet `SCValue` dataclasses, used when building `callTx` arguments. Covers all numeric types, bool, symbol, bytes, address, vec, map.
-
-### K semantics (`src/komet_node/kdist/node.md`)
-
-Implements the JSON fast path on the K side. When the configuration is in the idle state (empty `<k>`, `<instrs>`, `<program>` cells):
-- If `request.json` exists → read it, dispatch `#handleRequest(contents)`, remove the file, halt
-- If not → halt immediately (expected idle state, ready for the next request)
-
-`#handleRequest` decodes the JSON string into K `Steps` using `String2JSON` and a set of `#decodeStep` / `#decodeArg` rules, then injects them directly into `<k>`. A `steps-done` rule (mirroring KASMER's `steps-empty` but with `...`) is needed to let the continuation proceed once the decoded steps finish.
-
-Supported JSON step types and SCVal arg types mirror the Python encoder — see the format comment in `node.md`.
-
-### Tests (`src/tests/integration/`)
-
-- `test_full_lifecycle` — end-to-end: create account → upload wasm (KORE path) → deploy contract → call `foo()` (no args)
-- `test_callTx_with_args` — deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` args, exercising the full `_encode_scval` / `#decodeArg` pipeline
-
-Not yet covered by tests: `bytes` and `address` SCVal types (require host object allocation).
+State lives in the io dir as `state.kore` (KORE world state), `metadata.json` (ledger counter), and `transactions.json` (tx store). See [architecture.md](architecture.md).
 
 ---
 
-## What needs to be implemented
+## Tests (`src/tests/integration/`)
 
-A server that sits above `NodeInterpreter`: listens for incoming Stellar RPC requests, manages the `.kore` state file on disk, and calls `run_transaction` for each incoming transaction.
+- `test_server.py` drives the running HTTP server end-to-end. It exercises the read-only methods, `sendTransaction` + `getTransaction`, ledger increments, the full lifecycle (create → upload wasm → deploy → invoke), and the `traceTransaction` flows. `test_call_tx_with_args` deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` arguments, exercising the `scval_to_json` / `#decodeArg` pipeline.
+- `test_integration.py` and `test_unit.py` hold small sanity checks.
+
+Run with `make test` (requires `make kdist-build` first).
+
+The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCMap` (and `scval_to_json` does not yet encode the latter).
+
+---
+
+## Known gaps
+
+- `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
+- `SCVec` / `SCMap` contract arguments are not yet encoded.
+- `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
