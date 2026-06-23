@@ -9,3 +9,7 @@ response.json
 state.kore
 trace.jsonl
 transactions.json
+
+# Claude Code local artifacts (keep skills, ignore per-user/runtime files)
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
