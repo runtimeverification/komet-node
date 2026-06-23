@@ -45,7 +45,7 @@ The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestL
 
 ### `transaction.py` — `TransactionEncoder`
 
-`TransactionEncoder` decodes Stellar's binary XDR, the wire format K cannot read. It turns a `stellar_sdk` transaction envelope into a JSON request envelope containing the RPC method, the transaction hash, the envelope XDR, and the decoded operations as JSON "steps". For the one case K cannot consume as JSON — a wasm upload, whose `ModuleDecl` has no JSON form — it produces the kasmer steps in K-AST form for direct injection into the `<program>` cell.
+`TransactionEncoder` decodes Stellar's binary XDR transaction format, which K cannot parse. It turns a `stellar_sdk` transaction envelope into a JSON request envelope containing the RPC method, the transaction hash, the envelope XDR, and the decoded operations as JSON "steps". For the one case K cannot consume as JSON — a wasm upload, whose `ModuleDecl` has no JSON form — it produces the kasmer steps in K-AST form for direct injection into the `<program>` cell.
 
 → **[Detailed documentation](transaction.md)**
 

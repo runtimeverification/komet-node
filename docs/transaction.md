@@ -1,6 +1,6 @@
 # `transaction.py` — `TransactionEncoder`
 
-`TransactionEncoder` decodes Stellar's binary XDR, the wire format the K semantics cannot read. It turns a transaction envelope into the JSON *request envelope* consumed by [`node.md`](node-semantics.md), computes the transaction hash and contract ids, and (for wasm uploads only) parses the bytecode into a `ModuleDecl`.
+`TransactionEncoder` decodes Stellar's binary XDR transaction format, which the K semantics cannot parse. It turns a transaction envelope into the JSON *request envelope* consumed by [`node.md`](node-semantics.md), computes the transaction hash and contract ids, and (for wasm uploads only) parses the bytecode into a `ModuleDecl`.
 
 ---
 
