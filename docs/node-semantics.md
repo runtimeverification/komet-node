@@ -1,6 +1,6 @@
 # `kdist/node.md` — K Semantics
 
-`node.md` is the K module that implements the **entire RPC layer** on the K side. It reads `request.json`, dispatches on the RPC method, reads and updates the bookkeeping files, executes transaction steps via KASMER, and writes the JSON-RPC `response.json`. Everything that is part of the Soroban/Stellar protocol — method dispatch, the transaction store, ledger accounting, status determination, response formatting — lives here rather than in Python.
+`node.md` is the K module that implements the **entire RPC layer** on the K side. It reads `request.json`, dispatches on the RPC method, reads and updates the bookkeeping files, executes transaction steps via KASMER (Komet's harness for running Soroban operations as `Step`s), and writes the JSON-RPC `response.json`. Everything that is part of the Soroban/Stellar protocol — method dispatch, the transaction store, ledger accounting, status determination, response formatting — lives here rather than in Python.
 
 It is compiled by `kdist/plugin.py` into the `komet-node.simbolik` LLVM binary, cached under `~/.cache/kdist-*/komet-node/simbolik/`.
 

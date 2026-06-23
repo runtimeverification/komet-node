@@ -61,7 +61,7 @@ The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestL
 
 ### `kdist/node.md` — K Semantics
 
-`node.md` is the K module compiled into the LLVM binary. It implements the whole RPC layer on the K side: it reads `request.json`, dispatches on the `method` field, reads and updates the bookkeeping files (`metadata.json`, `transactions.json`), executes transaction steps via KASMER, and writes the JSON-RPC `response.json`.
+`node.md` is the K module compiled into the LLVM binary. It implements the whole RPC layer on the K side: it reads `request.json`, dispatches on the `method` field, reads and updates the bookkeeping files (`metadata.json`, `transactions.json`), executes transaction steps via KASMER, and writes the JSON-RPC `response.json`. KASMER is the Komet execution harness whose `Step`s — `setAccount`, `deployContract`, `callTx`, `uploadWasm` — carry out the Soroban operations a transaction decodes into.
 
 → **[Detailed documentation](node-semantics.md)**
 

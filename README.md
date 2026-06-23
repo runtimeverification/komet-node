@@ -16,7 +16,12 @@
 
 ## 🌟 Overview
 
-`komet-node` extends the standard Stellar RPC with a `traceTransaction` method that provides instruction-level execution traces. The node's state is persisted to disk, allowing the same ledger state to be reproduced and transactions to be replayed. The RPC logic itself runs inside the K formal semantics. The compiled semantics are a one-shot interpreter — given a state, it runs a single request to completion and exits — so a small Python program wraps it into a long-running server: it holds the HTTP connection, keeps the ledger state on disk between runs, and decodes Stellar's binary XDR transaction format, which K cannot read.
+`komet-node` is a Stellar testnet node you run on your own machine. It serves the standard [Stellar RPC](https://developers.stellar.org/docs/data/apis/rpc) API, so the SDKs, wallets, and tooling you already use with Stellar work against it unchanged — you point them at `localhost` instead of a public network.
+
+It is built for developing, testing, and debugging Soroban contracts locally, and adds two capabilities a public Stellar network does not offer:
+
+- **Instruction-level traces.** The `traceTransaction` method runs a transaction and returns a step-by-step record of every WebAssembly instruction the contract executed, so you can see exactly what happened — and where it went wrong.
+- **Reproducible, replayable state.** The ledger state is persisted to disk, so you can stop and restart the node, save a state, and replay transactions against it to reproduce a result.
 
 ## 🚀 Quick Start
 
@@ -24,7 +29,7 @@
 
 #### Install with kup
 
-`komet-node` is distributed through [`kup`](https://github.com/runtimeverification/kup), Runtime Verification's Nix-based package manager. It pulls prebuilt binaries (including the matching K Framework and kompiled semantics) from RV's binary cache, so there is nothing to compile.
+`komet-node` is distributed through [`kup`](https://github.com/runtimeverification/kup), Runtime Verification's Nix-based package manager. It pulls prebuilt binaries (including the matching K Framework and compiled semantics) from RV's binary cache, so there is nothing to compile.
 
 ```bash
 # 1. Install the kup package manager (one time)
@@ -41,7 +46,7 @@ To upgrade later, run `kup update komet-node`.
 
 #### Run with Docker
 
-Alternatively, a prebuilt image is published to Docker Hub for each release. It bundles K, the kompiled semantics, and `komet-node` ready to serve.
+Alternatively, a prebuilt image is published to Docker Hub for each release. It bundles K, the compiled semantics, and `komet-node` ready to serve.
 
 ```bash
 # Pull the image (replace the tag with the release you want)
@@ -75,7 +80,7 @@ komet-node --trace               # enable instruction-level execution tracing
 | `--state-file` | `state.kore` | Path to the persistent state file |
 | `--trace` | off | Enable instruction-level execution tracing |
 
-On first start the server creates a fresh `state.kore` (the idle configuration — an empty chain), alongside `metadata.json` (the ledger counter) and `transactions.json` (the transaction store). Delete `state.kore` to reset the chain (the sidecar files are re-seeded), or point `--state-file` at a pre-built configuration to resume from a snapshot.
+On first start the server creates `state.kore` in the state file's directory — along with two small bookkeeping files, `metadata.json` and `transactions.json` — and begins from an empty chain. The state persists across restarts, so stopping and restarting the node resumes the same chain. To start over from an empty chain, delete `state.kore`; to resume from a chain you saved earlier, point `--state-file` at it.
 
 #### Verify the server with `curl`
 
@@ -168,7 +173,7 @@ The bundled demo deploys and invokes a Soroban contract end-to-end (create accou
 uv run python -m komet_node.demo src/tests/integration/data/wasm/empty.wat
 ```
 
-This produces `state.kore` plus `state_<n>_<step>.pretty` files under `./out`, letting you inspect exactly how the formal state evolves. (Requires `wat2wasm` from [`wabt`](https://github.com/WebAssembly/wabt) on your `PATH`.)
+This produces `state.kore` plus `state_<n>_<step>.pretty` files under `./out`, letting you inspect exactly how the ledger state evolves at each step. (Requires `wat2wasm` from [`wabt`](https://github.com/WebAssembly/wabt) on your `PATH`.)
 
 ---
 
@@ -209,7 +214,7 @@ pip install dist/*.whl
 ### Documentation
 
 - [Architecture overview](docs/architecture.md) — how the pieces fit together
-- [Server](docs/server.md) — the long-running HTTP server that wraps the K interpreter, state lifecycle, and full method reference
+- [Server](docs/server.md) — the long-running HTTP server that wraps the K interpreter, plus the state lifecycle and the full method reference
 - [Transaction encoding](docs/transaction.md) — Stellar XDR → K request envelope
 - [Interpreter](docs/interpreter.md) — running request envelopes through the K semantics
 - [K semantics](docs/node-semantics.md) — the on-chain RPC dispatch and execution model
