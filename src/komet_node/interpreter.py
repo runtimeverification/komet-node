@@ -82,7 +82,7 @@ class NodeInterpreter:
     """
     Runs the K node semantics against a saved KORE world-state configuration.
 
-    This is purely the K-execution boundary: it builds the initial configuration, runs RPC
+    Its sole responsibility is K execution: it builds the initial configuration, runs RPC
     request envelopes through the LLVM interpreter, and persists the resulting state. It
     knows nothing about Stellar — XDR decoding lives in :class:`TransactionEncoder`, and RPC
     dispatch / bookkeeping / response formatting live in ``node.md``.

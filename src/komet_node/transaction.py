@@ -40,7 +40,7 @@ class TransactionEncoder:
     """
     Decodes Stellar XDR transactions into the request envelope consumed by ``node.md``.
 
-    This is the boundary K cannot cross: parsing the XDR envelope, computing the
+    It performs the work K cannot do itself: parsing the XDR envelope, computing the
     transaction hash and contract ids, and (for wasm uploads) parsing the bytecode into a
     ``ModuleDecl`` via ``wasm2kast``. It produces a JSON request envelope and, only for the
     wasm-upload case, the kasmer steps to inject into the ``<program>`` cell.

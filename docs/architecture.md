@@ -45,7 +45,7 @@ The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestL
 
 ### `transaction.py` — `TransactionEncoder`
 
-`TransactionEncoder` is the XDR boundary. It decodes a `stellar_sdk` transaction envelope into a JSON request envelope containing the RPC method, the transaction hash, the envelope XDR, and the decoded operations as JSON "steps". For the one case K cannot consume as JSON — a wasm upload, whose `ModuleDecl` has no JSON form — it produces the kasmer steps in K-AST form for direct injection into the `<program>` cell.
+`TransactionEncoder` decodes Stellar's binary XDR, the wire format K cannot read. It turns a `stellar_sdk` transaction envelope into a JSON request envelope containing the RPC method, the transaction hash, the envelope XDR, and the decoded operations as JSON "steps". For the one case K cannot consume as JSON — a wasm upload, whose `ModuleDecl` has no JSON form — it produces the kasmer steps in K-AST form for direct injection into the `<program>` cell.
 
 → **[Detailed documentation](transaction.md)**
 
@@ -53,7 +53,7 @@ The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestL
 
 ### `interpreter.py` — `NodeInterpreter`
 
-`NodeInterpreter` is the K-execution boundary. It builds the initial configuration, runs a request envelope through the LLVM interpreter against `state.kore`, and persists the resulting state. It knows nothing about Stellar. It performs **no** whole-configuration `kast`↔`kore` conversions — the initial config is built directly in KORE and request steps are spliced into the `<program>` cell at the KORE level.
+`NodeInterpreter` runs request envelopes through the K semantics. It builds the initial configuration, feeds a request envelope to the LLVM interpreter against `state.kore`, and persists the resulting state. It knows nothing about Stellar. It performs **no** whole-configuration `kast`↔`kore` conversions — the initial config is built directly in KORE and request steps are spliced into the `<program>` cell at the KORE level.
 
 → **[Detailed documentation](interpreter.md)**
 

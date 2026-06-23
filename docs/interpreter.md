@@ -1,6 +1,6 @@
 # `interpreter.py` — `NodeInterpreter`
 
-`NodeInterpreter` is the K-execution boundary of komet-node. It builds the initial configuration, runs RPC request envelopes through the compiled K semantics with the LLVM backend, and persists the resulting world state. It knows nothing about Stellar — XDR decoding lives in [`TransactionEncoder`](transaction.md), and RPC dispatch / bookkeeping / response formatting live in [`node.md`](node-semantics.md).
+`NodeInterpreter` runs komet-node's RPC requests through the compiled K semantics (LLVM backend). It builds the initial configuration, feeds each request envelope to the interpreter against `state.kore`, and persists the resulting world state. It knows nothing about Stellar — XDR decoding lives in [`TransactionEncoder`](transaction.md), and RPC dispatch / bookkeeping / response formatting live in [`node.md`](node-semantics.md).
 
 ---
 
