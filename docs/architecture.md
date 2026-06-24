@@ -83,7 +83,7 @@ The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestL
 
 ## The io-dir
 
-All of the server's input and output artifacts live in one directory, the *io dir* (set by `--io-dir`, the working directory by default). Its files fall into two groups: a few that **persist** across requests and restarts and together hold the chain, and a few **transient** ones that the server and the semantics rewrite on every request to pass data to each other.
+All of the server's input and output artifacts live in one directory, the *io dir* (set by `--io-dir`; when omitted, a fresh temporary directory). Its files fall into two groups: a few that **persist** across requests and restarts and together hold the chain, and a few **transient** ones that the server and the semantics rewrite on every request to pass data to each other.
 
 | File | Lifetime | Written by | Contents |
 |---|---|---|---|

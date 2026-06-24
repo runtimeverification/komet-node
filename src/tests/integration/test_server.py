@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import socket
 import subprocess
 import threading
@@ -70,6 +71,20 @@ def server(tmp_path: Path):
     _wait_for_server('localhost', port)
     yield srv
     srv.shutdown()
+
+
+def test_default_io_dir_is_a_fresh_temp_dir() -> None:
+    """With no io_dir, the server provisions a fresh temporary directory and seeds it."""
+    srv = StellarRpcServer(host='localhost', port=0)
+    try:
+        assert srv.io_dir.exists()
+        assert srv.io_dir.resolve() != Path.cwd()
+        assert srv.state_file == srv.io_dir / 'state.kore'
+        assert srv.state_file.exists()
+        assert (srv.io_dir / 'metadata.json').exists()
+        assert (srv.io_dir / 'transactions.json').exists()
+    finally:
+        shutil.rmtree(srv.io_dir, ignore_errors=True)
 
 
 def test_get_health(server: StellarRpcServer) -> None:

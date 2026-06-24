@@ -15,8 +15,9 @@ def main() -> None:
     parser.add_argument(
         '--io-dir',
         type=Path,
-        default=Path('.'),
-        help='Directory for all input/output artifacts (state, ledger, transactions; default: .)',
+        default=None,
+        help='Directory for all input/output artifacts (state, ledger, transactions; '
+        'default: a fresh temporary directory)',
     )
     args = parser.parse_args()
 

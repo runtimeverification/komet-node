@@ -67,7 +67,7 @@ docker run --rm -p 8000:8000 \
 #### Start the server
 
 ```bash
-komet-node                       # serve on localhost:8000, artifacts in ./
+komet-node                       # serve on localhost:8000, artifacts in a fresh temp dir
 komet-node --help                # print general usage information
 komet-node --port 9000           # custom port
 komet-node --io-dir ./chain      # put all artifacts under ./chain
@@ -77,9 +77,9 @@ komet-node --io-dir ./chain      # put all artifacts under ./chain
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port to listen on |
-| `--io-dir` | `.` | Directory holding all input and output artifacts |
+| `--io-dir` | a fresh temp dir | Directory holding all input and output artifacts |
 
-All artifacts live in the io-dir: `state.kore` (the world state), plus the bookkeeping files `metadata.json` and `transactions.json`. On startup the server reports, on stderr, the address it is listening on and whether it is starting from a fresh state (an empty io-dir) or resuming an existing one. The state persists across restarts, so stopping and restarting the node against the same io-dir resumes the same chain. To start over from an empty chain, point `--io-dir` at an empty directory; to resume a chain you saved earlier, point it at that directory. Every incoming request is logged to stderr.
+All artifacts live in the io-dir: `state.kore` (the world state), plus the bookkeeping files `metadata.json` and `transactions.json`. When `--io-dir` is omitted, the server creates a fresh temporary directory, so each launch begins from an empty chain and leaves your working directory untouched. On startup the server reports, on stderr, the io-dir path, the address it is listening on, and whether it is starting from a fresh state (an empty io-dir) or resuming an existing one. The state persists across restarts, so pointing `--io-dir` at the same directory on the next launch resumes the same chain; point it at an empty directory to start over. Every incoming request is logged to stderr.
 
 #### Verify the server with `curl`
 

@@ -35,18 +35,20 @@ For `sendTransaction` it builds the request envelope with `encoder.build_tx_requ
 server = StellarRpcServer(
     host='localhost',
     port=8000,
-    io_dir=Path('.'),
+    io_dir=Path('out'),  # omit for a fresh temporary directory
     network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
 )
 server.serve()
 ```
+
+`io_dir` defaults to `None`, in which case the server creates a fresh temporary directory (`tempfile.mkdtemp`) and runs against that — a throwaway chain that starts empty on every launch and leaves the working directory untouched. Pass an explicit `io_dir` to keep the state in a known place.
 
 At construction the server prepares the *io dir*, where `state.kore` lives at `io_dir / 'state.kore'`:
 
 - **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}` and `transactions.json` with `{}`.
 - **`state.kore` present** — it is used as-is, and the sidecar files are seeded only if missing. This lets you resume a previous session (ledger counter and transaction store included) or start against a pre-built state.
 
-Once the socket is bound, `serve` logs the listening address to stderr and reports whether it is starting from a fresh state (an empty io-dir) or resuming an existing one (with the latest ledger). Instruction tracing is always on, so every transaction the semantics run produces a trace. (Tracing only produces records for contract invocations.)
+Once the socket is bound, `serve` logs three lines to stderr: whether it is starting from a fresh state (an empty io-dir) or resuming an existing one (with the latest ledger), the io-dir path, and the listening address. Instruction tracing is always on, so every transaction the semantics run produces a trace. (Tracing only produces records for contract invocations.)
 
 ---
 
@@ -153,4 +155,4 @@ komet-node [--host HOST] [--port PORT] [--io-dir DIR]
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port |
-| `--io-dir` | `.` | Directory holding every artifact (`state.kore`, `metadata.json`, `transactions.json`) |
+| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `transactions.json`) |

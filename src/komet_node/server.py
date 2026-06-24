@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import tempfile
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -59,7 +60,9 @@ class StellarRpcServer:
         self._port = port
         self.interpreter = NodeInterpreter()
         self.encoder = TransactionEncoder(network_passphrase)
-        self.io_dir = (io_dir if io_dir is not None else Path('.')).resolve()
+        # With no io-dir given, run against a fresh temporary directory: a throwaway chain
+        # that starts empty on every launch and leaves the working directory untouched.
+        self.io_dir = (Path(tempfile.mkdtemp(prefix='komet-node-')) if io_dir is None else io_dir).resolve()
         self.io_dir.mkdir(parents=True, exist_ok=True)
         self.state_file = self.io_dir / 'state.kore'
         self._httpd: HTTPServerType | None = None
@@ -105,11 +108,12 @@ class StellarRpcServer:
         """Announce, once the socket is bound, where the server listens and how it started."""
         _configure_logging()
         if self._fresh:
-            origin = f'starting from a fresh state (empty io-dir {self.io_dir})'
+            status = 'starting from a fresh state (empty io-dir)'
         else:
             metadata = json.loads((self.io_dir / 'metadata.json').read_text())
-            origin = f'resuming from io-dir {self.io_dir} (latest ledger {metadata.get("latest_ledger", 0)})'
-        _log.info('komet-node ready — %s', origin)
+            status = f'resuming existing state (latest ledger {metadata.get("latest_ledger", 0)})'
+        _log.info('komet-node ready — %s', status)
+        _log.info('io-dir: %s', self.io_dir)
         _log.info('listening on http://%s:%d', self.host, self.port())
 
     def port(self) -> int:
