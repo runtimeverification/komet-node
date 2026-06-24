@@ -8,13 +8,17 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from stellar_sdk import Account, Keypair, Network, StrKey, TransactionBuilder, xdr
+from stellar_sdk.utils import sha256
 from stellar_sdk.xdr.sc_val_type import SCValType
 
 from komet_node.server import StellarRpcServer
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
 ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resolve(strict=True)
@@ -71,6 +75,41 @@ def server(tmp_path: Path):
     _wait_for_server('localhost', port)
     yield srv
     srv.shutdown()
+
+
+def _deploy_and_get_invoker(server: StellarRpcServer, wat_path: Path) -> Callable[..., str]:
+    """Create an account, upload `wat_path`, and deploy a contract instance from it.
+
+    Returns an ``invoke(func, args=None)`` callable that runs a contract function and returns
+    the executed transaction's hash, asserting the whole setup and each call reaches SUCCESS.
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    def send(tb: TransactionBuilder) -> str:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
+        assert res['result']['status'] == 'PENDING'
+        tx_hash = res['result']['hash']
+        get_res = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
+        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+        return tx_hash
+
+    send(builder().append_create_account_op(keypair.public_key, '1000'))
+    wasm_bytecode = wat_to_wasm(wat_path)
+    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
+    salt = b'\x00' * 32
+    send(builder().append_create_contract_op(sha256(wasm_bytecode), keypair.public_key, None, salt))
+    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+
+    def invoke(func: str, args: list[xdr.SCVal] | None = None) -> str:
+        return send(builder().append_invoke_contract_function_op(contract_address, func, args or []))
+
+    return invoke
 
 
 def test_default_io_dir_is_a_fresh_temp_dir() -> None:
@@ -339,50 +378,66 @@ def test_trace_transaction_missing_hash_returns_invalid_params(server: StellarRp
     assert result['error']['code'] == -32602
 
 
-def test_trace_transaction_produces_trace_on_contract_invocation(server: StellarRpcServer) -> None:
-    """traceTransaction returns a non-empty trace array for a submitted contract invocation."""
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
+def test_trace_transaction_returns_full_instruction_trace_for_foo(server: StellarRpcServer) -> None:
+    """traceTransaction returns the complete, ordered instruction trace of an invocation.
 
-    def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-
-    def sign_and_xdr(tb: TransactionBuilder) -> str:
-        env = tb.set_timeout(30).build()
-        env.sign(keypair)
-        return env.to_xdr()
-
-    def send(xdr: str) -> str:
-        res = _rpc(server.port(), 'sendTransaction', {'transaction': xdr})
-        assert res['result']['status'] == 'PENDING'
-        tx_hash = res['result']['hash']
-        assert _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']['status'] == 'SUCCESS'
-        return tx_hash
-
-    # Set up: create account, upload wasm, deploy contract
-    send(sign_and_xdr(builder().append_create_account_op(keypair.public_key, '1000')))
-
-    wasm_bytecode = wat_to_wasm(EMPTY_CONTRACT_WAT)
-    send(sign_and_xdr(builder().append_upload_contract_wasm_op(wasm_bytecode)))
-
-    from stellar_sdk.utils import sha256
-
-    wasm_hash = sha256(wasm_bytecode)
-    salt = b'\x00' * 32
-    send(sign_and_xdr(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt)))
-
-    # Submit the invocation, then retrieve its trace by hash.
-    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
-    invoke_xdr = sign_and_xdr(builder().append_invoke_contract_function_op(contract_address, 'foo', []))
-    tx_hash = send(invoke_xdr)
+    empty.wat's ``foo()`` body is a single ``i64.const 2`` (the Void return); the three leading
+    records are the contract's global initialisation and the ``block`` is the function frame.
+    This is the exact trace shown in the README, asserted record-for-record so any drift in the
+    format, ordering, or the array-vs-string shape of the result is caught.
+    """
+    invoke = _deploy_and_get_invoker(server, EMPTY_CONTRACT_WAT)
+    tx_hash = invoke('foo')
 
     trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
 
-    # Trace is a JSON array of per-instruction records (not a JSON-encoded string).
+    assert trace == [
+        {'pos': 3, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}},
+        {'pos': 11, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}},
+        {'pos': 19, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}},
+        {'pos': None, 'instr': ['block'], 'stack': [], 'locals': {}},
+        {'pos': 3, 'instr': ['const', 'i64', 2], 'stack': [], 'locals': {}},
+    ]
+
+
+def test_trace_records_have_expected_structure_and_reflect_arguments(server: StellarRpcServer) -> None:
+    """Each trace record is a ``{pos, instr, stack, locals}`` object, and for a call that takes
+    arguments the decoded arguments are bound as locals while intermediate values build up on the
+    stack — exercising a richer trace than the argument-less ``foo()`` case.
+    """
+    invoke = _deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
+    tx_hash = invoke(
+        'test_integers',
+        [
+            xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(42)),
+            xdr.SCVal(type=SCValType.SCV_I32, i32=xdr.Int32(-7)),
+            xdr.SCVal(type=SCValType.SCV_U64, u64=xdr.Uint64(100)),
+            xdr.SCVal(type=SCValType.SCV_I64, i64=xdr.Int64(-200)),
+        ],
+    )
+
+    trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
+
     assert isinstance(trace, list)
     assert len(trace) > 0
     for record in trace:
-        assert 'instr' in record
+        assert set(record) == {'pos', 'instr', 'stack', 'locals'}
+        assert record['pos'] is None or isinstance(record['pos'], int)
+        assert isinstance(record['instr'], list) and record['instr']
+        assert isinstance(record['instr'][0], str)  # opcode mnemonic
+        # stack and locals hold [type, value] pairs.
+        assert isinstance(record['stack'], list)
+        assert all(isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) for e in record['stack'])
+        assert isinstance(record['locals'], dict)
+        assert all(isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) for e in record['locals'].values())
+
+    # The four call arguments are bound as locals 0..3 by the time the body runs.
+    locals_seen = {key for record in trace for key in record['locals']}
+    assert {'0', '1', '2', '3'} <= locals_seen
+    # Intermediate computation puts values on the stack at some point.
+    assert any(record['stack'] for record in trace)
+    # The function body returns Void: the final instruction pushes the i64 constant 2.
+    assert trace[-1]['instr'] == ['const', 'i64', 2]
 
 
 def test_call_tx_with_args(server: StellarRpcServer) -> None:
@@ -391,37 +446,7 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
     Uses a minimal contract (args.wat) whose functions accept various arg types and return
     Void. Covers: bool, u32, i32, u64, i64, u128, i128, symbol.
     """
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
-
-    def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-
-    def send(tb: TransactionBuilder) -> None:
-        env = tb.set_timeout(30).build()
-        env.sign(keypair)
-        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
-        assert res['result']['status'] == 'PENDING'
-        tx_hash = res['result']['hash']
-        get_res = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
-        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
-
-    # Set up: create account, upload args.wat, deploy contract
-    send(builder().append_create_account_op(keypair.public_key, '1000'))
-
-    wasm_bytecode = wat_to_wasm(ARGS_CONTRACT_WAT)
-    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
-
-    from stellar_sdk.utils import sha256
-
-    wasm_hash = sha256(wasm_bytecode)
-    salt = b'\x00' * 32
-    send(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
-
-    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
-
-    def invoke(func: str, args: list[xdr.SCVal]) -> None:
-        send(builder().append_invoke_contract_function_op(contract_address, func, args))
+    invoke = _deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
 
     invoke('test_bool', [xdr.SCVal(type=SCValType.SCV_BOOL, b=True)])
     invoke(
