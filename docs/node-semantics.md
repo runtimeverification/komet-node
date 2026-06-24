@@ -1,6 +1,6 @@
 # `kdist/node.md` — K Semantics
 
-`node.md` is the K module that implements the **entire RPC layer** on the K side. It reads `request.json`, dispatches on the RPC method, reads and updates the bookkeeping files, executes transaction steps via KASMER (Komet's harness for running Soroban operations as `Step`s), and writes the JSON-RPC `response.json`. Everything that is part of the Soroban/Stellar protocol — method dispatch, the transaction store, ledger accounting, status determination, response formatting — lives here rather than in Python.
+`node.md` is the K module that implements the **entire RPC layer** on the K side. It reads `request.json`, dispatches on the RPC method, reads and updates the bookkeeping files, executes transaction steps via KASMER (Komet's harness for running Soroban operations as `Step`s), and writes the JSON-RPC `response.json`. Everything that is part of the Soroban/Stellar protocol — method dispatch, receipt bookkeeping, ledger accounting, status determination, response formatting — lives here rather than in Python.
 
 It is compiled by `kdist/plugin.py` into the `komet-node.simbolik` LLVM binary, cached under `~/.cache/kdist-*/komet-node/simbolik/`.
 
@@ -15,8 +15,8 @@ The semantics communicate with the Python process through files in the working d
 | `request.json` | Python → K | the request envelope (`method`, `id`, `now`, and method-specific fields) |
 | `response.json` | K → Python | the JSON-RPC response (`{jsonrpc, id, result}`) |
 | `metadata.json` | K ↔ K | `{"latest_ledger": N}` — the ledger counter |
-| `transactions.json` | K ↔ K | map from tx hash → stored receipt |
-| `trace.jsonl` | K → Python | per-instruction trace records for the transaction being executed |
+| `receipts/receipt_<hash>.json` | K → Python | one stored receipt per transaction, keyed by tx hash |
+| `traces/trace_<hash>.jsonl` | K → Python | one execution trace per transaction (per-instruction records), keyed by tx hash |
 
 ---
 
@@ -61,7 +61,7 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 - `getHealth` → `{ "status": "healthy" }`
 - `getNetwork` → `{ "friendbotUrl": null, "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic)
 - `getLatestLedger` → reads `metadata.json` and returns `{ "id": <64 zeros>, "protocolVersion": ..., "sequence": <latest_ledger> }`
-- `getTransaction` → looks up the hash in `transactions.json`; returns the stored receipt merged with the current `latestLedger`/`latestLedgerCloseTime`, or `{ "status": "NOT_FOUND", ... }`
+- `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the current `latestLedger`/`latestLedgerCloseTime`, or `{ "status": "NOT_FOUND", ... }` when the file is absent
 
 `#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0.
 
@@ -73,24 +73,24 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 
 ```
 #runTx(request)
-   => #enableTrace                               ← clear trace.jsonl and point <ioDir> at it
+   => #enableTrace(traces/trace_<hash>.jsonl)     ← clear the trace file and point <ioDir> at it
    ~> setLedgerSequence(<latest_ledger from metadata.json>)
-   ~> #decodeSteps(<the "steps" array>)          ← KASMER runs each decoded step
+   ~> #decodeSteps(<the "steps" array>)           ← KASMER runs each decoded step
    ~> #finalizeTx(request)
 ```
 
-`#finalizeTx` reads `metadata.json`, `transactions.json`, and `trace.jsonl`, then:
+`#finalizeTx` reads `metadata.json`, then:
 
 1. writes `metadata.json` with `latest_ledger + 1`,
-2. upserts a receipt into `transactions.json` under the tx hash:
-   `{ status: "SUCCESS", ledger, createdAt, envelopeXdr, resultXdr: "", resultMetaXdr: "", trace }`,
+2. writes the receipt to `receipts/receipt_<hash>.json`:
+   `{ status: "SUCCESS", ledger, createdAt, envelopeXdr, resultXdr: "", resultMetaXdr: "" }`,
 3. responds with `{hash, status: "PENDING", latestLedger, latestLedgerCloseTime}`.
 
-Reaching `#finalizeTx` means the steps completed without getting stuck, so the status is `SUCCESS`. A failed transaction gets stuck before this point, `response.json` is never written, and the Python server records the `FAILED` receipt instead.
+The trace is not part of the receipt — the executing steps already appended it to `traces/trace_<hash>.jsonl`. Reaching `#finalizeTx` means the steps completed without getting stuck, so the status is `SUCCESS`. A failed transaction gets stuck before this point, `response.json` is never written, and the Python server records the `FAILED` receipt instead.
 
 ### traceTransaction
 
-`traceTransaction` is a read-only lookup. It takes a `hash` (the same parameter `getTransaction` takes), reads `transactions.json`, and responds with the `trace` field stored on that transaction's receipt, or `null` when no transaction with that hash exists. Because tracing is always on, every `sendTransaction` receipt carries its trace.
+`traceTransaction` is a read-only lookup. It takes a `hash` (the same parameter `getTransaction` takes) and responds with the contents of `traces/trace_<hash>.jsonl`, or `null` when no trace file exists for that hash. Because tracing is always on, every `sendTransaction` writes this file.
 
 ### Two ways steps are delivered
 
@@ -104,8 +104,8 @@ Reaching `#finalizeTx` means the steps completed without getting stuck, so the s
 `node.md` carries a small set of order-independent JSON accessors used for the request envelope and the bookkeeping files:
 
 - `#getJSON(key, obj[, default])`, `#getString(key, obj)`, `#getInt(key, obj)` — read a field
-- `#putJSON(key, value, obj)` — upsert into an object (used to add a receipt to `transactions.json`)
 - `#concatJSONs(a, b)` — append object entries (used to merge `latestLedger` fields into a stored receipt)
+- `#receiptFile(hash)`, `#traceFile(hash)` — build the per-transaction file paths (`receipts/receipt_<hash>.json`, `traces/trace_<hash>.jsonl`)
 
 These complement the **order-sensitive** step decoders below.
 
@@ -163,7 +163,7 @@ rule HexBytes(S)  => Int2Bytes(lengthString(S) /Int 2, String2Base(S, 16), BE)
 
 `node.md` is compiled with `md_selector: 'k | k-tracing'`, which includes the tracing rules from `soroban-semantics`. They intercept each WebAssembly instruction and append a JSON record to the file named by the `<ioDir>` cell.
 
-Tracing is always on. Before running the steps, `#enableTrace` clears `trace.jsonl` and points `<ioDir>` at it, so the intercepted instructions append to it. After the steps run, `#finalizeTx` reads `trace.jsonl` back, stores it in the receipt's `trace` field, and resets `<ioDir>` to empty.
+Tracing is always on. Before running the steps, `#enableTrace` clears the transaction's `traces/trace_<hash>.jsonl` file and points `<ioDir>` at it, so the intercepted instructions append to it. After the steps run, `#finalizeTx` resets `<ioDir>` to empty; the trace file is left in place for `traceTransaction` to read.
 
 **Trace format** (one JSON record per line):
 

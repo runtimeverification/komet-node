@@ -82,7 +82,10 @@ def test_default_io_dir_is_a_fresh_temp_dir() -> None:
         assert srv.state_file == srv.io_dir / 'state.kore'
         assert srv.state_file.exists()
         assert (srv.io_dir / 'metadata.json').exists()
-        assert (srv.io_dir / 'transactions.json').exists()
+        # The per-item artifact directories are created up front (the K hooks won't).
+        assert (srv.io_dir / 'receipts').is_dir()
+        assert (srv.io_dir / 'traces').is_dir()
+        assert (srv.io_dir / 'requests').is_dir()
     finally:
         shutil.rmtree(srv.io_dir, ignore_errors=True)
 
@@ -181,6 +184,31 @@ def test_send_transaction_and_get_result(server: StellarRpcServer) -> None:
     get_result = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})
     assert get_result['result']['status'] == 'SUCCESS'
     assert get_result['result']['envelopeXdr'] == xdr_str
+
+
+def test_io_dir_splits_into_per_item_files(server: StellarRpcServer) -> None:
+    """Each receipt, trace, and request lands in its own file; there is no transactions.json."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    envelope = (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
+        .set_timeout(30)
+        .build()
+    )
+    envelope.sign(keypair)
+
+    # sendTransaction is the first RPC call in this test, so it is archived as request_0.json.
+    tx_hash = _rpc(server.port(), 'sendTransaction', {'transaction': envelope.to_xdr()})['result']['hash']
+
+    assert (server.io_dir / 'receipts' / f'receipt_{tx_hash}.json').exists()
+    assert (server.io_dir / 'traces' / f'trace_{tx_hash}.jsonl').exists()
+    assert not (server.io_dir / 'transactions.json').exists()
+
+    # Each incoming request is archived under its own monotonic index.
+    assert (server.io_dir / 'requests' / 'request_0.json').exists()
+    _rpc(server.port(), 'getTransaction', {'hash': tx_hash})
+    assert (server.io_dir / 'requests' / 'request_1.json').exists()
 
 
 def test_failed_transaction_records_failed_receipt(server: StellarRpcServer) -> None:

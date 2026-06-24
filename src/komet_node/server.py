@@ -35,13 +35,18 @@ class StellarRpcServer:
     between runs, so this server supplies what they lack: it keeps the HTTP socket open,
     persists state to disk, and decodes the Stellar XDR envelope (:class:`TransactionEncoder`)
     that K cannot parse. It then runs the request envelope through the semantics
-    (:class:`NodeInterpreter`). All RPC dispatch, the transaction store, ledger accounting,
+    (:class:`NodeInterpreter`). All RPC dispatch, receipt bookkeeping, ledger accounting,
     and response formatting are performed in K (``node.md``). All artifacts — input and
     output — live in ``io_dir``:
 
-      - ``state.kore``        — the KORE world-state configuration (accounts, contracts, wasm)
-      - ``metadata.json``     — ``{"latest_ledger": N}``
-      - ``transactions.json`` — map from tx hash to stored receipt
+      - ``state.kore``            — the KORE world-state configuration (accounts, contracts, wasm)
+      - ``metadata.json``         — ``{"latest_ledger": N}``
+      - ``receipts/receipt_<hash>.json`` — one stored receipt per transaction
+      - ``traces/trace_<hash>.jsonl``    — one execution trace per transaction
+      - ``requests/request_<n>.json``    — an archive of each incoming JSON-RPC request
+
+    Splitting receipts, traces, and requests into per-item files keeps any single file from
+    growing without bound as the chain advances.
     """
 
     interpreter: NodeInterpreter
@@ -73,9 +78,19 @@ class StellarRpcServer:
         metadata_file = self.io_dir / 'metadata.json'
         if self._fresh or not metadata_file.exists():
             metadata_file.write_text(json.dumps({'latest_ledger': 0}))
-        transactions_file = self.io_dir / 'transactions.json'
-        if self._fresh or not transactions_file.exists():
-            transactions_file.write_text(json.dumps({}))
+
+        # Per-transaction receipts and traces, and per-request archives, each go in their own
+        # file under these directories so no single file grows without bound. The K
+        # file-system hooks open files with POSIX open(), which does not create parent
+        # directories, so the directories must exist before the semantics run.
+        self.receipts_dir = self.io_dir / 'receipts'
+        self.traces_dir = self.io_dir / 'traces'
+        self.requests_dir = self.io_dir / 'requests'
+        for directory in (self.receipts_dir, self.traces_dir, self.requests_dir):
+            directory.mkdir(exist_ok=True)
+        # Continue the request archive numbering past anything a previous run left behind, so
+        # resuming an io-dir never overwrites its earlier request files.
+        self._request_count = _next_request_index(self.requests_dir)
 
     def serve(self) -> None:
         server = self
@@ -166,6 +181,7 @@ class StellarRpcServer:
         """
         now = str(int(time.time()))
         _log.info('request: %s (id=%r)', method, request_id)
+        self._archive_request(method, params, request_id)
 
         if method in _TX_METHODS:
             transaction = params.get('transaction')
@@ -216,6 +232,17 @@ class StellarRpcServer:
             return {**base, 'hash': tx_hash}
         return None
 
+    def _archive_request(self, method: str | None, params: dict[str, Any], request_id: Any) -> None:
+        """Write each incoming JSON-RPC call to its own ``requests/request_<n>.json`` file.
+
+        This is an audit trail for the developer; the canonical ``request.json`` the semantics
+        consume is written separately by :class:`NodeInterpreter`. The server is single-threaded
+        (requests are serialised), so the counter needs no locking.
+        """
+        archive = {'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params}
+        (self.requests_dir / f'request_{self._request_count}.json').write_text(json.dumps(archive))
+        self._request_count += 1
+
     def _failure_response(self, rpc_id: Any, envelope: dict[str, Any], now: str) -> dict[str, Any]:
         """Synthesise the sendTransaction response for a transaction that got stuck (failed).
 
@@ -228,7 +255,8 @@ class StellarRpcServer:
         tx_hash = envelope['txHash']
 
         # This FAILED receipt mirrors the SUCCESS receipt the semantics build in
-        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule.
+        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule. Like the
+        # success path, the receipt carries no trace — any trace lives in its own file.
         receipt = {
             'status': 'FAILED',
             'ledger': str(ledger),
@@ -236,12 +264,8 @@ class StellarRpcServer:
             'envelopeXdr': envelope['envelopeXdr'],
             'resultXdr': '',
             'resultMetaXdr': '',
-            'trace': None,
         }
-        transactions_file = self.io_dir / 'transactions.json'
-        transactions = json.loads(transactions_file.read_text())
-        transactions[tx_hash] = receipt
-        transactions_file.write_text(json.dumps(transactions))
+        (self.receipts_dir / f'receipt_{tx_hash}.json').write_text(json.dumps(receipt))
 
         result = {
             'hash': tx_hash,
@@ -250,6 +274,21 @@ class StellarRpcServer:
             'latestLedgerCloseTime': now,
         }
         return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+
+
+def _next_request_index(requests_dir: Path) -> int:
+    """Return the next free index for ``requests/request_<n>.json``.
+
+    One past the highest index already present, so resuming an io-dir continues the archive
+    rather than overwriting it; 0 when the directory holds no request files yet.
+    """
+    highest = -1
+    for path in requests_dir.glob('request_*.json'):
+        try:
+            highest = max(highest, int(path.stem.removeprefix('request_')))
+        except ValueError:
+            continue  # ignore files that don't match the request_<int> pattern
+    return highest + 1
 
 
 def _configure_logging() -> None:

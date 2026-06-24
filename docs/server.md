@@ -1,6 +1,6 @@
 # `server.py` — `StellarRpcServer`
 
-`StellarRpcServer` exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC. Its job is to make the K semantics usable as a server. The compiled semantics are a one-shot interpreter — one process invocation per request, with no networking and no memory between runs — and `StellarRpcServer` is the long-running process wrapped around them: it keeps the HTTP socket open and the state files on disk, decodes the XDR envelope (via `TransactionEncoder`), runs each request through the semantics (via `NodeInterpreter`), and returns whatever `response.json` the semantics produced. All RPC dispatch, the transaction store, ledger accounting, and response formatting happen in K — the server holds none of that state itself.
+`StellarRpcServer` exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC. Its job is to make the K semantics usable as a server. The compiled semantics are a one-shot interpreter — one process invocation per request, with no networking and no memory between runs — and `StellarRpcServer` is the long-running process wrapped around them: it keeps the HTTP socket open and the state files on disk, decodes the XDR envelope (via `TransactionEncoder`), runs each request through the semantics (via `NodeInterpreter`), and returns whatever `response.json` the semantics produced. All RPC dispatch, receipt bookkeeping, ledger accounting, and response formatting happen in K — the server holds none of that state itself.
 
 ---
 
@@ -11,7 +11,10 @@ class StellarRpcServer:
     interpreter: NodeInterpreter     # the K runner
     encoder:     TransactionEncoder  # the XDR → request-envelope decoder
     io_dir:      Path                # directory holding every artifact
-    state_file:  Path                # io_dir / 'state.kore' — alongside metadata.json / transactions.json
+    state_file:  Path                # io_dir / 'state.kore'
+    receipts_dir: Path               # io_dir / 'receipts'  — receipt_<hash>.json per transaction
+    traces_dir:   Path               # io_dir / 'traces'    — trace_<hash>.jsonl per transaction
+    requests_dir: Path               # io_dir / 'requests'  — request_<n>.json archive
 ```
 
 The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `BaseHTTPRequestHandler` reads each POST body and calls `_handle`, which parses the JSON-RPC frame and delegates to `handle_rpc`.
@@ -45,32 +48,36 @@ server.serve()
 
 At construction the server prepares the *io dir*, where `state.kore` lives at `io_dir / 'state.kore'`:
 
-- **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}` and `transactions.json` with `{}`.
-- **`state.kore` present** — it is used as-is, and the sidecar files are seeded only if missing. This lets you resume a previous session (ledger counter and transaction store included) or start against a pre-built state.
+- **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}`.
+- **`state.kore` present** — it is used as-is, and `metadata.json` is seeded only if missing. This lets you resume a previous session (ledger counter and stored receipts included) or start against a pre-built state.
+
+In both cases the server creates the `receipts/`, `traces/`, and `requests/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
 
 Once the socket is bound, `serve` logs three lines to stderr: whether it is starting from a fresh state (an empty io-dir) or resuming an existing one (with the latest ledger), the io-dir path, and the listening address. Instruction tracing is always on, so every transaction the semantics run produces a trace. (Tracing only produces records for contract invocations.)
 
 ---
 
-## State file lifecycle
+## State lifecycle
 
-Three files in the io dir hold the persistent state; the server and semantics also exchange a few transient files there per request. See [architecture.md](architecture.md#the-io-dir) for the complete io-dir layout.
+`state.kore` and `metadata.json` hold the persistent chain state; per-transaction receipts and traces live under `receipts/` and `traces/`; the server and semantics also exchange a few transient files per request. See [architecture.md](architecture.md#the-io-dir) for the complete io-dir layout.
 
 ```
 startup (state.kore absent):
-          → empty_config() → state.kore ; metadata.json {latest_ledger:0} ; transactions.json {}
+          → empty_config() → state.kore ; metadata.json {latest_ledger:0}
+          → create receipts/ traces/ requests/
 
 per successful transaction:
-          → the semantics run the steps, append a SUCCESS receipt to transactions.json,
-            bump latest_ledger in metadata.json, and write response.json
+          → the semantics run the steps (trace → traces/trace_<hash>.jsonl),
+            write receipts/receipt_<hash>.json, bump latest_ledger in metadata.json,
+            and write response.json
           → NodeInterpreter persists the new state.kore
 
 per failed (stuck) transaction:
           → no response.json is produced; state.kore and metadata.json are left unchanged
-          → the server synthesises a FAILED receipt (see below)
+          → the server writes a FAILED receipts/receipt_<hash>.json (see below)
 ```
 
-Because all three files live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the transaction store.
+Because these artifacts live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the stored receipts.
 
 ---
 
@@ -117,11 +124,11 @@ All methods are answered by the K semantics and follow the [Stellar RPC specific
 
 ### `getTransaction`
 
-`getTransaction` looks up the stored receipt in `transactions.json`.
+`getTransaction` reads the hash's `receipts/receipt_<hash>.json` file.
 
 | Status | Meaning |
 |---|---|
-| `NOT_FOUND` | Hash not in `transactions.json` |
+| `NOT_FOUND` | No `receipts/receipt_<hash>.json` for that hash |
 | `SUCCESS` | Transaction executed successfully |
 | `FAILED` | Transaction was submitted but got stuck in the semantics |
 
@@ -130,18 +137,17 @@ All methods are answered by the K semantics and follow the [Stellar RPC specific
 {
   "status": "SUCCESS", "ledger": "5", "createdAt": "1716000000",
   "envelopeXdr": "<base64 XDR>", "resultXdr": "", "resultMetaXdr": "",
-  "trace": "<jsonl string or null>",
   "latestLedger": "5", "latestLedgerCloseTime": "1716000000"
 }
 ```
 
-`resultXdr` and `resultMetaXdr` are currently empty stubs.
+`resultXdr` and `resultMetaXdr` are currently empty stubs. The receipt carries no trace — use `traceTransaction` with the same hash to fetch it.
 
 ---
 
 ## Failure fallback
 
-A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. Only `sendTransaction` executes a transaction, so it is the only method that reaches this path. The server then synthesises the response in Python: it records a `FAILED` receipt in `transactions.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING`. This is the only response content the server builds itself.
+A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. Only `sendTransaction` executes a transaction, so it is the only method that reaches this path. The server then synthesises the response in Python: it writes a `FAILED` `receipts/receipt_<hash>.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING`. This is the only response content the server builds itself.
 
 ---
 
@@ -155,4 +161,4 @@ komet-node [--host HOST] [--port PORT] [--io-dir DIR]
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port |
-| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `transactions.json`) |
+| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `receipts/`, `traces/`, `requests/`) |

@@ -46,7 +46,7 @@ def main(wasm_wat: Path, out_dir: Path) -> None:
     root_keypair = Keypair.random()
     root_account = Account(root_keypair.public_key, sequence=0)
 
-    # The server owns the io_dir lifecycle (state.kore, metadata.json, transactions.json);
+    # The server owns the io_dir lifecycle (state.kore, metadata.json, receipts/, traces/);
     # we drive it directly via handle_rpc, no HTTP server needed.
     server = StellarRpcServer(io_dir=out_dir)
     state_file = server.state_file

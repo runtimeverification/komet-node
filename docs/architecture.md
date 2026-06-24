@@ -4,7 +4,7 @@
 
 komet-node is a local Stellar testnet whose execution engine is the [K formal semantics](https://github.com/runtimeverification/komet) of Soroban. It decodes incoming Stellar transactions into K steps and executes them through the compiled semantics.
 
-The split between Python and K follows one rule: K does everything that is part of the Soroban/Stellar protocol, and Python does only what K structurally cannot. The compiled K semantics are a *one-shot interpreter* — one invocation runs one request to completion and exits, with no network, no memory between invocations, and no decoder for Stellar's binary XDR format. Python supplies exactly those three missing pieces: it is the long-running process that holds the HTTP socket, it keeps the world state on disk between invocations, and it decodes the XDR envelope (and parses uploaded wasm). Everything else — RPC method dispatch, the transaction store, ledger-sequence accounting, status determination, and JSON-RPC response formatting — runs inside the K semantics (`node.md`).
+The split between Python and K follows one rule: K does everything that is part of the Soroban/Stellar protocol, and Python does only what K structurally cannot. The compiled K semantics are a *one-shot interpreter* — one invocation runs one request to completion and exits, with no network, no memory between invocations, and no decoder for Stellar's binary XDR format. Python supplies exactly those three missing pieces: it is the long-running process that holds the HTTP socket, it keeps the world state on disk between invocations, and it decodes the XDR envelope (and parses uploaded wasm). Everything else — RPC method dispatch, receipt bookkeeping, ledger-sequence accounting, status determination, and JSON-RPC response formatting — runs inside the K semantics (`node.md`).
 
 ```mermaid
 flowchart TB
@@ -27,7 +27,7 @@ flowchart TB
         direction LR
         state[("state.kore")]
         meta[("metadata.json")]
-        txs[("transactions.json")]
+        txs[("receipts/ · traces/")]
     end
 
     client -->|"JSON-RPC (base64 XDR)"| server
@@ -45,7 +45,7 @@ flowchart TB
 
 ### `server.py` — `StellarRpcServer`
 
-`StellarRpcServer` is the long-running process around the semantics: a plain `http.server.HTTPServer` that keeps the HTTP socket open and the state files on disk across requests — the networking and persistence the one-shot K interpreter has no notion of. It receives JSON-RPC requests, uses `TransactionEncoder` to turn a transaction into a request envelope, hands the envelope to `NodeInterpreter`, and returns the `response.json` the semantics produced. It holds **no** ledger counter, transaction store, or response-formatting logic — those live in K.
+`StellarRpcServer` is the long-running process around the semantics: a plain `http.server.HTTPServer` that keeps the HTTP socket open and the state files on disk across requests — the networking and persistence the one-shot K interpreter has no notion of. It receives JSON-RPC requests, uses `TransactionEncoder` to turn a transaction into a request envelope, hands the envelope to `NodeInterpreter`, and returns the `response.json` the semantics produced. It holds **no** ledger counter, receipt store, or response-formatting logic — those live in K.
 
 `handle_rpc(method, params, id)` is the dispatch entry point and is usable without the HTTP layer (scripts, tests).
 
@@ -75,7 +75,7 @@ The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestL
 
 ### `kdist/node.md` — K Semantics
 
-`node.md` is the K module compiled into the LLVM binary. It implements the whole RPC layer on the K side: it reads `request.json`, dispatches on the `method` field, reads and updates the bookkeeping files (`metadata.json`, `transactions.json`), executes transaction steps via KASMER, and writes the JSON-RPC `response.json`. KASMER is the Komet execution harness whose `Step`s — `setAccount`, `deployContract`, `callTx`, `uploadWasm` — carry out the Soroban operations a transaction decodes into.
+`node.md` is the K module compiled into the LLVM binary. It implements the whole RPC layer on the K side: it reads `request.json`, dispatches on the `method` field, reads and updates `metadata.json` and the per-transaction `receipts/` files, executes transaction steps via KASMER, and writes the JSON-RPC `response.json`. KASMER is the Komet execution harness whose `Step`s — `setAccount`, `deployContract`, `callTx`, `uploadWasm` — carry out the Soroban operations a transaction decodes into.
 
 → **[Detailed documentation](node-semantics.md)**
 
@@ -83,37 +83,40 @@ The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestL
 
 ## The io-dir
 
-All of the server's input and output artifacts live in one directory, the *io dir* (set by `--io-dir`; when omitted, a fresh temporary directory). Its files fall into two groups: a few that **persist** across requests and restarts and together hold the chain, and a few **transient** ones that the server and the semantics rewrite on every request to pass data to each other.
+All of the server's input and output artifacts live in one directory, the *io dir* (set by `--io-dir`; when omitted, a fresh temporary directory). Its contents fall into two groups: the files and directories that **persist** across requests and restarts and together hold the chain, and a few **transient** files that the server and the semantics rewrite on every request to pass data to each other.
 
-| File | Lifetime | Written by | Contents |
+| Path | Lifetime | Written by | Contents |
 |---|---|---|---|
 | `state.kore` | persistent | `NodeInterpreter` | the full K world-state configuration — accounts, contract code (including uploaded wasm `ModuleDecl`s), contract storage, ledger metadata — serialized in KORE. Read before each run and rewritten after a successful one. |
 | `metadata.json` | persistent | the K semantics | `{"latest_ledger": N}` — the server ledger counter, bumped by 1 per committed transaction. |
-| `transactions.json` | persistent | the semantics (on success) or the server (on failure) | a map from tx hash to its stored receipt, answering `getTransaction` and `traceTransaction`. Each receipt is `{status, ledger, createdAt, envelopeXdr, resultXdr, resultMetaXdr, trace}`. |
+| `receipts/receipt_<hash>.json` | persistent | the semantics (on success) or the server (on failure) | one stored receipt per transaction, keyed by tx hash, answering `getTransaction`. Each is `{status, ledger, createdAt, envelopeXdr, resultXdr, resultMetaXdr}`. |
+| `traces/trace_<hash>.jsonl` | persistent | the semantics | one execution trace per transaction, keyed by tx hash — the instruction-level records, one JSON object per line. `traceTransaction` returns this file's contents. |
+| `requests/request_<n>.json` | persistent | the server | an archive of each incoming JSON-RPC request, numbered by a monotonic counter, kept for debugging. |
 | `request.json` | transient | the server | the request envelope for the call in flight (`method`, `id`, `now`, and method-specific fields). The semantics remove it once they respond. |
 | `response.json` | transient | the semantics | the JSON-RPC response (`{jsonrpc, id, result}`) for the most recent call. The server reads it back; it is absent when a transaction gets stuck. |
-| `trace.jsonl` | transient | the semantics | the instruction-level trace of the transaction currently executing, one JSON record per line. Cleared at the start of each `sendTransaction`; its contents are copied into that transaction's receipt. |
 
-The world state stays in KORE (rather than a JSON snapshot) because an uploaded wasm module is a `ModuleDecl` that the semantics cannot reconstruct from bytes — only `wasm2kast` (Python) can produce it. The RPC bookkeeping, by contrast, is plain data and lives in the JSON files, which the semantics read and write directly via the file-system hooks.
+Receipts, traces, and request archives are split into one file per item — keyed by tx hash, or numbered — so that no single file grows without bound as the chain advances. The server creates the `receipts/`, `traces/`, and `requests/` directories before the semantics run, because the K file-system hooks open files with POSIX `open()`, which does not create parent directories.
+
+The world state stays in KORE (rather than a JSON snapshot) because an uploaded wasm module is a `ModuleDecl` that the semantics cannot reconstruct from bytes — only `wasm2kast` (Python) can produce it. The receipts and the ledger counter, by contrast, are plain data and live in JSON files, which the semantics read and write directly via the file-system hooks.
 
 ```mermaid
 flowchart TB
     boot(["server start"]) --> exists{"state.kore exists?"}
-    exists -->|"no"| init["empty_config() builds the idle K config in KORE<br/>write state.kore · seed metadata.json {latest_ledger: 0} · transactions.json {}"]
-    exists -->|"yes"| reuse["use existing state.kore<br/>seed sidecar files only if missing"]
+    exists -->|"no"| init["empty_config() builds the idle K config in KORE<br/>write state.kore · seed metadata.json {latest_ledger: 0}<br/>create receipts/ traces/ requests/"]
+    exists -->|"yes"| reuse["use existing state.kore<br/>seed metadata.json if missing · ensure artifact dirs exist"]
     init --> ready(["ready for requests"])
     reuse --> ready
 
     ready --> tx(["transaction submitted"])
-    tx --> run["semantics run the decoded steps"]
+    tx --> run["semantics run the decoded steps<br/>(trace appended to traces/trace_&lt;hash&gt;.jsonl)"]
     run --> stuck{"steps completed<br/>without getting stuck?"}
-    stuck -->|"yes — SUCCESS"| ok["append SUCCESS receipt → transactions.json<br/>bump latest_ledger → metadata.json<br/>write response.json · persist new state.kore"]
-    stuck -->|"no — FAILED"| fail["no response.json<br/>state.kore and ledger left unchanged<br/>server synthesises a FAILED receipt"]
+    stuck -->|"yes — SUCCESS"| ok["write receipts/receipt_&lt;hash&gt;.json<br/>bump latest_ledger → metadata.json<br/>write response.json · persist new state.kore"]
+    stuck -->|"no — FAILED"| fail["no response.json<br/>state.kore and ledger left unchanged<br/>server writes a FAILED receipts/receipt_&lt;hash&gt;.json"]
     ok --> ready
     fail --> ready
 ```
 
-Because the persistent files live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the transaction store. To resume a session, point `--io-dir` at a directory holding a saved `state.kore` (its sidecar files are read if present). To start fresh, point it at an empty directory.
+Because the persistent artifacts live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the stored receipts. To resume a session, point `--io-dir` at a directory holding a saved `state.kore` (its sidecar files and receipts are read if present). To start fresh, point it at an empty directory.
 
 ---
 
@@ -138,7 +141,8 @@ sequenceDiagram
     Note right of Interp: wasm only — splice upload steps into the program cell, in KORE
     Interp->>K: llvm_interpret on state.kore
     Note over K: insert-handleRequestFile → dispatch → dispatchMethod
-    K->>FS: run steps, append SUCCESS receipt to transactions.json
+    K->>FS: run steps (trace → traces/trace_&lt;hash&gt;.jsonl)
+    K->>FS: write receipts/receipt_&lt;hash&gt;.json (SUCCESS)
     K->>FS: bump latest_ledger in metadata.json
     K->>FS: write response.json { status: PENDING, ... }
     K-->>Interp: updated configuration
@@ -150,10 +154,10 @@ sequenceDiagram
     Client->>Server: getTransaction { hash }
     Server->>Interp: run(read-only envelope)
     Interp->>K: llvm_interpret on state.kore
-    K->>FS: look up hash in transactions.json
+    K->>FS: read receipts/receipt_&lt;hash&gt;.json
     K-->>Interp: response.json
     Interp-->>Server: response.json
-    Server-->>Client: { status: SUCCESS, ledger, createdAt, envelopeXdr, trace, ... }
+    Server-->>Client: { status: SUCCESS, ledger, createdAt, envelopeXdr, ... }
 ```
 
 ---
