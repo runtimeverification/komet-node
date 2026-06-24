@@ -66,20 +66,46 @@ docker run --rm -p 8000:8000 \
 
 #### Start the server
 
-```bash
-komet-node                       # serve on localhost:8000, artifacts in a fresh temp dir
-komet-node --help                # print general usage information
-komet-node --port 9000           # custom port
-komet-node --io-dir ./chain      # put all artifacts under ./chain
+Run `komet-node` to start the server; `komet-node --help` prints the full usage:
+
 ```
+usage: komet-node [-h] [--host HOST] [--port PORT] [--io-dir IO_DIR]
 
-| Flag | Default | Description |
-|---|---|---|
-| `--host` | `localhost` | Bind address |
-| `--port` | `8000` | Port to listen on |
-| `--io-dir` | a fresh temp dir | Directory holding all input and output artifacts |
+Komet Node — a local Stellar testnet backed by the K semantics of Soroban.
 
-All artifacts live in the io-dir: `state.kore` (the world state) and `metadata.json` (the ledger counter), plus a `receipts/` directory (one receipt file per transaction), a `traces/` directory (one execution trace per transaction), and a `requests/` directory (an archive of each request). Each transaction and request gets its own file so nothing grows without bound. When `--io-dir` is omitted, the server creates a fresh temporary directory, so each launch begins from an empty chain and leaves your working directory untouched. On startup the server reports, on stderr, the io-dir path, the address it is listening on, and whether it is starting from a fresh state (an empty io-dir) or resuming an existing one. The state persists across restarts, so pointing `--io-dir` at the same directory on the next launch resumes the same chain; point it at an empty directory to start over. Every incoming request is logged to stderr.
+options:
+  -h, --help       show this help message and exit
+  --host HOST      bind address (default: localhost)
+  --port PORT      port to listen on (default: 8000)
+  --io-dir IO_DIR  directory for all input/output artifacts (default: a fresh
+                   temporary directory)
+
+io-dir layout:
+  All input and output lives in the io-dir. With --io-dir omitted, a fresh
+  temporary directory is used, so each launch starts from an empty chain and
+  leaves the working directory untouched.
+
+    state.kore     the world state
+    metadata.json  the ledger counter
+    receipts/      one receipt file per transaction
+    traces/        one execution trace per transaction
+    requests/      an archive of each request
+
+  Each transaction and request gets its own file, so nothing grows without
+  bound. Point --io-dir at the same directory on the next launch to resume the
+  same chain, or at an empty directory to start over.
+
+logging:
+  On startup the server logs, to stderr, the io-dir path, the address it is
+  listening on, and whether it is starting fresh or resuming an existing chain.
+  Every incoming request is logged to stderr as well.
+
+examples:
+  komet-node                     serve on localhost:8000 in a fresh temp dir
+  komet-node --port 9000         use a custom port
+  komet-node --io-dir ./chain    keep all artifacts under ./chain (persistent)
+  komet-node --host 0.0.0.0      accept connections from outside localhost
+```
 
 #### Verify the server with `curl`
 
