@@ -11,9 +11,10 @@ response formatting live here in K:
   - The semantic world state (accounts, contracts, uploaded wasm) round-trips through the
     KORE configuration (`state.kore`), because uploaded wasm is a `ModuleDecl` that cannot
     be reconstructed from bytes by the semantics.
-  - The RPC bookkeeping (the transaction store and the latest-ledger counter) is persisted
-    as small JSON files (`transactions.json`, `metadata.json`) in the working directory,
-    read and written by these rules via the file-system hooks.
+  - The latest-ledger counter is persisted as a small JSON file (`metadata.json`) in the
+    working directory. Each transaction's receipt and execution trace are persisted as their
+    own files under `receipts/` and `traces/`, keyed by tx hash, so no single file grows
+    without bound. All are read and written by these rules via the file-system hooks.
 
 Lifecycle: on each invocation, if `request.json` exists, read it, dispatch on the
 `method` field, write `response.json`, remove `request.json`, and halt. The empty `<k>`,
@@ -46,12 +47,13 @@ module NODE
     syntax KItem ::= "#handleRequestFile"
                    | #dispatch( JSON )
                    | #dispatchMethod( String, JSON )
-                   | #runTx( JSON, String )
-                   | #finalizeTx( JSON, String )
-                   | #recordAndRespond( JSON, String, Int, JSON, JSON )
-                   | #respondTx( JSON, String, Int, JSON )
-                   | #maybeEnableTrace( JSON, String )
-                   | #getTxResult( String, String, JSON, JSON, Int )
+                   | #runTx( JSON )
+                   | #finalizeTx( JSON )
+                   | #recordAndRespond( JSON, Int )
+                   | #respondTx( JSON, Int )
+                   | #enableTrace( String )
+                   | #getTxResult( String, String, JSON, Int )
+                   | #respondTrace( JSON, String )
                    | #respond( JSON, JSON )
 
     syntax Step ::= setLedgerSequence(Int)    [symbol(setLedgerSequence)]
@@ -82,8 +84,8 @@ produces a WasmStringToken using K's generic string-to-token hook.
 ###############################################################################
 # JSON helpers
 
-These rules provide order-independent accessors over JSON objects, plus an upsert helper for
-the transaction store, ported from kontrol-node's `json-utils.md`.
+These rules provide order-independent accessors over JSON objects, ported from kontrol-node's
+`json-utils.md`.
 
 ```k
     syntax JSON ::= #getJSON( JSONKey, JSON )       [function, symbol(getJSON)]
@@ -103,16 +105,14 @@ the transaction store, ported from kontrol-node's `json-utils.md`.
  // -----------------------------------------------------------------
     rule #getInt( KEY, J ) => {#getJSON( KEY, J )}:>Int
 
-    // Upsert KEY |-> VAL into a JSON object, dropping any existing entry for KEY.
-    syntax JSON  ::= #putJSON( JSONKey, JSON, JSON )   [function, symbol(putJSON)]
-    syntax JSONs ::= #removeKeyJSONs( JSONKey, JSONs ) [function, symbol(removeKeyJSONs)]
- // ------------------------------------------------------------------------------------
-    rule #putJSON( KEY, VAL, { OBJ } ) => { KEY : VAL , #removeKeyJSONs( KEY, OBJ ) }
-
-    rule #removeKeyJSONs( _, .JSONs ) => .JSONs
-    rule #removeKeyJSONs( KEY, ( KEY  : _, REST ) ) => #removeKeyJSONs( KEY, REST )
-    rule #removeKeyJSONs( KEY, ( KEY2 : V, REST ) ) => ( KEY2 : V , #removeKeyJSONs( KEY, REST ) )
-      requires KEY =/=K KEY2
+    // The per-hash file that holds a transaction's receipt / execution trace. Python and K
+    // both build these paths the same way (see server.py), and the directories are created
+    // by the server before the semantics run (the file-system hooks do not create them).
+    syntax String ::= #receiptFile( String ) [function, symbol(receiptFile)]
+                    | #traceFile( String )   [function, symbol(traceFile)]
+ // ----------------------------------------------------------------------
+    rule #receiptFile( HASH ) => "receipts/receipt_" +String HASH +String ".json"
+    rule #traceFile( HASH )   => "traces/trace_"     +String HASH +String ".jsonl"
 
     // Append the entries of TAIL after the entries of HEAD.
     syntax JSONs ::= #concatJSONs( JSONs, JSONs ) [function, symbol(concatJSONs)]
@@ -205,8 +205,9 @@ rule. `#respond(ID, RESULT)` writes the JSON-RPC envelope to `response.json`, re
 
 ## getTransaction
 
-Look up the stored receipt by hash in `transactions.json`. If present, return it merged
-with the current `latestLedger`/`latestLedgerCloseTime`; otherwise return `NOT_FOUND`.
+Look up the stored receipt by hash in its `receipts/receipt_<hash>.json` file. If the file
+exists, return its contents merged with the current `latestLedger`/`latestLedgerCloseTime`;
+otherwise return `NOT_FOUND`.
 
 ```k
     rule <k> #dispatchMethod( "getTransaction", REQ )
@@ -214,24 +215,23 @@ with the current `latestLedger`/`latestLedgerCloseTime`; otherwise return `NOT_F
                  #getString( "hash", REQ ),
                  #getString( "now", REQ ),
                  #getJSON( "id", REQ ),
-                 String2JSON( {#readFile("transactions.json")}:>String ),
                  #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) )
              )
              ...
          </k>
 
-    rule <k> #getTxResult( HASH, NOW, ID, { TXS }, LL )
+    rule <k> #getTxResult( HASH, NOW, ID, LL )
           => #respond( ID, { #concatJSONs(
-                 #recordOf( #getJSON( HASH, { TXS } ) ),
+                 #recordOf( String2JSON( {#readFile( #receiptFile( HASH ) )}:>String ) ),
                  ( "latestLedger"          : Int2String( LL ) ,
                    "latestLedgerCloseTime" : NOW ,
                    .JSONs )
              )})
              ...
          </k>
-      requires #getJSON( HASH, { TXS } ) =/=K null
+      requires #fileExists( #receiptFile( HASH ) )
 
-    rule <k> #getTxResult( HASH, NOW, ID, { TXS }, LL )
+    rule <k> #getTxResult( HASH, NOW, ID, LL )
           => #respond( ID, {
                  "status"                : "NOT_FOUND",
                  "latestLedger"          : Int2String( LL ),
@@ -239,7 +239,7 @@ with the current `latestLedger`/`latestLedgerCloseTime`; otherwise return `NOT_F
              })
              ...
          </k>
-      requires #getJSON( HASH, { TXS } ) ==K null
+      requires notBool #fileExists( #receiptFile( HASH ) )
 
     // Extract the entries of a stored receipt object so they can be concatenated.
     syntax JSONs ::= #recordOf( JSON ) [function, symbol(recordOf)]
@@ -248,28 +248,28 @@ with the current `latestLedger`/`latestLedgerCloseTime`; otherwise return `NOT_F
 ```
 
 ###############################################################################
-## sendTransaction / traceTransaction
+## sendTransaction
 
-Both run the decoded steps, then record a receipt, bump the ledger, and respond. The only
-differences are whether instruction tracing is enabled and the shape of the immediate
-response (`PENDING` for sendTransaction, the result + trace for traceTransaction).
+`sendTransaction` runs the decoded steps, records a receipt, bumps the ledger, and responds
+with `PENDING`. Instruction tracing is always on: the executing steps append to the
+transaction's own `traces/trace_<hash>.jsonl` file, which `traceTransaction` (below) later
+retrieves by hash. The receipt itself does not carry the trace.
 
 The steps come either from the `steps` array of the request envelope (the common path) or
 from the `<program>` cell (the wasm-upload path, where they were pre-injected and have
 already run by the time we get here, leaving `steps` empty).
 
 ```k
-    rule <k> #dispatchMethod( "sendTransaction",  REQ ) => #runTx( REQ, "sendTransaction" )  ... </k>
-    rule <k> #dispatchMethod( "traceTransaction", REQ ) => #runTx( REQ, "traceTransaction" ) ... </k>
+    rule <k> #dispatchMethod( "sendTransaction", REQ ) => #runTx( REQ ) ... </k>
 
     // Unknown method — respond with a null result.
     rule <k> #dispatchMethod( _, REQ ) => #respond( #getJSON( "id", REQ ), null ) ... </k> [owise]
 
-    rule <k> #runTx( REQ, METHOD )
-          => #maybeEnableTrace( REQ, METHOD )
+    rule <k> #runTx( REQ )
+          => #enableTrace( #traceFile( #getString( "txHash", REQ ) ) )
           ~> setLedgerSequence( #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ) )
           ~> #decodeSteps( #stepsJSONs( #getJSON( "steps", REQ, [ .JSONs ] ) ) )
-          ~> #finalizeTx( REQ, METHOD )
+          ~> #finalizeTx( REQ )
              ...
          </k>
 
@@ -279,76 +279,48 @@ already run by the time we get here, leaving `steps` empty).
     rule #stepsJSONs( _ )      => .JSONs [owise]
 ```
 
-Tracing is enabled for `traceTransaction` and for any request that carries `"trace": true`
-(set by the `--trace` server flag). When enabled we clear the trace file and point the
-trace `<ioDir>` at it; otherwise tracing stays disabled.
+Tracing is always enabled: clear the transaction's trace file and point the trace `<ioDir>`
+at it so the executing steps append their records to it.
 
 ```k
-    syntax Bool ::= #tracingOn( JSON, String ) [function, symbol(tracingOn)]
- // -----------------------------------------------------------------------
-    rule #tracingOn( _, METHOD ) => true
-      requires METHOD ==String "traceTransaction"
-    rule #tracingOn( REQ, METHOD ) => #getJSON( "trace", REQ, false ) ==K true
-      requires METHOD =/=String "traceTransaction"
-
-    rule <k> #maybeEnableTrace( REQ, METHOD ) => #writeFile( "trace.jsonl", "" ) ... </k>
-         <ioDir> _ => "trace.jsonl" </ioDir>
-      requires #tracingOn( REQ, METHOD )
-
-    rule <k> #maybeEnableTrace( REQ, METHOD ) => .K ... </k>
-         <ioDir> _ => "" </ioDir>
-      requires notBool #tracingOn( REQ, METHOD )
+    rule <k> #enableTrace( PATH ) => #writeFile( PATH, "" ) ... </k>
+         <ioDir> _ => PATH </ioDir>
 ```
 
-After the steps run, read the current bookkeeping, capture the trace (if tracing was on),
-record the receipt, write the new ledger counter, and respond. Reaching this point means
-the steps completed without getting stuck, so the status is `SUCCESS`.
+After the steps run, record the receipt, write the new ledger counter, and respond. The trace
+was already written to its own file during execution, so we only reset `<ioDir>`. Reaching
+this point means the steps completed without getting stuck, so the status is `SUCCESS`.
 
 ```k
-    rule <k> #finalizeTx( REQ, METHOD )
+    rule <k> #finalizeTx( REQ )
           => #recordAndRespond(
-                 REQ, METHOD,
-                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ),
-                 String2JSON( {#readFile("transactions.json")}:>String ),
-                 {#readFile("trace.jsonl")}:>String
+                 REQ,
+                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) )
              )
              ...
          </k>
          <ioDir> _ => "" </ioDir>
-      requires #tracingOn( REQ, METHOD )
 
-    rule <k> #finalizeTx( REQ, METHOD )
-          => #recordAndRespond(
-                 REQ, METHOD,
-                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ),
-                 String2JSON( {#readFile("transactions.json")}:>String ),
-                 null
-             )
-             ...
-         </k>
-      requires notBool #tracingOn( REQ, METHOD )
-
-    rule <k> #recordAndRespond( REQ, METHOD, L, TXS, TRACE )
+    rule <k> #recordAndRespond( REQ, L )
           => #writeFile( "metadata.json", JSON2String({ "latest_ledger" : L +Int 1 }) )
-          ~> #writeFile( "transactions.json",
-                 JSON2String( #putJSON( #getString( "txHash", REQ ), #txReceipt( REQ, L +Int 1, TRACE ), TXS ) ) )
-          ~> #respondTx( REQ, METHOD, L +Int 1, TRACE )
+          ~> #writeFile( #receiptFile( #getString( "txHash", REQ ) ),
+                 JSON2String( #txReceipt( REQ, L +Int 1 ) ) )
+          ~> #respondTx( REQ, L +Int 1 )
              ...
          </k>
 
-    syntax JSON ::= #txReceipt( JSON, Int, JSON ) [function, symbol(txReceipt)]
- // ---------------------------------------------------------------------------
-    rule #txReceipt( REQ, NEWL, TRACE ) => {
+    syntax JSON ::= #txReceipt( JSON, Int ) [function, symbol(txReceipt)]
+ // ---------------------------------------------------------------------
+    rule #txReceipt( REQ, NEWL ) => {
             "status"        : "SUCCESS",
             "ledger"        : Int2String( NEWL ),
             "createdAt"     : #getString( "now", REQ ),
             "envelopeXdr"   : #getString( "envelopeXdr", REQ ),
             "resultXdr"     : "",
-            "resultMetaXdr" : "",
-            "trace"         : TRACE
+            "resultMetaXdr" : ""
         }
 
-    rule <k> #respondTx( REQ, "sendTransaction", NEWL, _TRACE )
+    rule <k> #respondTx( REQ, NEWL )
           => #respond( #getJSON( "id", REQ ), {
                  "hash"                  : #getString( "txHash", REQ ),
                  "status"                : "PENDING",
@@ -357,18 +329,25 @@ the steps completed without getting stuck, so the status is `SUCCESS`.
              })
              ...
          </k>
+```
 
-    rule <k> #respondTx( REQ, "traceTransaction", NEWL, TRACE )
-          => #respond( #getJSON( "id", REQ ), {
-                 "hash"                  : #getString( "txHash", REQ ),
-                 "status"                : "SUCCESS",
-                 "ledger"                : Int2String( NEWL ),
-                 "trace"                 : TRACE,
-                 "latestLedger"          : Int2String( NEWL ),
-                 "latestLedgerCloseTime" : #getString( "now", REQ )
-             })
+## traceTransaction
+
+Retrieve the execution trace of a previously submitted transaction, looked up by `hash` (the
+same parameter `getTransaction` takes). The trace was written to `traces/trace_<hash>.jsonl`
+by `sendTransaction`. Responds with the trace file's contents, or `null` when no trace file
+exists for that hash.
+
+```k
+    rule <k> #dispatchMethod( "traceTransaction", REQ )
+          => #respondTrace( #getJSON( "id", REQ ), #getString( "hash", REQ ) )
              ...
          </k>
+
+    rule <k> #respondTrace( ID, HASH ) => #respond( ID, {#readFile( #traceFile( HASH ) )}:>String ) ... </k>
+      requires #fileExists( #traceFile( HASH ) )
+    rule <k> #respondTrace( ID, HASH ) => #respond( ID, null ) ... </k>
+      requires notBool #fileExists( #traceFile( HASH ) )
 ```
 
 ###############################################################################

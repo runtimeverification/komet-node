@@ -43,7 +43,7 @@ The run happens in a throwaway empty directory on purpose. The idle configuratio
 1. Write the request envelope to `request.json` in `io_dir`, and delete any stale `response.json`.
 2. Parse `state.kore` with `KoreParser` (no kast conversion).
 3. For a wasm upload only, splice the upload steps into the `<program>` cell (see below).
-4. Run the interpreter with its subprocess working directory set to `io_dir` (so the K file-system hooks resolve the relative paths `request.json`, `response.json`, `metadata.json`, `transactions.json`, `trace.jsonl`). The directory is set on the subprocess only — the server's own process never `chdir`s, so concurrent requests in other threads are unaffected.
+4. Run the interpreter with its subprocess working directory set to `io_dir` (so the K file-system hooks resolve the relative paths `request.json`, `response.json`, `metadata.json`, and the `receipts/` and `traces/` files). The directory is set on the subprocess only — the server's own process never `chdir`s, so concurrent requests in other threads are unaffected.
 5. If the semantics wrote `response.json`, persist the new configuration to `state.kore` and return the response text. If not, the transaction got stuck (failed) — leave `state.kore` unchanged and return `None`, so the caller can synthesise a failure response.
 
 ### `_inject_program(pattern, steps)` — the wasm-upload path

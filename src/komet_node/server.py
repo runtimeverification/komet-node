@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
+import sys
+import tempfile
 import time
 import traceback
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -17,7 +20,11 @@ if TYPE_CHECKING:
 
 _PROTOCOL_VERSION: Final = '22'
 
-_TX_METHODS: Final = ('sendTransaction', 'traceTransaction')
+# Only sendTransaction executes a transaction. traceTransaction is a read-only lookup of the
+# trace stored on a previously executed transaction's receipt (see _read_only_envelope).
+_TX_METHODS: Final = ('sendTransaction',)
+
+_log = logging.getLogger('komet_node')
 
 
 class StellarRpcServer:
@@ -28,46 +35,62 @@ class StellarRpcServer:
     between runs, so this server supplies what they lack: it keeps the HTTP socket open,
     persists state to disk, and decodes the Stellar XDR envelope (:class:`TransactionEncoder`)
     that K cannot parse. It then runs the request envelope through the semantics
-    (:class:`NodeInterpreter`). All RPC dispatch, the transaction store, ledger accounting,
-    and response formatting are performed in K (``node.md``). The persistent state lives in
-    ``io_dir``:
+    (:class:`NodeInterpreter`). All RPC dispatch, receipt bookkeeping, ledger accounting,
+    and response formatting are performed in K (``node.md``). All artifacts — input and
+    output — live in ``io_dir``:
 
-      - ``state.kore``        — the KORE world-state configuration (accounts, contracts, wasm)
-      - ``metadata.json``     — ``{"latest_ledger": N}``
-      - ``transactions.json`` — map from tx hash to stored receipt
+      - ``state.kore``            — the KORE world-state configuration (accounts, contracts, wasm)
+      - ``metadata.json``         — ``{"latest_ledger": N}``
+      - ``receipts/receipt_<hash>.json`` — one stored receipt per transaction
+      - ``traces/trace_<hash>.jsonl``    — one execution trace per transaction
+      - ``requests/request_<n>.json``    — an archive of each incoming JSON-RPC request
+
+    Splitting receipts, traces, and requests into per-item files keeps any single file from
+    growing without bound as the chain advances.
     """
 
     interpreter: NodeInterpreter
     encoder: TransactionEncoder
-    state_file: Path
     io_dir: Path
+    state_file: Path
 
     def __init__(
         self,
         host: str = 'localhost',
         port: int = 8000,
-        state_file: Path | None = None,
+        io_dir: Path | None = None,
         network_passphrase: str = Network.TESTNET_NETWORK_PASSPHRASE,
-        trace: bool = False,
     ) -> None:
         self.host = host
         self._port = port
         self.interpreter = NodeInterpreter()
-        self.encoder = TransactionEncoder(network_passphrase, trace=trace)
-        self.state_file = (state_file if state_file is not None else Path('state.kore')).resolve()
-        self.io_dir = self.state_file.parent
+        self.encoder = TransactionEncoder(network_passphrase)
+        # With no io-dir given, run against a fresh temporary directory: a throwaway chain
+        # that starts empty on every launch and leaves the working directory untouched.
+        self.io_dir = (Path(tempfile.mkdtemp(prefix='komet-node-')) if io_dir is None else io_dir).resolve()
         self.io_dir.mkdir(parents=True, exist_ok=True)
+        self.state_file = self.io_dir / 'state.kore'
         self._httpd: HTTPServerType | None = None
 
-        fresh = not self.state_file.exists()
-        if fresh:
+        self._fresh = not self.state_file.exists()
+        if self._fresh:
             self.state_file.write_text(self.interpreter.empty_config())
         metadata_file = self.io_dir / 'metadata.json'
-        if fresh or not metadata_file.exists():
+        if self._fresh or not metadata_file.exists():
             metadata_file.write_text(json.dumps({'latest_ledger': 0}))
-        transactions_file = self.io_dir / 'transactions.json'
-        if fresh or not transactions_file.exists():
-            transactions_file.write_text(json.dumps({}))
+
+        # Per-transaction receipts and traces, and per-request archives, each go in their own
+        # file under these directories so no single file grows without bound. The K
+        # file-system hooks open files with POSIX open(), which does not create parent
+        # directories, so the directories must exist before the semantics run.
+        self.receipts_dir = self.io_dir / 'receipts'
+        self.traces_dir = self.io_dir / 'traces'
+        self.requests_dir = self.io_dir / 'requests'
+        for directory in (self.receipts_dir, self.traces_dir, self.requests_dir):
+            directory.mkdir(exist_ok=True)
+        # Continue the request archive numbering past anything a previous run left behind, so
+        # resuming an io-dir never overwrites its earlier request files.
+        self._request_count = _next_request_index(self.requests_dir)
 
     def serve(self) -> None:
         server = self
@@ -83,7 +106,9 @@ class StellarRpcServer:
                 self.end_headers()
                 self.wfile.write(response)
 
-            def log_message(self, *args: Any) -> None:  # silence per-request logging
+            # The default BaseHTTPRequestHandler logging writes one noisy line per request to
+            # stderr. We log requests ourselves (in _handle), so silence the default.
+            def log_message(self, *args: Any) -> None:
                 pass
 
         # Intentionally a single-threaded HTTPServer: requests are serialised. The K node
@@ -91,7 +116,20 @@ class StellarRpcServer:
         # state.kore), so two requests in flight at once would clobber each other. Do not
         # switch to ThreadingHTTPServer without reworking that file protocol.
         self._httpd = HTTPServer((self.host, int(self._port)), Handler)
+        self._log_ready()
         self._httpd.serve_forever()
+
+    def _log_ready(self) -> None:
+        """Announce, once the socket is bound, where the server listens and how it started."""
+        _configure_logging()
+        if self._fresh:
+            status = 'starting from a fresh state (empty io-dir)'
+        else:
+            metadata = json.loads((self.io_dir / 'metadata.json').read_text())
+            status = f'resuming existing state (latest ledger {metadata.get("latest_ledger", 0)})'
+        _log.info('komet-node ready — %s', status)
+        _log.info('io-dir: %s', self.io_dir)
+        _log.info('listening on http://%s:%d', self.host, self.port())
 
     def port(self) -> int:
         if self._httpd is not None:
@@ -142,15 +180,15 @@ class StellarRpcServer:
         Usable without the HTTP layer (e.g. from scripts and tests).
         """
         now = str(int(time.time()))
+        _log.info('request: %s (id=%r)', method, request_id)
+        self._archive_request(method, params, request_id)
 
         if method in _TX_METHODS:
             transaction = params.get('transaction')
             if not isinstance(transaction, str):
                 return _error_str(request_id, -32602, "Invalid params: 'transaction' (XDR string) is required")
             try:
-                envelope, program_steps = self.encoder.build_tx_request(
-                    method, request_id, transaction, now, force_trace=(method == 'traceTransaction')
-                )
+                envelope, program_steps = self.encoder.build_tx_request(method, request_id, transaction, now)
             except Exception:
                 # build_tx_request both decodes XDR and validates it (e.g. rejecting
                 # sub-stroop amounts); either is a client error. Log the detail, but keep
@@ -159,7 +197,7 @@ class StellarRpcServer:
                 return _error_str(request_id, -32602, 'Invalid params: could not process transaction')
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
-                return json.dumps(self._failure_response(method, request_id, envelope, now))
+                return json.dumps(self._failure_response(request_id, envelope, now))
             return response
 
         read_only_envelope = self._read_only_envelope(method, params, request_id, now)
@@ -187,15 +225,26 @@ class StellarRpcServer:
             return {**base, 'passphrase': self.encoder.network_passphrase, 'protocolVersion': _PROTOCOL_VERSION}
         if method == 'getLatestLedger':
             return {**base, 'protocolVersion': _PROTOCOL_VERSION}
-        if method == 'getTransaction':
+        if method in ('getTransaction', 'traceTransaction'):
             tx_hash = params.get('hash')
             if not isinstance(tx_hash, str):
                 return _error_str(request_id, -32602, "Invalid params: 'hash' (string) is required")
             return {**base, 'hash': tx_hash}
         return None
 
-    def _failure_response(self, method: str, rpc_id: Any, envelope: dict[str, Any], now: str) -> dict[str, Any]:
-        """Synthesise the response for a transaction that got stuck (failed) in the semantics.
+    def _archive_request(self, method: str | None, params: dict[str, Any], request_id: Any) -> None:
+        """Write each incoming JSON-RPC call to its own ``requests/request_<n>.json`` file.
+
+        This is an audit trail for the developer; the canonical ``request.json`` the semantics
+        consume is written separately by :class:`NodeInterpreter`. The server is single-threaded
+        (requests are serialised), so the counter needs no locking.
+        """
+        archive = {'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params}
+        (self.requests_dir / f'request_{self._request_count}.json').write_text(json.dumps(archive))
+        self._request_count += 1
+
+    def _failure_response(self, rpc_id: Any, envelope: dict[str, Any], now: str) -> dict[str, Any]:
+        """Synthesise the sendTransaction response for a transaction that got stuck (failed).
 
         The K run does not produce a ``response.json`` for a failed transaction and the
         world state is left unchanged. We record a FAILED receipt so a later getTransaction
@@ -206,7 +255,8 @@ class StellarRpcServer:
         tx_hash = envelope['txHash']
 
         # This FAILED receipt mirrors the SUCCESS receipt the semantics build in
-        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule.
+        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule. Like the
+        # success path, the receipt carries no trace — any trace lives in its own file.
         receipt = {
             'status': 'FAILED',
             'ledger': str(ledger),
@@ -214,30 +264,45 @@ class StellarRpcServer:
             'envelopeXdr': envelope['envelopeXdr'],
             'resultXdr': '',
             'resultMetaXdr': '',
-            'trace': None,
         }
-        transactions_file = self.io_dir / 'transactions.json'
-        transactions = json.loads(transactions_file.read_text())
-        transactions[tx_hash] = receipt
-        transactions_file.write_text(json.dumps(transactions))
+        (self.receipts_dir / f'receipt_{tx_hash}.json').write_text(json.dumps(receipt))
 
-        if method == 'sendTransaction':
-            result = {
-                'hash': tx_hash,
-                'status': 'PENDING',
-                'latestLedger': str(ledger),
-                'latestLedgerCloseTime': now,
-            }
-        else:
-            result = {
-                'hash': tx_hash,
-                'status': 'FAILED',
-                'ledger': str(ledger),
-                'trace': None,
-                'latestLedger': str(ledger),
-                'latestLedgerCloseTime': now,
-            }
+        result = {
+            'hash': tx_hash,
+            'status': 'PENDING',
+            'latestLedger': str(ledger),
+            'latestLedgerCloseTime': now,
+        }
         return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+
+
+def _next_request_index(requests_dir: Path) -> int:
+    """Return the next free index for ``requests/request_<n>.json``.
+
+    One past the highest index already present, so resuming an io-dir continues the archive
+    rather than overwriting it; 0 when the directory holds no request files yet.
+    """
+    highest = -1
+    for path in requests_dir.glob('request_*.json'):
+        try:
+            highest = max(highest, int(path.stem.removeprefix('request_')))
+        except ValueError:
+            continue  # ignore files that don't match the request_<int> pattern
+    return highest + 1
+
+
+def _configure_logging() -> None:
+    """Attach a stderr handler to the komet_node logger once, if nothing else has.
+
+    Logs go to stderr so they never interleave with anything a client reads from stdout.
+    Idempotent: calling it more than once (e.g. server restarted in-process) is a no-op.
+    """
+    if _log.handlers:
+        return
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
+    _log.addHandler(handler)
+    _log.setLevel(logging.INFO)
 
 
 def _error_str(rpc_id: Any, code: int, message: str) -> str:

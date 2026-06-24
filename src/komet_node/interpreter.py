@@ -88,8 +88,8 @@ class NodeInterpreter:
     dispatch / bookkeeping / response formatting live in ``node.md``.
 
     The world state (accounts, contracts, uploaded wasm) round-trips through the KORE
-    configuration (``state.kore``); the RPC bookkeeping (transaction store, ledger counter)
-    is persisted as JSON files in the working directory, read and written by the semantics.
+    configuration (``state.kore``); the RPC bookkeeping (per-transaction receipts, ledger
+    counter) is persisted as files in the working directory, read and written by the semantics.
     """
 
     definition: SimbolikDefinition
