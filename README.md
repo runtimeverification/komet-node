@@ -87,43 +87,20 @@ examples:
   komet-node --host 0.0.0.0      accept connections from outside localhost
 ```
 
-#### Verify the server with `curl`
-
-The server is operated via the Stellar RPC protocol. The read-only methods below take no transaction payload and can be used as a quick health check:
-
-```bash
-# Is the server alive?
-curl -s http://localhost:8000 \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth","params":{}}'
-# => {"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}
-```
-
-```bash
-# Which network am I connected to?
-curl -s http://localhost:8000 \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getNetwork","params":{}}'
-# => {"jsonrpc":"2.0","id":1,"result":{"passphrase":"Test SDF Network ; September 2015","protocolVersion":"22","friendbotUrl":null}}
-```
-
-```bash
-# What is the current ledger sequence? (increments per committed transaction)
-curl -s http://localhost:8000 \
-  -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"getLatestLedger","params":{}}'
-# => {"jsonrpc":"2.0","id":1,"result":{"id":"00...00","protocolVersion":"22","sequence":0}}
-```
-
-Submitting transactions uses the standard two-step Stellar pattern — `sendTransaction` with a base64 XDR envelope, then poll `getTransaction` by hash. Because there is no mempool, `komet-node` executes the transaction synchronously inside `sendTransaction`, so the result is already available by the time you poll. The trace example below shows this flow end-to-end with ready-to-run envelopes; see [docs/server.md](docs/server.md) for the full RPC reference.
-
 #### Trace a transaction
 
 Every submitted transaction is traced as it executes, and the instruction-level trace is stored on its receipt. `traceTransaction` retrieves that stored trace, looked up by transaction hash — the same hash `getTransaction` takes. So tracing a contract invocation is two calls: `sendTransaction` to run it, then `traceTransaction` with the returned hash. Tracing is always on; there is no flag to enable.
 
-A trace requires a deployed contract. The four envelopes below are pre-built and signed (a tiny contract whose `foo()` returns void, deployed from a fixed key) so you can paste them straight in — the local node does not check signatures, sequence numbers, or timebounds, so they work as-is on a fresh chain. Run them in order against the server above.
+Submitting transactions uses the standard two-step Stellar pattern — `sendTransaction` with a base64 XDR envelope, then poll `getTransaction` by hash. Because there is no mempool, `komet-node` executes the transaction synchronously inside `sendTransaction`, so the result is already available by the time you poll. See [docs/server.md](docs/server.md) for the full RPC reference.
+
+A trace requires a deployed contract. The four envelopes below are pre-built and signed (a tiny contract whose `foo()` returns void, deployed from a fixed key) so you can paste them straight in — the local node does not check signatures, sequence numbers, or timebounds, so they work as-is on a fresh chain. After a quick health check, run them in order against the server started above.
 
 ```bash
+# Is the server alive?
+curl -s http://localhost:8000 -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth","params":{}}'
+# => {"jsonrpc":"2.0","id":1,"result":{"status":"healthy"}}
+
 # 1. Create the deployer account
 curl -s http://localhost:8000 -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":{"transaction":"AAAAAgAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAGQAAAAAAAAAAQAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAAJUC+QAAAAAAAAAAAESVTG4AAAAQMOMXdUuK9E9tF0pgpqX+z+nXFlE6Mn5e7rqOFL8jIolInsXc7XHPgvYs4VWDqlCGI/fom9SpYiHOQYUqKTvDAc="}}'
