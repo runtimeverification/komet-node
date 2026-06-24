@@ -323,9 +323,9 @@ def test_trace_transaction_retrieves_trace_by_hash(server: StellarRpcServer) -> 
     assert send_result['status'] == 'PENDING'
 
     # The trace is keyed by the same hash getTransaction uses. A create-account op runs no
-    # wasm instructions, so the stored trace is the empty string (resolved, not null/NOT_FOUND).
+    # wasm instructions, so the stored trace is an empty array (resolved, not null/NOT_FOUND).
     trace = _rpc(server.port(), 'traceTransaction', {'hash': send_result['hash']})['result']
-    assert trace == ''
+    assert trace == []
 
 
 def test_trace_transaction_unknown_hash_returns_null(server: StellarRpcServer) -> None:
@@ -340,7 +340,7 @@ def test_trace_transaction_missing_hash_returns_invalid_params(server: StellarRp
 
 
 def test_trace_transaction_produces_trace_on_contract_invocation(server: StellarRpcServer) -> None:
-    """traceTransaction returns non-empty trace JSONL for a submitted contract invocation."""
+    """traceTransaction returns a non-empty trace array for a submitted contract invocation."""
     keypair = Keypair.random()
     account = Account(keypair.public_key, sequence=0)
 
@@ -378,14 +378,10 @@ def test_trace_transaction_produces_trace_on_contract_invocation(server: Stellar
 
     trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
 
-    assert trace is not None
-    # Trace is newline-separated JSON records; verify each line parses as JSON
-    lines = [line for line in trace.splitlines() if line.strip()]
-    assert len(lines) > 0
-    import json as _json
-
-    for line in lines:
-        record = _json.loads(line)
+    # Trace is a JSON array of per-instruction records (not a JSON-encoded string).
+    assert isinstance(trace, list)
+    assert len(trace) > 0
+    for record in trace:
         assert 'instr' in record
 
 
