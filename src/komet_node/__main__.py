@@ -10,26 +10,6 @@ from komet_node.server import StellarRpcServer
 _DESCRIPTION = 'Komet Node — a local Stellar testnet backed by the K semantics of Soroban.'
 
 _EPILOG = """\
-io-dir layout:
-  All input and output lives in the io-dir. With --io-dir omitted, a fresh
-  temporary directory is used, so each launch starts from an empty chain and
-  leaves the working directory untouched.
-
-    state.kore     the world state
-    metadata.json  the ledger counter
-    receipts/      one receipt file per transaction
-    traces/        one execution trace per transaction
-    requests/      an archive of each request
-
-  Each transaction and request gets its own file, so nothing grows without
-  bound. Point --io-dir at the same directory on the next launch to resume the
-  same chain, or at an empty directory to start over.
-
-logging:
-  On startup the server logs, to stderr, the io-dir path, the address it is
-  listening on, and whether it is starting fresh or resuming an existing chain.
-  Every incoming request is logged to stderr as well.
-
 examples:
   komet-node                     serve on localhost:8000 in a fresh temp dir
   komet-node --port 9000         use a custom port
