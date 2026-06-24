@@ -52,7 +52,7 @@ Once the socket is bound, `serve` logs the listening address to stderr and repor
 
 ## State file lifecycle
 
-Server state is split across three files in the io dir; see [architecture.md](architecture.md#state-management) for the full table.
+Three files in the io dir hold the persistent state; the server and semantics also exchange a few transient files there per request. See [architecture.md](architecture.md#the-io-dir) for the complete io-dir layout.
 
 ```
 startup (state.kore absent):

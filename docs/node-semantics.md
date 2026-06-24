@@ -8,7 +8,7 @@ It is compiled by `kdist/plugin.py` into the `komet-node.simbolik` LLVM binary, 
 
 ## Files
 
-The semantics communicate with the Python process through files in the working directory (the io dir), using the file-system hooks. All paths are relative, resolved against the cwd that `NodeInterpreter` sets before each run.
+The semantics communicate with the Python process through files in the working directory (the io dir), using the file-system hooks. All paths are relative, resolved against the cwd that `NodeInterpreter` sets before each run. The table below covers only the files the semantics touch through these hooks; for the complete io-dir layout, including `state.kore`, see [architecture.md](architecture.md#the-io-dir).
 
 | File | Direction | Contents |
 |---|---|---|

@@ -81,17 +81,20 @@ The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestL
 
 ---
 
-## State management
+## The io-dir
 
-Server state is split across the *io dir* (the directory containing the state file, by default the working directory):
+All of the server's input and output artifacts live in one directory, the *io dir* (set by `--io-dir`, the working directory by default). Its files fall into two groups: a few that **persist** across requests and restarts and together hold the chain, and a few **transient** ones that the server and the semantics rewrite on every request to pass data to each other.
 
-| File | Owner | Contents |
-|---|---|---|
-| `state.kore` | round-tripped by `NodeInterpreter` | the full K world-state configuration — accounts, contract code (incl. uploaded wasm `ModuleDecl`s), contract storage, ledger metadata — serialized in KORE |
-| `metadata.json` | read/written by the K semantics | `{"latest_ledger": N}` — the server ledger counter |
-| `transactions.json` | read/written by the K semantics | map from tx hash → stored receipt, answering `getTransaction` |
+| File | Lifetime | Written by | Contents |
+|---|---|---|---|
+| `state.kore` | persistent | `NodeInterpreter` | the full K world-state configuration — accounts, contract code (including uploaded wasm `ModuleDecl`s), contract storage, ledger metadata — serialized in KORE. Read before each run and rewritten after a successful one. |
+| `metadata.json` | persistent | the K semantics | `{"latest_ledger": N}` — the server ledger counter, bumped by 1 per committed transaction. |
+| `transactions.json` | persistent | the semantics (on success) or the server (on failure) | a map from tx hash to its stored receipt, answering `getTransaction` and `traceTransaction`. Each receipt is `{status, ledger, createdAt, envelopeXdr, resultXdr, resultMetaXdr, trace}`. |
+| `request.json` | transient | the server | the request envelope for the call in flight (`method`, `id`, `now`, and method-specific fields). The semantics remove it once they respond. |
+| `response.json` | transient | the semantics | the JSON-RPC response (`{jsonrpc, id, result}`) for the most recent call. The server reads it back; it is absent when a transaction gets stuck. |
+| `trace.jsonl` | transient | the semantics | the instruction-level trace of the transaction currently executing, one JSON record per line. Cleared at the start of each `sendTransaction`; its contents are copied into that transaction's receipt. |
 
-The world state stays in KORE (rather than a JSON snapshot) because an uploaded wasm module is a `ModuleDecl` that the semantics cannot reconstruct from bytes — only `wasm2kast` (Python) can produce it. The RPC bookkeeping, by contrast, is plain data and lives in the two JSON sidecar files, which the semantics read and write directly via the file-system hooks.
+The world state stays in KORE (rather than a JSON snapshot) because an uploaded wasm module is a `ModuleDecl` that the semantics cannot reconstruct from bytes — only `wasm2kast` (Python) can produce it. The RPC bookkeeping, by contrast, is plain data and lives in the JSON files, which the semantics read and write directly via the file-system hooks.
 
 ```mermaid
 flowchart TB
@@ -110,7 +113,7 @@ flowchart TB
     fail --> ready
 ```
 
-Because all three files live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the transaction store. To resume a session, point `--io-dir` at a directory holding a saved `state.kore` (its sidecar files are read if present). To start fresh, point it at an empty directory.
+Because the persistent files live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the transaction store. To resume a session, point `--io-dir` at a directory holding a saved `state.kore` (its sidecar files are read if present). To start fresh, point it at an empty directory.
 
 ---
 
