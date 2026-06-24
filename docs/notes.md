@@ -4,8 +4,6 @@
 
 `komet-node` is a local Stellar testnet backed by the K semantics of Soroban. The compiled semantics are a one-shot interpreter (one process per request, no networking, no state between runs), so Python wraps them into a long-running server: it holds the HTTP socket, keeps state on disk between runs, and decodes Stellar XDR, which K cannot. The RPC layer itself — method dispatch, receipt bookkeeping, ledger accounting, status, and response formatting — runs inside the K semantics ([`node.md`](node-semantics.md)).
 
-See `src/komet_node/demo.py` for an end-to-end example: empty state → create account → upload wasm → deploy contract → call `foo()`, with each step's K configuration pretty-printed.
-
 ---
 
 ## Module map

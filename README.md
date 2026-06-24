@@ -141,16 +141,6 @@ curl -s http://localhost:8000 -H 'Content-Type: application/json' \
 
 Each trace record captures the VM state at instruction entry: `pos` is the instruction's byte offset in the binary (`null` for synthetic instructions), `instr` is the instruction and its operands, and `stack`/`locals` are the value stack and locals as `[type, value]` pairs. See [docs/interpreter.md](docs/interpreter.md) for the full trace format.
 
-#### Walk through a contract lifecycle
-
-The bundled demo deploys and invokes a Soroban contract end-to-end (create account → upload wasm → deploy → invoke):
-
-```bash
-uv run python -m komet_node.demo src/tests/integration/data/wasm/empty.wat
-```
-
-This produces `state.kore` plus `state_<n>_<step>.pretty` files under `./out`, letting you inspect exactly how the ledger state evolves at each step. (Requires `wat2wasm` from [`wabt`](https://github.com/WebAssembly/wabt) on your `PATH`.)
-
 ---
 
 ## For Developers

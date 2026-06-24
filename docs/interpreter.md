@@ -59,10 +59,6 @@ return _set_cell(pattern, "<program> cell symbol", steps_kore)   # KORE-level sp
 
 Because Soroban allows only a single host-function operation per transaction, a wasm-upload transaction is exactly one `uploadWasm` op — this path never carries anything else.
 
-### `pretty_print(kore_str)`
-
-`pretty_print` is a debugging helper that pretty-prints a KORE configuration string using `krun --output pretty --depth 0`. `demo.py` uses it to render each step of a contract lifecycle.
-
 ---
 
 ## Supported operations
@@ -80,4 +76,4 @@ The mapping from Stellar operations to kasmer steps is performed by [`Transactio
 
 ## Error handling
 
-`NodeInterpreterError` is raised for interpreter-level failures (e.g. `pretty_print`). A *transaction* failure is not an exception: the semantics get stuck without writing `response.json`, so `run` returns `None` and the server records a `FAILED` receipt while leaving `state.kore` unchanged (the state effectively rolls back).
+`NodeInterpreterError` is raised for interpreter-level failures (e.g. the interpreter crashing or producing no output). A *transaction* failure is not an exception: the semantics get stuck without writing `response.json`, so `run` returns `None` and the server records a `FAILED` receipt while leaving `state.kore` unchanged (the state effectively rolls back).
