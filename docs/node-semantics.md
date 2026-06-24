@@ -16,7 +16,7 @@ The semantics communicate with the Python process through files in the working d
 | `response.json` | K → Python | the JSON-RPC response (`{jsonrpc, id, result}`) |
 | `metadata.json` | K ↔ K | `{"latest_ledger": N}` — the ledger counter |
 | `transactions.json` | K ↔ K | map from tx hash → stored receipt |
-| `trace.jsonl` | K → Python | per-instruction trace records, when tracing is enabled |
+| `trace.jsonl` | K → Python | per-instruction trace records for the transaction being executed |
 
 ---
 
@@ -39,9 +39,9 @@ insert-handleRequestFile → handleRequestFile
          ▼
 #dispatchMethod(method, request)        ← routes on the "method" field
          │
-         ├─ getHealth / getNetwork / getLatestLedger / getTransaction → #respond(...)
+         ├─ getHealth / getNetwork / getLatestLedger / getTransaction / traceTransaction → #respond(...)
          │
-         └─ sendTransaction / traceTransaction → #runTx → run steps
+         └─ sendTransaction → #runTx → run steps
                 → #finalizeTx → record receipt + bump ledger → #respond(...)
          ▼
 #respond(id, result)
@@ -69,24 +69,28 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 
 ## Transaction methods
 
-`sendTransaction` and `traceTransaction` share one rule (`#runTx`); they differ only in whether tracing is enabled and the shape of the immediate response.
+`sendTransaction` is the only method that executes a transaction, via `#runTx`. `traceTransaction` does not run anything; it reads back the trace `sendTransaction` already stored (see [traceTransaction](#tracetransaction) below).
 
 ```
-#runTx(request, method)
-   => #maybeEnableTrace(request, method)         ← point <ioDir> at trace.jsonl, or leave it ""
+#runTx(request)
+   => #enableTrace                               ← clear trace.jsonl and point <ioDir> at it
    ~> setLedgerSequence(<latest_ledger from metadata.json>)
    ~> #decodeSteps(<the "steps" array>)          ← KASMER runs each decoded step
-   ~> #finalizeTx(request, method)
+   ~> #finalizeTx(request)
 ```
 
-`#finalizeTx` reads `metadata.json` and `transactions.json` (and `trace.jsonl` if tracing was on), then:
+`#finalizeTx` reads `metadata.json`, `transactions.json`, and `trace.jsonl`, then:
 
 1. writes `metadata.json` with `latest_ledger + 1`,
 2. upserts a receipt into `transactions.json` under the tx hash:
    `{ status: "SUCCESS", ledger, createdAt, envelopeXdr, resultXdr: "", resultMetaXdr: "", trace }`,
-3. responds — `{hash, status: "PENDING", ...}` for `sendTransaction`, or the inline `{hash, status, ledger, trace, ...}` for `traceTransaction`.
+3. responds with `{hash, status: "PENDING", latestLedger, latestLedgerCloseTime}`.
 
 Reaching `#finalizeTx` means the steps completed without getting stuck, so the status is `SUCCESS`. A failed transaction gets stuck before this point, `response.json` is never written, and the Python server records the `FAILED` receipt instead.
+
+### traceTransaction
+
+`traceTransaction` is a read-only lookup. It takes a `hash` (the same parameter `getTransaction` takes), reads `transactions.json`, and responds with the `trace` field stored on that transaction's receipt, or `null` when no transaction with that hash exists. Because tracing is always on, every `sendTransaction` receipt carries its trace.
 
 ### Two ways steps are delivered
 
@@ -159,7 +163,7 @@ rule HexBytes(S)  => Int2Bytes(lengthString(S) /Int 2, String2Base(S, 16), BE)
 
 `node.md` is compiled with `md_selector: 'k | k-tracing'`, which includes the tracing rules from `soroban-semantics`. They intercept each WebAssembly instruction and append a JSON record to the file named by the `<ioDir>` cell.
 
-Tracing is activated per-request: when the request envelope carries `"trace": true` (set by `traceTransaction`, or by the `--trace` flag for every transaction), `#maybeEnableTrace` clears `trace.jsonl` and points `<ioDir>` at it; otherwise `<ioDir>` is left empty and tracing is off. After the steps run, `#finalizeTx` reads `trace.jsonl` back and stores it in the receipt's `trace` field.
+Tracing is always on. Before running the steps, `#enableTrace` clears `trace.jsonl` and points `<ioDir>` at it, so the intercepted instructions append to it. After the steps run, `#finalizeTx` reads `trace.jsonl` back, stores it in the receipt's `trace` field, and resets `<ioDir>` to empty.
 
 **Trace format** (one JSON record per line):
 

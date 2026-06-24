@@ -9,25 +9,23 @@
 ```python
 class TransactionEncoder:
     network_passphrase: str
-    trace: bool                      # whether --trace traces every transaction
 ```
 
-The encoder is stateless apart from these two configuration values; it holds no ledger or transaction state (that lives in K).
+The encoder is stateless apart from this one configuration value; it holds no ledger or transaction state (that lives in K).
 
 ---
 
-## `build_tx_request(method, rpc_id, transaction_xdr, now, force_trace)`
+## `build_tx_request(method, rpc_id, transaction_xdr, now)`
 
 `build_tx_request` is the entry point. It decodes the XDR envelope and returns a `(request, program_steps)` pair:
 
 ```python
 request = {
-    'method':      method,            # "sendTransaction" | "traceTransaction"
+    'method':      method,            # "sendTransaction"
     'id':          rpc_id,            # JSON-RPC id, echoed back in the response
     'now':         now,               # epoch seconds (string); wall-clock can't live in K
     'txHash':      envelope.hash_hex(),
     'envelopeXdr': transaction_xdr,
-    'trace':       force_trace or self.trace,
     'steps':       [ ... ] or [],     # JSON steps, or [] for the wasm path
 }
 ```

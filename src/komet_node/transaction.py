@@ -47,11 +47,9 @@ class TransactionEncoder:
     """
 
     network_passphrase: str
-    trace: bool
 
-    def __init__(self, network_passphrase: str = Network.TESTNET_NETWORK_PASSPHRASE, trace: bool = False) -> None:
+    def __init__(self, network_passphrase: str = Network.TESTNET_NETWORK_PASSPHRASE) -> None:
         self.network_passphrase = network_passphrase
-        self.trace = trace
 
     def build_tx_request(
         self,
@@ -59,7 +57,6 @@ class TransactionEncoder:
         rpc_id: Any,
         transaction_xdr: str,
         now: str,
-        force_trace: bool,
     ) -> tuple[dict[str, Any], list[KInner] | None]:
         """
         Decode a transaction XDR envelope into a request envelope for the K semantics.
@@ -77,7 +74,6 @@ class TransactionEncoder:
             'now': now,
             'txHash': envelope.hash_hex(),
             'envelopeXdr': transaction_xdr,
-            'trace': bool(force_trace or self.trace),
             'steps': json_steps if json_steps is not None else [],
         }
 

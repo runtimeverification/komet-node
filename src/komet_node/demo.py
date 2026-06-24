@@ -43,14 +43,13 @@ def wat_to_wasm(wat_path: Path) -> bytes:
 def main(wasm_wat: Path, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    state_file = out_dir / 'state.kore'
-
     root_keypair = Keypair.random()
     root_account = Account(root_keypair.public_key, sequence=0)
 
     # The server owns the io_dir lifecycle (state.kore, metadata.json, transactions.json);
     # we drive it directly via handle_rpc, no HTTP server needed.
-    server = StellarRpcServer(state_file=state_file)
+    server = StellarRpcServer(io_dir=out_dir)
+    state_file = server.state_file
 
     step = 0
 

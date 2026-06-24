@@ -10,8 +10,8 @@
 class StellarRpcServer:
     interpreter: NodeInterpreter     # the K runner
     encoder:     TransactionEncoder  # the XDR → request-envelope decoder
-    state_file:  Path                # state.kore on disk
-    io_dir:      Path                # state_file.parent — also holds metadata.json / transactions.json
+    io_dir:      Path                # directory holding every artifact
+    state_file:  Path                # io_dir / 'state.kore' — alongside metadata.json / transactions.json
 ```
 
 The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `BaseHTTPRequestHandler` reads each POST body and calls `_handle`, which parses the JSON-RPC frame and delegates to `handle_rpc`.
@@ -21,11 +21,11 @@ The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `B
 `handle_rpc` is the dispatch entry point; it returns the JSON-RPC response envelope as a string. You can call it **without** the HTTP layer, which is convenient for scripts and tests:
 
 ```python
-server = StellarRpcServer(state_file=Path('out/state.kore'))
+server = StellarRpcServer(io_dir=Path('out'))
 server.handle_rpc('sendTransaction', {'transaction': xdr})
 ```
 
-For `sendTransaction` / `traceTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run`; for the read-only methods it builds a small envelope and runs it. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the one exception is the failure fallback (below).
+For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run`; for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `traceTransaction`) it builds a small envelope and runs it. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the one exception is the failure fallback (below). Each call is logged to stderr.
 
 ---
 
@@ -35,19 +35,18 @@ For `sendTransaction` / `traceTransaction` it builds the request envelope with `
 server = StellarRpcServer(
     host='localhost',
     port=8000,
-    state_file=Path('state.kore'),
+    io_dir=Path('.'),
     network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
-    trace=False,
 )
 server.serve()
 ```
 
-At construction the server prepares the *io dir* (`state_file.parent`):
+At construction the server prepares the *io dir*, where `state.kore` lives at `io_dir / 'state.kore'`:
 
 - **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}` and `transactions.json` with `{}`.
 - **`state.kore` present** — it is used as-is, and the sidecar files are seeded only if missing. This lets you resume a previous session (ledger counter and transaction store included) or start against a pre-built state.
 
-The `trace` flag is passed to `TransactionEncoder`; when set, every transaction request carries `"trace": true`, so the semantics enable instruction tracing. (Tracing only produces records for contract invocations.)
+Once the socket is bound, `serve` logs the listening address to stderr and reports whether it is starting from a fresh state (an empty io-dir) or resuming an existing one (with the latest ledger). Instruction tracing is always on, so every transaction the semantics run produces a trace. (Tracing only produces records for contract invocations.)
 
 ---
 
@@ -108,11 +107,10 @@ All methods are answered by the K semantics and follow the [Stellar RPC specific
 
 ### `traceTransaction`
 
-`traceTransaction` behaves like `sendTransaction`, but it enables instruction tracing and returns the result **inline** in a single call, with no polling. The `trace` field is a JSONL string with one record per executed WebAssembly instruction.
+`traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored on that transaction's receipt. The result is the trace itself: a JSONL string with one record per executed WebAssembly instruction, or `null` when no transaction with that hash exists.
 
 ```json
-{ "hash": "<hex>", "status": "SUCCESS", "ledger": "5", "trace": "<jsonl>",
-  "latestLedger": "5", "latestLedgerCloseTime": "1716000000" }
+"<jsonl string>"
 ```
 
 ### `getTransaction`
@@ -141,19 +139,18 @@ All methods are answered by the K semantics and follow the [Stellar RPC specific
 
 ## Failure fallback
 
-A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. The server then synthesises the response in Python: it records a `FAILED` receipt in `transactions.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING` (for `sendTransaction`) or the `FAILED` result (for `traceTransaction`). This is the only response content the server builds itself.
+A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. Only `sendTransaction` executes a transaction, so it is the only method that reaches this path. The server then synthesises the response in Python: it records a `FAILED` receipt in `transactions.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING`. This is the only response content the server builds itself.
 
 ---
 
 ## CLI
 
 ```
-komet-node [--host HOST] [--port PORT] [--state-file PATH] [--trace]
+komet-node [--host HOST] [--port PORT] [--io-dir DIR]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port |
-| `--state-file` | `state.kore` | Path to the persistent state file (its directory also holds `metadata.json` / `transactions.json`) |
-| `--trace` | off | Enable instruction-level execution tracing |
+| `--io-dir` | `.` | Directory holding every artifact (`state.kore`, `metadata.json`, `transactions.json`) |

@@ -62,7 +62,7 @@ def server(tmp_path: Path):
     srv = StellarRpcServer(
         host='localhost',
         port=port,
-        state_file=tmp_path / 'state.kore',
+        io_dir=tmp_path,
         network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
     )
     thread = threading.Thread(target=srv.serve, daemon=True)
@@ -263,8 +263,8 @@ def test_full_lifecycle_over_http(server: StellarRpcServer) -> None:
     send(sign_and_xdr(builder().append_invoke_contract_function_op(contract_address, 'foo', [])))
 
 
-def test_trace_transaction_returns_result_directly(server: StellarRpcServer) -> None:
-    """traceTransaction returns status/ledger/trace immediately, not PENDING."""
+def test_trace_transaction_retrieves_trace_by_hash(server: StellarRpcServer) -> None:
+    """traceTransaction returns the trace of a previously submitted transaction, keyed by hash."""
     keypair = Keypair.random()
     account = Account(keypair.public_key, sequence=0)
 
@@ -276,37 +276,28 @@ def test_trace_transaction_returns_result_directly(server: StellarRpcServer) -> 
     )
     envelope.sign(keypair)
 
-    result = _rpc(server.port(), 'traceTransaction', {'transaction': envelope.to_xdr()})['result']
+    send_result = _rpc(server.port(), 'sendTransaction', {'transaction': envelope.to_xdr()})['result']
+    assert send_result['status'] == 'PENDING'
 
-    assert result['status'] == 'SUCCESS'
-    assert result['hash'] == envelope.hash_hex()
-    assert 'ledger' in result
-    assert 'trace' in result
-    assert 'latestLedger' in result
+    # The trace is keyed by the same hash getTransaction uses. A create-account op runs no
+    # wasm instructions, so the stored trace is the empty string (resolved, not null/NOT_FOUND).
+    trace = _rpc(server.port(), 'traceTransaction', {'hash': send_result['hash']})['result']
+    assert trace == ''
 
 
-def test_trace_transaction_stored_for_get_transaction(server: StellarRpcServer) -> None:
-    """traceTransaction stores the result so getTransaction can retrieve it."""
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
+def test_trace_transaction_unknown_hash_returns_null(server: StellarRpcServer) -> None:
+    """traceTransaction returns null when no transaction with that hash exists."""
+    result = _rpc(server.port(), 'traceTransaction', {'hash': 'deadbeef'})['result']
+    assert result is None
 
-    envelope = (
-        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-        .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
-        .set_timeout(30)
-        .build()
-    )
-    envelope.sign(keypair)
 
-    trace_result = _rpc(server.port(), 'traceTransaction', {'transaction': envelope.to_xdr()})['result']
-    get_result = _rpc(server.port(), 'getTransaction', {'hash': trace_result['hash']})['result']
-
-    assert get_result['status'] == 'SUCCESS'
-    assert get_result['envelopeXdr'] == envelope.to_xdr()
+def test_trace_transaction_missing_hash_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'traceTransaction', {})
+    assert result['error']['code'] == -32602
 
 
 def test_trace_transaction_produces_trace_on_contract_invocation(server: StellarRpcServer) -> None:
-    """traceTransaction returns non-empty trace JSONL when a contract function is invoked."""
+    """traceTransaction returns non-empty trace JSONL for a submitted contract invocation."""
     keypair = Keypair.random()
     account = Account(keypair.public_key, sequence=0)
 
@@ -318,11 +309,12 @@ def test_trace_transaction_produces_trace_on_contract_invocation(server: Stellar
         env.sign(keypair)
         return env.to_xdr()
 
-    def send(xdr: str) -> None:
+    def send(xdr: str) -> str:
         res = _rpc(server.port(), 'sendTransaction', {'transaction': xdr})
         assert res['result']['status'] == 'PENDING'
         tx_hash = res['result']['hash']
         assert _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']['status'] == 'SUCCESS'
+        return tx_hash
 
     # Set up: create account, upload wasm, deploy contract
     send(sign_and_xdr(builder().append_create_account_op(keypair.public_key, '1000')))
@@ -336,15 +328,16 @@ def test_trace_transaction_produces_trace_on_contract_invocation(server: Stellar
     salt = b'\x00' * 32
     send(sign_and_xdr(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt)))
 
-    # Invoke via traceTransaction and check trace content
+    # Submit the invocation, then retrieve its trace by hash.
     contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
     invoke_xdr = sign_and_xdr(builder().append_invoke_contract_function_op(contract_address, 'foo', []))
-    result = _rpc(server.port(), 'traceTransaction', {'transaction': invoke_xdr})['result']
+    tx_hash = send(invoke_xdr)
 
-    assert result['status'] == 'SUCCESS'
-    assert result['trace'] is not None
+    trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
+
+    assert trace is not None
     # Trace is newline-separated JSON records; verify each line parses as JSON
-    lines = [line for line in result['trace'].splitlines() if line.strip()]
+    lines = [line for line in trace.splitlines() if line.strip()]
     assert len(lines) > 0
     import json as _json
 

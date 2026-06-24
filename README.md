@@ -20,7 +20,7 @@
 
 It is built for developing, testing, and debugging Soroban contracts locally, and adds two capabilities a public Stellar network does not offer:
 
-- **Instruction-level traces.** The `traceTransaction` method runs a transaction and returns a step-by-step record of every WebAssembly instruction the contract executed, so you can see exactly what happened — and where it went wrong.
+- **Instruction-level traces.** Every transaction is traced as it runs, and the `traceTransaction` method returns that step-by-step record of every WebAssembly instruction the contract executed, so you can see exactly what happened — and where it went wrong.
 - **Reproducible, replayable state.** The ledger state is persisted to disk, so you can stop and restart the node, save a state, and replay transactions against it to reproduce a result.
 
 ## 🚀 Quick Start
@@ -67,20 +67,19 @@ docker run --rm -p 8000:8000 \
 #### Start the server
 
 ```bash
-komet-node                       # serve on localhost:8000, state in ./state.kore
+komet-node                       # serve on localhost:8000, artifacts in ./
 komet-node --help                # print general usage information
 komet-node --port 9000           # custom port
-komet-node --trace               # enable instruction-level execution tracing
+komet-node --io-dir ./chain      # put all artifacts under ./chain
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port to listen on |
-| `--state-file` | `state.kore` | Path to the persistent state file |
-| `--trace` | off | Enable instruction-level execution tracing |
+| `--io-dir` | `.` | Directory holding all input and output artifacts |
 
-On first start the server creates `state.kore` in the state file's directory — along with two small bookkeeping files, `metadata.json` and `transactions.json` — and begins from an empty chain. The state persists across restarts, so stopping and restarting the node resumes the same chain. To start over from an empty chain, delete `state.kore`; to resume from a chain you saved earlier, point `--state-file` at it.
+All artifacts live in the io-dir: `state.kore` (the world state), plus the bookkeeping files `metadata.json` and `transactions.json`. On startup the server reports, on stderr, the address it is listening on and whether it is starting from a fresh state (an empty io-dir) or resuming an existing one. The state persists across restarts, so stopping and restarting the node against the same io-dir resumes the same chain. To start over from an empty chain, point `--io-dir` at an empty directory; to resume a chain you saved earlier, point it at that directory. Every incoming request is logged to stderr.
 
 #### Verify the server with `curl`
 
@@ -114,11 +113,7 @@ Submitting transactions uses the standard two-step Stellar pattern — `sendTran
 
 #### Trace a transaction
 
-`traceTransaction` executes a transaction and returns an instruction-level execution trace inline, in a single call. Tracing only applies to contract invocations, so the server must be started with `--trace`:
-
-```bash
-komet-node --trace
-```
+Every submitted transaction is traced as it executes, and the instruction-level trace is stored on its receipt. `traceTransaction` retrieves that stored trace, looked up by transaction hash — the same hash `getTransaction` takes. So tracing a contract invocation is two calls: `sendTransaction` to run it, then `traceTransaction` with the returned hash. Tracing is always on; there is no flag to enable.
 
 A trace requires a deployed contract. The four envelopes below are pre-built and signed (a tiny contract whose `foo()` returns void, deployed from a fixed key) so you can paste them straight in — the local node does not check signatures, sequence numbers, or timebounds, so they work as-is on a fresh chain. Run them in order against the server above.
 
@@ -135,31 +130,29 @@ curl -s http://localhost:8000 -H 'Content-Type: application/json' \
 curl -s http://localhost:8000 -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":{"transaction":"AAAAAgAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAGQAAAAAAAAAAwAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAGAAAAAMAAAAAAAAAAAAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFdPOLtg6vmmrgodRyN6P3wk1UfHrQxVekpbnsYYOcpvAAAAAAAAAAAAAAAAAAAAARJVMbgAAABAnLtNirBI7XdD2xwH3ws3rTDEhCxJ8mCRNU66d7b4MR2Ih9WtZzqb6akBqK6yA1GIavzVa7ahq2FNBflk+JpOBg=="}}'
 
-# 4. Invoke foo() via traceTransaction — the trace comes back inline
+# 4. Invoke foo() — sendTransaction runs it and returns its hash
 curl -s http://localhost:8000 -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"traceTransaction","params":{"transaction":"AAAAAgAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAGQAAAAAAAAABAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAGAAAAAAAAAABaiD+wakIF3Ol8jzjcPkl8jY0blEEON3W1A9rJxHBNOAAAAADZm9vAAAAAAAAAAAAAAAAAAAAAAESVTG4AAAAQKB9w/QmdK59UzXVbxXJp+5qfNpFSa495yajOyPM5KmYblE3/AbWqnnZMxTiBea0ShGZehgvo12AIyw48Lb1Xw0="}}'
+  -d '{"jsonrpc":"2.0","id":1,"method":"sendTransaction","params":{"transaction":"AAAAAgAAAAADoQe/884Qvh1w3RjnS8CZZ+TWMJulDV8d3IZkElUxuAAAAGQAAAAAAAAABAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAGAAAAAAAAAABaiD+wakIF3Ol8jzjcPkl8jY0blEEON3W1A9rJxHBNOAAAAADZm9vAAAAAAAAAAAAAAAAAAAAAAESVTG4AAAAQKB9w/QmdK59UzXVbxXJp+5qfNpFSa495yajOyPM5KmYblE3/AbWqnnZMxTiBea0ShGZehgvo12AIyw48Lb1Xw0="}}'
+# => {"jsonrpc":"2.0","id":1,"result":{"hash":"c7099cbe10a9bfa1cdf9c9d368e1e1c932f535a70e4403b7aa409ce19fc36805","status":"PENDING", ...}}
+
+# 5. Retrieve the trace for that hash
+curl -s http://localhost:8000 -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"traceTransaction","params":{"hash":"c7099cbe10a9bfa1cdf9c9d368e1e1c932f535a70e4403b7aa409ce19fc36805"}}'
 ```
 
-The final call returns the result inline. The `trace` field is itself a JSONL string (one JSON record per executed WebAssembly instruction); it is shown decoded here for readability:
+`traceTransaction` returns the stored trace as its result. The trace is a JSONL string (one JSON record per executed WebAssembly instruction); it is shown decoded here for readability:
 
 ```jsonc
 {
   "jsonrpc": "2.0",
   "id": 1,
-  "result": {
-    "hash": "c7099cbe10a9bfa1cdf9c9d368e1e1c932f535a70e4403b7aa409ce19fc36805",
-    "status": "SUCCESS",
-    "ledger": "4",
-    "latestLedger": "4",
-    "latestLedgerCloseTime": "1716000000",
-    "trace": [
-      {"pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
-      {"pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
-      {"pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
-      {"pos": null, "instr": ["block"],                 "stack": [], "locals": {}},
-      {"pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}}
-    ]
-  }
+  "result": [
+    {"pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
+    {"pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
+    {"pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
+    {"pos": null, "instr": ["block"],                 "stack": [], "locals": {}},
+    {"pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}}
+  ]
 }
 ```
 

@@ -110,7 +110,7 @@ flowchart TB
     fail --> ready
 ```
 
-Because all three files live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the transaction store. To resume a session, point `--state-file` at a saved `state.kore` (its sidecar files are read if present). To start fresh, delete the files.
+Because all three files live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the transaction store. To resume a session, point `--io-dir` at a directory holding a saved `state.kore` (its sidecar files are read if present). To start fresh, point it at an empty directory.
 
 ---
 
