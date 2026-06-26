@@ -61,7 +61,8 @@ RUN . /home/vscode/.nix-profile/etc/profile.d/nix.sh \
     && nix profile install \
         nixpkgs#direnv \
         nixpkgs#nix-direnv \
-        nixpkgs#nodejs_22
+        nixpkgs#nodejs_22 \
+        nixpkgs#gh
 
 # Claude Code CLI — installed to a per-user prefix so root isn't required.
 RUN . /home/vscode/.nix-profile/etc/profile.d/nix.sh \

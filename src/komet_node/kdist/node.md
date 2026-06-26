@@ -335,8 +335,10 @@ this point means the steps completed without getting stuck, so the status is `SU
 
 Retrieve the execution trace of a previously submitted transaction, looked up by `hash` (the
 same parameter `getTransaction` takes). The trace was written to `traces/trace_<hash>.jsonl`
-by `sendTransaction`. Responds with the trace file's contents, or `null` when no trace file
-exists for that hash.
+by `sendTransaction`. The file is JSONL (one JSON record per executed instruction); we parse
+it into a JSON array so the result is structured data rather than an opaque string. Responds
+with that array — empty when the transaction ran no instructions — or `null` when no trace
+file exists for that hash.
 
 ```k
     rule <k> #dispatchMethod( "traceTransaction", REQ )
@@ -344,10 +346,36 @@ exists for that hash.
              ...
          </k>
 
-    rule <k> #respondTrace( ID, HASH ) => #respond( ID, {#readFile( #traceFile( HASH ) )}:>String ) ... </k>
+    rule <k> #respondTrace( ID, HASH ) => #respond( ID, [ #parseTraceLines( {#readFile( #traceFile( HASH ) )}:>String ) ] ) ... </k>
       requires #fileExists( #traceFile( HASH ) )
     rule <k> #respondTrace( ID, HASH ) => #respond( ID, null ) ... </k>
       requires notBool #fileExists( #traceFile( HASH ) )
+```
+
+`#parseTraceLines` turns the JSONL trace text into a `JSONs` list, parsing each newline-
+delimited record with `String2JSON`. Empty segments (a leading/blank line, or the empty
+tail after the final record's trailing newline) are skipped, so an empty file yields `.JSONs`
+(an empty array).
+
+```k
+    syntax JSONs ::= #parseTraceLines( String ) [function, symbol(parseTraceLines)]
+ // -------------------------------------------------------------------------------
+    rule #parseTraceLines( "" ) => .JSONs
+
+    // No more newlines: the whole remaining string is the final record.
+    rule #parseTraceLines( S ) => String2JSON( S ) , .JSONs
+      requires S =/=String "" andBool findString( S, "\n", 0 ) <Int 0
+
+    // Split off the first line and recurse on the rest.
+    rule #parseTraceLines( S )
+      => String2JSON( substrString( S, 0, findString( S, "\n", 0 ) ) )
+       , #parseTraceLines( substrString( S, findString( S, "\n", 0 ) +Int 1, lengthString( S ) ) )
+      requires findString( S, "\n", 0 ) >Int 0
+
+    // Empty leading line (the string starts with a newline): drop it and recurse.
+    rule #parseTraceLines( S )
+      => #parseTraceLines( substrString( S, 1, lengthString( S ) ) )
+      requires findString( S, "\n", 0 ) ==Int 0
 ```
 
 ###############################################################################

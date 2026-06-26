@@ -123,7 +123,7 @@ curl -s http://localhost:8000 -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"traceTransaction","params":{"hash":"c7099cbe10a9bfa1cdf9c9d368e1e1c932f535a70e4403b7aa409ce19fc36805"}}'
 ```
 
-`traceTransaction` returns the stored trace as its result. The trace is a JSONL string (one JSON record per executed WebAssembly instruction); it is shown decoded here for readability:
+`traceTransaction` returns the stored trace as its result: a JSON array with one record per executed WebAssembly instruction.
 
 ```jsonc
 {
