@@ -116,10 +116,12 @@ All methods are answered by the K semantics and follow the [Stellar RPC specific
 
 ### `traceTransaction`
 
-`traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored on that transaction's receipt. The result is the trace itself: a JSONL string with one record per executed WebAssembly instruction, or `null` when no transaction with that hash exists.
+`traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored for that transaction. The result is a JSON array with one record per executed WebAssembly instruction (empty when the transaction ran no instructions), or `null` when no transaction with that hash exists.
 
 ```json
-"<jsonl string>"
+[
+  {"pos": 3, "instr": ["const", "i32", 1048576], "stack": [], "locals": {}}
+]
 ```
 
 ### `getTransaction`
