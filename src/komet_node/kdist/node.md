@@ -393,10 +393,10 @@ SCVal arg encoding (key order also significant):
         => deployContract(Account(HexBytes(FROM)), Contract(HexBytes(ADDR)), HexBytes(HASH))
 
     rule #decodeStep({ "op" : "callTx" , "from" : FROM:String , "fromIsContract" : false , "func" : FUNC:String , "to" : TO:String , "args" : [ARGS:JSONs] })
-        => callTx(Account(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""), #decodeArgList(ARGS), Void)
+        => uncheckedCallTx(Account(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""), #decodeArgList(ARGS))
 
     rule #decodeStep({ "op" : "callTx" , "from" : FROM:String , "fromIsContract" : true , "func" : FUNC:String , "to" : TO:String , "args" : [ARGS:JSONs] })
-        => callTx(Contract(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""), #decodeArgList(ARGS), Void)
+        => uncheckedCallTx(Contract(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""), #decodeArgList(ARGS))
 
     syntax List  ::= #decodeArgList(JSONs) [function]
     syntax ScVal ::= #decodeArg(JSON)      [function]
@@ -415,6 +415,23 @@ SCVal arg encoding (key order also significant):
     rule #decodeArg({ "type" : "bytes"   , "value" : V:String }) => ScBytes(HexBytes(V))
     rule #decodeArg({ "type" : "address" , "addrType" : "account"  , "value" : V:String }) => ScAddress(Account(HexBytes(V)))
     rule #decodeArg({ "type" : "address" , "addrType" : "contract" , "value" : V:String }) => ScAddress(Contract(HexBytes(V)))
+```
+
+`uncheckedCallTx` is like komet's `callTx` but it does not entail a return value check.
+
+
+```k
+    syntax Step ::= uncheckedCallTx( from: Address, to: Address, func: WasmString, args: List)     [symbol(uncheckedCallTx)]
+
+    rule [uncheckedCallTx]:
+        <k> uncheckedCallTx(FROM, TO, FUNC, ARGS)
+         => allocObjects(ARGS)
+         ~> callContractFromStack(FROM, TO, FUNC)
+         ~> #resetHost
+            ...
+        </k>
+        // clear the host cell before contract calls
+        (_:HostCell => <host> <hostStack> .HostStack </hostStack> ... </host>)
 
 endmodule
 ```
