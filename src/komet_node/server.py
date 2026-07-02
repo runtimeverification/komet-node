@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import tempfile
 import time
@@ -18,7 +19,11 @@ from komet_node.transaction import TransactionEncoder
 if TYPE_CHECKING:
     from http.server import HTTPServer as HTTPServerType
 
-_PROTOCOL_VERSION: Final = '22'
+_PROTOCOL_VERSION: Final = 22
+
+# Transaction hashes are 64 lowercase hex characters (the spec's Hash schema:
+# ^[a-f\d]{64}$). Anything else is rejected as Invalid params before reaching K.
+_TX_HASH_RE: Final = re.compile(r'[0-9a-f]{64}')
 
 # Only sendTransaction executes a transaction. traceTransaction is a read-only lookup of the
 # trace stored on a previously executed transaction's receipt (see _read_only_envelope).
@@ -195,6 +200,12 @@ class StellarRpcServer:
                 # the client-facing message neutral rather than leaking internal exceptions.
                 traceback.print_exc()
                 return _error_str(request_id, -32602, 'Invalid params: could not process transaction')
+            # A hash that already has a receipt is a duplicate submission: the semantics
+            # answer DUPLICATE without running the steps (see node.md). Steps injected into
+            # the <program> cell (wasm uploads) would execute *before* dispatch, though, so
+            # they must not be injected for a duplicate.
+            if (self.receipts_dir / f'receipt_{envelope["txHash"]}.json').exists():
+                program_steps = None
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
                 return json.dumps(self._failure_response(request_id, envelope, now))
@@ -229,6 +240,8 @@ class StellarRpcServer:
             tx_hash = params.get('hash')
             if not isinstance(tx_hash, str):
                 return _error_str(request_id, -32602, "Invalid params: 'hash' (string) is required")
+            if _TX_HASH_RE.fullmatch(tx_hash) is None:
+                return _error_str(request_id, -32602, "Invalid params: 'hash' must be a 64-character hex string")
             return {**base, 'hash': tx_hash}
         return None
 
@@ -255,22 +268,25 @@ class StellarRpcServer:
         tx_hash = envelope['txHash']
 
         # This FAILED receipt mirrors the SUCCESS receipt the semantics build in
-        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule. Like the
-        # success path, the receipt carries no trace — any trace lives in its own file.
+        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule (ledger a
+        # JSON number, createdAt an int64-as-string). Like the success path, the receipt
+        # carries no trace — any trace lives in its own file.
         receipt = {
             'status': 'FAILED',
-            'ledger': str(ledger),
-            'createdAt': now,
+            'applicationOrder': 1,
+            'feeBump': False,
             'envelopeXdr': envelope['envelopeXdr'],
             'resultXdr': '',
             'resultMetaXdr': '',
+            'ledger': ledger,
+            'createdAt': now,
         }
         (self.receipts_dir / f'receipt_{tx_hash}.json').write_text(json.dumps(receipt))
 
         result = {
             'hash': tx_hash,
             'status': 'PENDING',
-            'latestLedger': str(ledger),
+            'latestLedger': ledger,
             'latestLedgerCloseTime': now,
         }
         return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
