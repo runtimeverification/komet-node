@@ -18,6 +18,7 @@ from komet_node.server import StellarRpcServer
 
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
 ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resolve(strict=True)
+ADDER_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'adder.wat').resolve(strict=True)
 
 
 def wat_to_wasm(wat_path: Path) -> bytes:
@@ -445,3 +446,55 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
         ],
     )
     invoke('test_symbol', [xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(sc_symbol=b'hello'))])
+
+
+def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
+    """A contract invocation that returns a non-Void value succeeds.
+
+    Regression test: transactions used to be decoded into ``callTx(..., Void)``, which
+    asserts the call returns Void. Invoking ``add(2, 3)`` (returning U32(5)) therefore got
+    stuck in the semantics and was recorded as FAILED. ``uncheckedCallTx`` drops the return
+    value check.
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def send(tb: TransactionBuilder) -> None:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
+        assert res['result']['status'] == 'PENDING'
+        tx_hash = res['result']['hash']
+        get_res = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
+        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    # Set up: create account, upload adder.wat, deploy contract
+    send(builder().append_create_account_op(keypair.public_key, '1000'))
+
+    wasm_bytecode = wat_to_wasm(ADDER_CONTRACT_WAT)
+    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
+
+    from stellar_sdk.utils import sha256
+
+    wasm_hash = sha256(wasm_bytecode)
+    salt = b'\x00' * 32
+    send(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
+
+    # add(2, 3) returns U32(5), not Void — the send() helper asserts SUCCESS.
+    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+    send(
+        builder().append_invoke_contract_function_op(
+            contract_address,
+            'add',
+            [
+                xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(2)),
+                xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(3)),
+            ],
+        )
+    )
+
+    # All four transactions, including the non-Void invocation, advanced the ledger.
+    assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 4
