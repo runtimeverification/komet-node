@@ -203,6 +203,62 @@ rule. `#respond(ID, RESULT)` writes the JSON-RPC envelope to `response.json`, re
          </k>
 ```
 
+`getVersionInfo` echoes the version strings the Python server put into the request envelope
+(the package versions live in Python's package metadata, which K cannot read). Its
+`protocolVersion` is a JSON number, per the spec and real stellar-rpc.
+
+```k
+    rule <k> #dispatchMethod( "getVersionInfo", REQ )
+          => #respond( #getJSON( "id", REQ ), {
+                 "version"            : #getString( "version", REQ ),
+                 "commitHash"         : #getString( "commitHash", REQ ),
+                 "buildTimestamp"     : #getString( "buildTimestamp", REQ ),
+                 "captiveCoreVersion" : #getString( "captiveCoreVersion", REQ ),
+                 "protocolVersion"    : #getInt( "protocolVersion", REQ )
+             })
+             ...
+         </k>
+```
+
+`getFeeStats` reports a constant fee distribution: komet-node has no fee market (transactions
+execute immediately and pay no fees), so every statistic is the network minimum inclusion fee
+of 100 stroops over an empty sample. Real stellar-rpc serialises every distribution field
+except `ledgerCount` with Go's `,string` option, so those are JSON strings holding decimal
+numbers, while `ledgerCount` and `latestLedger` are JSON numbers. `latestLedger` is read live
+from `metadata.json`.
+
+```k
+    rule <k> #dispatchMethod( "getFeeStats", REQ )
+          => #respond( #getJSON( "id", REQ ), {
+                 "sorobanInclusionFee" : #feeDistribution,
+                 "inclusionFee"        : #feeDistribution,
+                 "latestLedger"        : #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) )
+             })
+             ...
+         </k>
+
+    syntax JSON ::= "#feeDistribution" [function, symbol(feeDistribution)]
+ // ----------------------------------------------------------------------
+    rule #feeDistribution => {
+            "max"  : "100",
+            "min"  : "100",
+            "mode" : "100",
+            "p10"  : "100",
+            "p20"  : "100",
+            "p30"  : "100",
+            "p40"  : "100",
+            "p50"  : "100",
+            "p60"  : "100",
+            "p70"  : "100",
+            "p80"  : "100",
+            "p90"  : "100",
+            "p95"  : "100",
+            "p99"  : "100",
+            "transactionCount" : "0",
+            "ledgerCount"      : 0
+        }
+```
+
 ## getTransaction
 
 Look up the stored receipt by hash in its `receipts/receipt_<hash>.json` file. If the file

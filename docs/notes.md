@@ -35,4 +35,5 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 
 - `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
-- `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
+- `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getTransactions`, `getLedgers`, and TTL/footprint operations are not implemented.
+- `getFeeStats` reports constant distributions (there is no fee market); only its `latestLedger` is live.

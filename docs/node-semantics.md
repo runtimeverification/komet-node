@@ -39,7 +39,8 @@ insert-handleRequestFile → handleRequestFile
          ▼
 #dispatchMethod(method, request)        ← routes on the "method" field
          │
-         ├─ getHealth / getNetwork / getLatestLedger / getTransaction / traceTransaction → #respond(...)
+         ├─ getHealth / getNetwork / getLatestLedger / getVersionInfo / getFeeStats
+         │    / getTransaction / traceTransaction → #respond(...)
          │
          └─ sendTransaction → #runTx → run steps
                 → #finalizeTx → record receipt + bump ledger → #respond(...)
@@ -61,6 +62,8 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 - `getHealth` → `{ "status": "healthy" }`
 - `getNetwork` → `{ "friendbotUrl": null, "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic)
 - `getLatestLedger` → reads `metadata.json` and returns `{ "id": <64 zeros>, "protocolVersion": ..., "sequence": <latest_ledger> }`
+- `getVersionInfo` → echoes the version fields the server put into the envelope (`version`, `commitHash`, `buildTimestamp`, `captiveCoreVersion` — package metadata lives on the Python side); `protocolVersion` is a JSON number
+- `getFeeStats` → constant `#feeDistribution` objects (komet-node has no fee market) for `sorobanInclusionFee`/`inclusionFee`, plus a live `latestLedger` number from `metadata.json`; all distribution fields except `ledgerCount` are decimal strings, matching real stellar-rpc's Go `,string` encoding
 - `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the current `latestLedger`/`latestLedgerCloseTime`, or `{ "status": "NOT_FOUND", ... }` when the file is absent
 
 `#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0.

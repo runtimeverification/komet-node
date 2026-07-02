@@ -51,7 +51,7 @@ flowchart TB
 
 → **[Detailed documentation](server.md)**
 
-The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `sendTransaction`, `getTransaction`, and `traceTransaction` — and the K semantics answer all of them.
+The server implements eight RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `getVersionInfo`, `getFeeStats`, `sendTransaction`, `getTransaction`, and `traceTransaction` — and the K semantics answer all of them.
 
 `sendTransaction` always returns `PENDING` and clients poll `getTransaction` for the result — matching the Stellar RPC async pattern even though the transaction executes synchronously. See [server.md](server.md) for details.
 
@@ -177,6 +177,6 @@ sequenceDiagram
 
 - `resultXdr` / `resultMetaXdr` in `getTransaction` responses (contract return values)
 - `simulateTransaction` (dry-run without state mutation)
-- `getEvents`, `getLedgerEntries`, `getFeeStats` and other read-only RPC methods
+- `getEvents`, `getLedgerEntries`, `getTransactions`, `getLedgers` and other read-only RPC methods
 - `ExtendFootprintTTL` and `RestoreFootprint` operations
 - `SCVec` / `SCMap` contract-argument types in the request encoder (`scval_to_json`)

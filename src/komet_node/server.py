@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import logging
 import sys
@@ -19,6 +20,15 @@ if TYPE_CHECKING:
     from http.server import HTTPServer as HTTPServerType
 
 _PROTOCOL_VERSION: Final = '22'
+
+# getVersionInfo fields. komet-node is a Python package, not a Go binary, so there is no
+# commit hash or build timestamp baked in at compile time; report all-zeros / epoch
+# placeholders with the correct spec types instead. The "Captive Core" of komet-node is the
+# komet package (the K semantics of Soroban that execute the transactions).
+_VERSION: Final = importlib.metadata.version('komet-node')
+_COMMIT_HASH: Final = '0' * 40
+_BUILD_TIMESTAMP: Final = '1970-01-01T00:00:00'
+_CAPTIVE_CORE_VERSION: Final = f'komet {importlib.metadata.version("komet")} (K semantics of Soroban)'
 
 # Only sendTransaction executes a transaction. traceTransaction is a read-only lookup of the
 # trace stored on a previously executed transaction's receipt (see _read_only_envelope).
@@ -225,6 +235,19 @@ class StellarRpcServer:
             return {**base, 'passphrase': self.encoder.network_passphrase, 'protocolVersion': _PROTOCOL_VERSION}
         if method == 'getLatestLedger':
             return {**base, 'protocolVersion': _PROTOCOL_VERSION}
+        if method == 'getVersionInfo':
+            # protocolVersion is a JSON number here (a Go uint32 in stellar-rpc), unlike the
+            # string the older methods still emit.
+            return {
+                **base,
+                'version': _VERSION,
+                'commitHash': _COMMIT_HASH,
+                'buildTimestamp': _BUILD_TIMESTAMP,
+                'captiveCoreVersion': _CAPTIVE_CORE_VERSION,
+                'protocolVersion': int(_PROTOCOL_VERSION),
+            }
+        if method == 'getFeeStats':
+            return base
         if method in ('getTransaction', 'traceTransaction'):
             tx_hash = params.get('hash')
             if not isinstance(tx_hash, str):
