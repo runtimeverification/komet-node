@@ -51,7 +51,7 @@ flowchart TB
 
 → **[Detailed documentation](server.md)**
 
-The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `sendTransaction`, `getTransaction`, and `traceTransaction` — and the K semantics answer all of them.
+The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `sendTransaction`, `getTransaction`, and the komet-specific `traceTransaction` extension — and the K semantics answer all of them. JSON-RPC framing (single calls, batch arrays, notifications) is handled in Python; the semantics see one request envelope per invocation.
 
 `sendTransaction` always returns `PENDING` and clients poll `getTransaction` for the result — matching the Stellar RPC async pattern even though the transaction executes synchronously. See [server.md](server.md) for details.
 
