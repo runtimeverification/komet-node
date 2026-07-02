@@ -136,18 +136,20 @@ All methods are answered by the K semantics and follow the [Stellar RPC specific
 ```json
 {
   "status": "SUCCESS", "ledger": "5", "createdAt": "1716000000",
-  "envelopeXdr": "<base64 XDR>", "resultXdr": "", "resultMetaXdr": "",
+  "envelopeXdr": "<base64 XDR>", "resultXdr": "<base64 XDR>", "resultMetaXdr": "<base64 XDR>",
   "latestLedger": "5", "latestLedgerCloseTime": "1716000000"
 }
 ```
 
-`resultXdr` and `resultMetaXdr` are currently empty stubs. The receipt carries no trace — use `traceTransaction` with the same hash to fetch it.
+`resultXdr` is a base64 `TransactionResult` (code `txSUCCESS` or `txFAILED`) and `resultMetaXdr` a base64 `TransactionMeta` v3; when the transaction invoked a contract, its return value is reported as `sorobanMeta.returnValue` inside the meta. Both are synthesised by the server (`result_xdr.py`) from the envelope and the return value the semantics recorded in the receipt — see [node-semantics.md](node-semantics.md). Fees and ledger-entry change sets in these structs are zero/empty (komet-node does not track them). `resultMetaXdr` is omitted on `FAILED` receipts — a failed run rolls back and produces no meta. The receipt carries no trace — use `traceTransaction` with the same hash to fetch it.
 
 ---
 
 ## Failure fallback
 
-A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. Only `sendTransaction` executes a transaction, so it is the only method that reaches this path. The server then synthesises the response in Python: it writes a `FAILED` `receipts/receipt_<hash>.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING`. This is the only response content the server builds itself.
+A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. Only `sendTransaction` executes a transaction, so it is the only method that reaches this path. The server then synthesises the response in Python: it writes a `FAILED` `receipts/receipt_<hash>.json` (so a later `getTransaction` finds it) with a `txFAILED` `resultXdr` and no `resultMetaXdr`, without bumping the ledger, and returns `PENDING`. `ledger` on a `FAILED` receipt pins the latest ledger at failure time (the chain does not advance) and `createdAt` the submission time, with the same encoding as on `SUCCESS` receipts.
+
+On the success path the server also post-processes the receipt the semantics wrote: `_attach_result_xdr` replaces the receipt's internal `returnValue` field (a JSON-encoded SCVal, or `null`) with the spec-mandated `resultXdr`/`resultMetaXdr` base64 XDR, which K cannot construct. These are the only response contents the server builds itself.
 
 ---
 

@@ -89,7 +89,7 @@ All of the server's input and output artifacts live in one directory, the *io di
 |---|---|---|---|
 | `state.kore` | persistent | `NodeInterpreter` | the full K world-state configuration — accounts, contract code (including uploaded wasm `ModuleDecl`s), contract storage, ledger metadata — serialized in KORE. Read before each run and rewritten after a successful one. |
 | `metadata.json` | persistent | the K semantics | `{"latest_ledger": N}` — the server ledger counter, bumped by 1 per committed transaction. |
-| `receipts/receipt_<hash>.json` | persistent | the semantics (on success) or the server (on failure) | one stored receipt per transaction, keyed by tx hash, answering `getTransaction`. Each is `{status, ledger, createdAt, envelopeXdr, resultXdr, resultMetaXdr}`. |
+| `receipts/receipt_<hash>.json` | persistent | the semantics and the server (on success — the server rewrites the semantics' internal `returnValue` field into `resultXdr`/`resultMetaXdr`), or the server alone (on failure) | one stored receipt per transaction, keyed by tx hash, answering `getTransaction`. Each is `{status, ledger, createdAt, envelopeXdr, resultXdr, resultMetaXdr?}`. |
 | `traces/trace_<hash>.jsonl` | persistent | the semantics | one execution trace per transaction, keyed by tx hash — the instruction-level records, one JSON object per line. `traceTransaction` returns this file's contents. |
 | `requests/request_<n>.json` | persistent | the server | an archive of each incoming JSON-RPC request, numbered by a monotonic counter, kept for debugging. |
 | `request.json` | transient | the server | the request envelope for the call in flight (`method`, `id`, `now`, and method-specific fields). The semantics remove it once they respond. |
@@ -175,7 +175,6 @@ sequenceDiagram
 
 ## What's not yet implemented
 
-- `resultXdr` / `resultMetaXdr` in `getTransaction` responses (contract return values)
 - `simulateTransaction` (dry-run without state mutation)
 - `getEvents`, `getLedgerEntries`, `getFeeStats` and other read-only RPC methods
 - `ExtendFootprintTTL` and `RestoreFootprint` operations

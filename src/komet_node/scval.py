@@ -20,6 +20,7 @@ from komet.scval import (
     SCSymbol,
     SCVec,
 )
+from stellar_sdk import xdr as stellar_xdr
 from stellar_sdk.xdr.sc_address_type import SCAddressType
 from stellar_sdk.xdr.sc_val_type import SCValType
 
@@ -27,6 +28,8 @@ if TYPE_CHECKING:
     from komet.scval import SCValue
     from stellar_sdk.xdr.sc_address import SCAddress as XDRSCAddress
     from stellar_sdk.xdr.sc_val import SCVal
+
+_U64_MASK = (1 << 64) - 1
 
 
 def scval_to_json(scval: SCVal) -> dict:
@@ -77,6 +80,74 @@ def scval_to_json(scval: SCVal) -> dict:
             return {'type': 'address', 'addrType': 'contract', 'value': addr.contract_id.contract_id.hash.hex()}
         case _:
             raise NotImplementedError(f'Unsupported SCVal type for JSON encoding: {scval.type}')
+
+
+def scval_from_json(value: dict) -> SCVal:
+    """Decode a JSON-encoded SCVal (as produced by ``#scValToJSON`` in ``node.md``) to XDR.
+
+    This is the inverse of :func:`scval_to_json`, extended with the value-only cases a
+    contract call can return but never takes as an argument (``void``, ``string``, ``u256``,
+    ``vec``, ``map``) — keep the three encodings in sync.
+    """
+    xdr = stellar_xdr
+    match value:
+        case {'type': 'bool', 'value': bool(b)}:
+            return xdr.SCVal(SCValType.SCV_BOOL, b=b)
+        case {'type': 'void'}:
+            return xdr.SCVal(SCValType.SCV_VOID)
+        case {'type': 'i32', 'value': int(v)}:
+            return xdr.SCVal(SCValType.SCV_I32, i32=xdr.Int32(v))
+        case {'type': 'u32', 'value': int(v)}:
+            return xdr.SCVal(SCValType.SCV_U32, u32=xdr.Uint32(v))
+        case {'type': 'i64', 'value': int(v)}:
+            return xdr.SCVal(SCValType.SCV_I64, i64=xdr.Int64(v))
+        case {'type': 'u64', 'value': int(v)}:
+            return xdr.SCVal(SCValType.SCV_U64, u64=xdr.Uint64(v))
+        case {'type': 'i128', 'value': int(v)}:
+            return xdr.SCVal(
+                SCValType.SCV_I128, i128=xdr.Int128Parts(hi=xdr.Int64(v >> 64), lo=xdr.Uint64(v & _U64_MASK))
+            )
+        case {'type': 'u128', 'value': int(v)}:
+            return xdr.SCVal(
+                SCValType.SCV_U128, u128=xdr.UInt128Parts(hi=xdr.Uint64(v >> 64), lo=xdr.Uint64(v & _U64_MASK))
+            )
+        case {'type': 'u256', 'value': int(v)}:
+            return xdr.SCVal(
+                SCValType.SCV_U256,
+                u256=xdr.UInt256Parts(
+                    hi_hi=xdr.Uint64(v >> 192),
+                    hi_lo=xdr.Uint64((v >> 128) & _U64_MASK),
+                    lo_hi=xdr.Uint64((v >> 64) & _U64_MASK),
+                    lo_lo=xdr.Uint64(v & _U64_MASK),
+                ),
+            )
+        case {'type': 'symbol', 'value': str(s)}:
+            return xdr.SCVal(SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(s.encode()))
+        case {'type': 'string', 'value': str(s)}:
+            return xdr.SCVal(SCValType.SCV_STRING, str=xdr.SCString(s.encode()))
+        case {'type': 'bytes', 'value': str(h)}:
+            return xdr.SCVal(SCValType.SCV_BYTES, bytes=xdr.SCBytes(bytes.fromhex(h)))
+        case {'type': 'address', 'addrType': 'account', 'value': str(h)}:
+            account_id = xdr.AccountID(
+                xdr.PublicKey(xdr.PublicKeyType.PUBLIC_KEY_TYPE_ED25519, ed25519=xdr.Uint256(bytes.fromhex(h)))
+            )
+            return xdr.SCVal(
+                SCValType.SCV_ADDRESS,
+                address=xdr.SCAddress(SCAddressType.SC_ADDRESS_TYPE_ACCOUNT, account_id=account_id),
+            )
+        case {'type': 'address', 'addrType': 'contract', 'value': str(h)}:
+            contract_id = xdr.ContractID(xdr.Hash(bytes.fromhex(h)))
+            return xdr.SCVal(
+                SCValType.SCV_ADDRESS,
+                address=xdr.SCAddress(SCAddressType.SC_ADDRESS_TYPE_CONTRACT, contract_id=contract_id),
+            )
+        case {'type': 'vec', 'value': list(items)}:
+            return xdr.SCVal(SCValType.SCV_VEC, vec=xdr.SCVec([scval_from_json(item) for item in items]))
+        case {'type': 'map', 'value': list(entries)}:
+            sc_map = [xdr.SCMapEntry(key=scval_from_json(k), val=scval_from_json(v)) for k, v in entries]
+            return xdr.SCVal(SCValType.SCV_MAP, map=xdr.SCMap(sc_map))
+        case _:
+            raise NotImplementedError(f'Unsupported JSON SCVal encoding: {value!r}')
 
 
 def sc_address_from_xdr(xdr: XDRSCAddress) -> SCAddress:

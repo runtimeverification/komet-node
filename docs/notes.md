@@ -33,6 +33,8 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 
 ## Known gaps
 
-- `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
+- `resultXdr` / `resultMetaXdr` are synthesised: `feeCharged` is 0, ledger-entry change
+  sets are empty, and the InvokeHostFunction success hash covers only the return value
+  (komet-node does not track fees, entry changes, or events).
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
 - `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.

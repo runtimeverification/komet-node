@@ -10,9 +10,11 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from stellar_sdk import Network
+from stellar_sdk import Network, TransactionEnvelope
 
 from komet_node.interpreter import NodeInterpreter
+from komet_node.result_xdr import transaction_meta_xdr, transaction_result_xdr
+from komet_node.scval import scval_from_json
 from komet_node.transaction import TransactionEncoder
 
 if TYPE_CHECKING:
@@ -198,6 +200,7 @@ class StellarRpcServer:
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
                 return json.dumps(self._failure_response(request_id, envelope, now))
+            self._attach_result_xdr(envelope['txHash'])
             return response
 
         read_only_envelope = self._read_only_envelope(method, params, request_id, now)
@@ -243,6 +246,24 @@ class StellarRpcServer:
         (self.requests_dir / f'request_{self._request_count}.json').write_text(json.dumps(archive))
         self._request_count += 1
 
+    def _attach_result_xdr(self, tx_hash: str) -> None:
+        """Rewrite a fresh SUCCESS receipt's internal ``returnValue`` into real result XDR.
+
+        The K semantics record the transaction's contract-call return value in the receipt
+        as a JSON-encoded SCVal (``null`` when the transaction made no call), because K
+        cannot construct XDR. Replace it with the spec-mandated ``resultXdr``/
+        ``resultMetaXdr`` (base64 TransactionResult / TransactionMeta), so getTransaction
+        can serve the stored receipt as-is.
+        """
+        receipt_file = self.receipts_dir / f'receipt_{tx_hash}.json'
+        receipt = json.loads(receipt_file.read_text())
+        return_value_json = receipt.pop('returnValue', None)
+        return_value = scval_from_json(return_value_json) if return_value_json is not None else None
+        tx_envelope = TransactionEnvelope.from_xdr(receipt['envelopeXdr'], self.encoder.network_passphrase)
+        receipt['resultXdr'] = transaction_result_xdr(tx_envelope, return_value, success=True)
+        receipt['resultMetaXdr'] = transaction_meta_xdr(tx_envelope, return_value)
+        receipt_file.write_text(json.dumps(receipt))
+
     def _failure_response(self, rpc_id: Any, envelope: dict[str, Any], now: str) -> dict[str, Any]:
         """Synthesise the sendTransaction response for a transaction that got stuck (failed).
 
@@ -253,17 +274,21 @@ class StellarRpcServer:
         metadata = json.loads((self.io_dir / 'metadata.json').read_text())
         ledger = metadata.get('latest_ledger', 0)
         tx_hash = envelope['txHash']
+        tx_envelope = TransactionEnvelope.from_xdr(envelope['envelopeXdr'], self.encoder.network_passphrase)
 
         # This FAILED receipt mirrors the SUCCESS receipt the semantics build in
-        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule. Like the
-        # success path, the receipt carries no trace — any trace lives in its own file.
+        # `#txReceipt` (kdist/node.md) after `_attach_result_xdr` finalises it: keep the
+        # field set in sync. A failed transaction never commits, so the chain does not
+        # advance: `ledger` pins the latest ledger at failure time (same string encoding as
+        # SUCCESS receipts) and `createdAt` the wall-clock submission time. `resultMetaXdr`
+        # is omitted — the spec allows that, and no meta exists for a rolled-back run. Like
+        # the success path, the receipt carries no trace — any trace lives in its own file.
         receipt = {
             'status': 'FAILED',
             'ledger': str(ledger),
             'createdAt': now,
             'envelopeXdr': envelope['envelopeXdr'],
-            'resultXdr': '',
-            'resultMetaXdr': '',
+            'resultXdr': transaction_result_xdr(tx_envelope, None, success=False),
         }
         (self.receipts_dir / f'receipt_{tx_hash}.json').write_text(json.dumps(receipt))
 

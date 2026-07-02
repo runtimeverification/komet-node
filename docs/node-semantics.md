@@ -83,8 +83,12 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 
 1. writes `metadata.json` with `latest_ledger + 1`,
 2. writes the receipt to `receipts/receipt_<hash>.json`:
-   `{ status: "SUCCESS", ledger, createdAt, envelopeXdr, resultXdr: "", resultMetaXdr: "" }`,
+   `{ status: "SUCCESS", ledger, createdAt, envelopeXdr, returnValue }` — `returnValue` is
+   the contract call's return `ScVal`, JSON-encoded by `#scValToJSON` (or `null` when the
+   transaction made no contract call), read off the `<hostStack>` before the host is reset,
 3. responds with `{hash, status: "PENDING", latestLedger, latestLedgerCloseTime}`.
+
+The internal `returnValue` field never reaches an RPC client: the Python server immediately rewrites it into the spec-mandated `resultXdr`/`resultMetaXdr` base64 XDR fields (`_attach_result_xdr` in `server.py`), because K cannot construct XDR. To keep the return value observable here, `uncheckedCallTx` (unlike komet's `callTx`) does not `#resetHost` after the call; `#recordAndRespond` serialises the stack top and resets the host instead.
 
 The trace is not part of the receipt — the executing steps already appended it to `traces/trace_<hash>.jsonl`. Reaching `#finalizeTx` means the steps completed without getting stuck, so the status is `SUCCESS`. A failed transaction gets stuck before this point, `response.json` is never written, and the Python server records the `FAILED` receipt instead.
 
