@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import shutil
 import socket
@@ -498,3 +499,97 @@ def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
 
     # All four transactions, including the non-Void invocation, advanced the ledger.
     assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 4
+
+
+def test_get_version_info(server: StellarRpcServer) -> None:
+    """getVersionInfo returns exactly the five spec fields with the right JSON types.
+
+    Real stellar-rpc (protocol 22+) emits camelCase keys only; the deprecated snake_case
+    aliases (``commit_hash``, ...) were removed, so an exact key-set check covers both the
+    required fields and the absence of the legacy ones. ``protocolVersion`` is a Go uint32,
+    i.e. a JSON number, not a string.
+    """
+    resp = _rpc(server.port(), 'getVersionInfo', {})
+    assert 'error' not in resp, resp
+    result = resp['result']
+
+    assert set(result) == {'version', 'commitHash', 'buildTimestamp', 'captiveCoreVersion', 'protocolVersion'}
+    # komet-node reports its own package version as the RPC server version.
+    assert result['version'] == importlib.metadata.version('komet-node')
+    assert type(result['commitHash']) is str
+    assert type(result['buildTimestamp']) is str
+    assert type(result['captiveCoreVersion']) is str
+    assert type(result['protocolVersion']) is int  # `is int` also rejects booleans
+    assert result['protocolVersion'] == 22
+
+
+def test_get_version_info_accepts_omitted_params(server: StellarRpcServer) -> None:
+    """getVersionInfo takes no parameters; a request without a params member must succeed."""
+    resp = _post(server.port(), b'{"jsonrpc": "2.0", "id": 1, "method": "getVersionInfo"}')
+    assert 'error' not in resp, resp
+    assert resp['result']['protocolVersion'] == 22
+
+
+# Every FeeDistribution field except ledgerCount is an unsigned integer serialised with Go's
+# `,string` option, i.e. a JSON string holding a decimal number (see the getFeeStats spec
+# example: `"transactionCount": "10"` but `"ledgerCount": 50`).
+_FEE_DISTRIBUTION_STRING_FIELDS = (
+    'max',
+    'min',
+    'mode',
+    'p10',
+    'p20',
+    'p30',
+    'p40',
+    'p50',
+    'p60',
+    'p70',
+    'p80',
+    'p90',
+    'p95',
+    'p99',
+    'transactionCount',
+)
+
+
+def _assert_fee_distribution(dist: dict[str, Any]) -> None:
+    """Check one FeeDistribution object against the stellar-rpc wire format."""
+    assert set(dist) == {*_FEE_DISTRIBUTION_STRING_FIELDS, 'ledgerCount'}
+    for field in _FEE_DISTRIBUTION_STRING_FIELDS:
+        value = dist[field]
+        assert type(value) is str, f'{field} must be a JSON string, got {type(value).__name__}'
+        assert value.isdigit(), f'{field} must hold a decimal number, got {value!r}'
+    assert type(dist['ledgerCount']) is int, 'ledgerCount must be a JSON number'
+    # The distribution must at least be internally consistent.
+    assert int(dist['min']) <= int(dist['p50']) <= int(dist['max'])
+
+
+def test_get_fee_stats(server: StellarRpcServer) -> None:
+    """getFeeStats returns both fee distributions and latestLedger with the right JSON types."""
+    resp = _rpc(server.port(), 'getFeeStats', {})
+    assert 'error' not in resp, resp
+    result = resp['result']
+
+    assert set(result) == {'sorobanInclusionFee', 'inclusionFee', 'latestLedger'}
+    _assert_fee_distribution(result['sorobanInclusionFee'])
+    _assert_fee_distribution(result['inclusionFee'])
+    assert type(result['latestLedger']) is int  # a JSON number, and 0 on a fresh chain
+    assert result['latestLedger'] == 0
+
+
+def test_get_fee_stats_latest_ledger_tracks_chain(server: StellarRpcServer) -> None:
+    """getFeeStats reports the live ledger sequence, not a constant."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    envelope = (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
+        .set_timeout(30)
+        .build()
+    )
+    envelope.sign(keypair)
+    assert _rpc(server.port(), 'sendTransaction', {'transaction': envelope.to_xdr()})['result']['status'] == 'PENDING'
+
+    resp = _rpc(server.port(), 'getFeeStats', {})
+    assert 'error' not in resp, resp
+    assert resp['result']['latestLedger'] == 1
