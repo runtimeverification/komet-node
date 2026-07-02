@@ -17,6 +17,7 @@ The semantics communicate with the Python process through files in the working d
 | `metadata.json` | K ↔ K | `{"latest_ledger": N}` — the ledger counter |
 | `receipts/receipt_<hash>.json` | K → Python | one stored receipt per transaction, keyed by tx hash |
 | `traces/trace_<hash>.jsonl` | K → Python | one execution trace per transaction (per-instruction records), keyed by tx hash |
+| `ledgers/ledger_<seq>.json` | Python → K | one record per closed ledger (`sequence`, `txHash`, `closedAt`, and the ledger-header XDR artifacts), written by the server and read back to serve `getTransactions`/`getLedgers` |
 
 ---
 
@@ -39,7 +40,8 @@ insert-handleRequestFile → handleRequestFile
          ▼
 #dispatchMethod(method, request)        ← routes on the "method" field
          │
-         ├─ getHealth / getNetwork / getLatestLedger / getTransaction / traceTransaction → #respond(...)
+         ├─ getHealth / getNetwork / getLatestLedger / getTransaction /
+         │  getTransactions / getLedgers / traceTransaction → #respond(...)
          │
          └─ sendTransaction → #runTx → run steps
                 → #finalizeTx → record receipt + bump ledger → #respond(...)
@@ -62,6 +64,7 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 - `getNetwork` → `{ "friendbotUrl": null, "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic)
 - `getLatestLedger` → reads `metadata.json` and returns `{ "id": <64 zeros>, "protocolVersion": ..., "sequence": <latest_ledger> }`
 - `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the current `latestLedger`/`latestLedgerCloseTime`, or `{ "status": "NOT_FOUND", ... }` when the file is absent
+- `getTransactions` / `getLedgers` → walk the per-ledger index files `ledgers/ledger_<seq>.json` from the envelope's `startSeq` up to the latest ledger, taking at most `limit` records (`#txInfos` / `#ledgerInfos`), and format the history page (`#txHistoryPage` / `#ledgerHistoryPage`). Parameter validation and cursor resolution happen in the server; the response `cursor` (`#pageCursor`) names the page's last record when the page is full — a TOID for transactions, the plain sequence for ledgers — and is empty otherwise. Serialization matches real stellar-rpc, including its quirks: per-transaction `createdAt` is a JSON number (unlike singular `getTransaction`), per-ledger `ledgerCloseTime` is a decimal string, and empty `resultXdr`/`resultMetaXdr` stubs are omitted (`#optXdrEntry`)
 
 `#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0.
 
@@ -105,7 +108,8 @@ The trace is not part of the receipt — the executing steps already appended it
 
 - `#getJSON(key, obj[, default])`, `#getString(key, obj)`, `#getInt(key, obj)` — read a field
 - `#concatJSONs(a, b)` — append object entries (used to merge `latestLedger` fields into a stored receipt)
-- `#receiptFile(hash)`, `#traceFile(hash)` — build the per-transaction file paths (`receipts/receipt_<hash>.json`, `traces/trace_<hash>.jsonl`)
+- `#receiptFile(hash)`, `#traceFile(hash)`, `#ledgerFile(seq)` — build the per-item file paths (`receipts/receipt_<hash>.json`, `traces/trace_<hash>.jsonl`, `ledgers/ledger_<seq>.json`)
+- `#readJSONFile(path)`, `#asInt(json)`, `#lengthJSONs(list)`, `#lastIntIn(key, list)` — small conveniences for the history methods
 
 These complement the **order-sensitive** step decoders below.
 

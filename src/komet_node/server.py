@@ -13,12 +13,20 @@ from typing import TYPE_CHECKING, Any, Final
 from stellar_sdk import Network
 
 from komet_node.interpreter import NodeInterpreter
+from komet_node.ledger import build_ledger_artifacts
 from komet_node.transaction import TransactionEncoder
 
 if TYPE_CHECKING:
     from http.server import HTTPServer as HTTPServerType
 
 _PROTOCOL_VERSION: Final = '22'
+
+# Pagination bounds for the history methods (getTransactions/getLedgers), per the spec:
+# limit ranges from 1 to 200 and defaults to 50.
+_MAX_PAGE_LIMIT: Final = 200
+_DEFAULT_PAGE_LIMIT: Final = 50
+# getTransactions cursors are TOID-style: (ledger sequence << 32) | (application order << 12).
+_TOID_LEDGER_SHIFT: Final = 32
 
 # Only sendTransaction executes a transaction. traceTransaction is a read-only lookup of the
 # trace stored on a previously executed transaction's receipt (see _read_only_envelope).
@@ -43,10 +51,12 @@ class StellarRpcServer:
       - ``metadata.json``         — ``{"latest_ledger": N}``
       - ``receipts/receipt_<hash>.json`` — one stored receipt per transaction
       - ``traces/trace_<hash>.jsonl``    — one execution trace per transaction
+      - ``ledgers/ledger_<seq>.json``    — one record per closed ledger (tx hash, close
+        time, and the ledger-header XDR artifacts), serving getTransactions/getLedgers
       - ``requests/request_<n>.json``    — an archive of each incoming JSON-RPC request
 
-    Splitting receipts, traces, and requests into per-item files keeps any single file from
-    growing without bound as the chain advances.
+    Splitting receipts, traces, ledgers, and requests into per-item files keeps any single
+    file from growing without bound as the chain advances.
     """
 
     interpreter: NodeInterpreter
@@ -85,8 +95,9 @@ class StellarRpcServer:
         # directories, so the directories must exist before the semantics run.
         self.receipts_dir = self.io_dir / 'receipts'
         self.traces_dir = self.io_dir / 'traces'
+        self.ledgers_dir = self.io_dir / 'ledgers'
         self.requests_dir = self.io_dir / 'requests'
-        for directory in (self.receipts_dir, self.traces_dir, self.requests_dir):
+        for directory in (self.receipts_dir, self.traces_dir, self.ledgers_dir, self.requests_dir):
             directory.mkdir(exist_ok=True)
         # Continue the request archive numbering past anything a previous run left behind, so
         # resuming an io-dir never overwrites its earlier request files.
@@ -198,6 +209,7 @@ class StellarRpcServer:
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
                 return json.dumps(self._failure_response(request_id, envelope, now))
+            self._record_closed_ledger(envelope, now)
             return response
 
         read_only_envelope = self._read_only_envelope(method, params, request_id, now)
@@ -230,7 +242,95 @@ class StellarRpcServer:
             if not isinstance(tx_hash, str):
                 return _error_str(request_id, -32602, "Invalid params: 'hash' (string) is required")
             return {**base, 'hash': tx_hash}
+        if method in ('getTransactions', 'getLedgers'):
+            return self._history_envelope(method, params, request_id, base)
         return None
+
+    def _history_envelope(
+        self, method: str, params: dict[str, Any], request_id: Any, base: dict[str, Any]
+    ) -> dict[str, Any] | str:
+        """Validate getTransactions/getLedgers params and build the request envelope.
+
+        Parameter validation lives here rather than in K because it needs the JSON-RPC
+        error path and the latest-ledger bound, both of which the server already owns for
+        the other methods. The envelope carries the resolved first ledger sequence to
+        serve (``startSeq``) and the page ``limit``; the semantics collect the records
+        and format the response.
+        """
+
+        def invalid(message: str) -> str:
+            return _error_str(request_id, -32602, f'Invalid params: {message}')
+
+        xdr_format = params.get('xdrFormat', 'base64')
+        if xdr_format == 'json':
+            return invalid("xdrFormat 'json' is not supported; use 'base64'")
+        if xdr_format not in ('', 'base64'):
+            return invalid("'xdrFormat' must be 'base64'")
+
+        pagination = params.get('pagination') or {}
+        if not isinstance(pagination, dict):
+            return invalid("'pagination' must be an object")
+        limit = pagination.get('limit', _DEFAULT_PAGE_LIMIT)
+        if not _is_int(limit) or not 1 <= limit <= _MAX_PAGE_LIMIT:
+            return invalid(f"'limit' must be an integer between 1 and {_MAX_PAGE_LIMIT}")
+
+        cursor = pagination.get('cursor')
+        start_ledger = params.get('startLedger')
+        if cursor is not None:
+            if start_ledger is not None:
+                return invalid("'startLedger' and 'cursor' are mutually exclusive")
+            if not isinstance(cursor, str) or not cursor.isdigit():
+                return invalid("'cursor' must be a cursor string from a previous response")
+            # The cursor names the last record already returned: a TOID for transactions
+            # (ledger << 32 | order << 12; one transaction per ledger here), the plain
+            # ledger sequence for ledgers. Either way the next page starts one ledger on.
+            position = int(cursor)
+            if method == 'getTransactions':
+                position >>= _TOID_LEDGER_SHIFT
+            start_seq = position + 1
+        else:
+            if start_ledger is None:
+                start_ledger = 0  # like real stellar-rpc: unset means "from the oldest ledger"
+            if not _is_int(start_ledger):
+                return invalid("'startLedger' must be a number")
+            latest_ledger = self._latest_ledger()
+            if start_ledger != 0 and not 0 <= start_ledger <= latest_ledger:
+                return invalid(
+                    f"'startLedger' must be between the oldest ledger 0 and the latest ledger {latest_ledger}"
+                )
+            start_seq = start_ledger
+        return {**base, 'startSeq': start_seq, 'limit': limit}
+
+    def _latest_ledger(self) -> int:
+        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
+        return int(metadata.get('latest_ledger', 0))
+
+    def _record_closed_ledger(self, envelope: dict[str, Any], now: str) -> None:
+        """Materialise ``ledgers/ledger_<seq>.json`` for the ledger a transaction just closed.
+
+        The K semantics own the ledger counter and receipts; this per-ledger record
+        additionally carries the ledger-header artifacts (``hash``, ``headerXdr``,
+        ``metadataXdr``) that only Python can construct (XDR), and is what the semantics
+        read to serve getTransactions and getLedgers. Written only on the success path —
+        a failed transaction closes no ledger.
+        """
+        sequence = self._latest_ledger()  # the semantics bumped it just before responding
+        previous_hash = b'\x00' * 32  # the genesis ledger's hash
+        previous_file = self.ledgers_dir / f'ledger_{sequence - 1}.json'
+        if previous_file.exists():
+            previous_hash = bytes.fromhex(json.loads(previous_file.read_text())['hash'])
+        ledger_hash, header_xdr, metadata_xdr = build_ledger_artifacts(
+            sequence, int(now), previous_hash, envelope['envelopeXdr']
+        )
+        record = {
+            'sequence': sequence,
+            'txHash': envelope['txHash'],
+            'closedAt': int(now),
+            'hash': ledger_hash,
+            'headerXdr': header_xdr,
+            'metadataXdr': metadata_xdr,
+        }
+        (self.ledgers_dir / f'ledger_{sequence}.json').write_text(json.dumps(record))
 
     def _archive_request(self, method: str | None, params: dict[str, Any], request_id: Any) -> None:
         """Write each incoming JSON-RPC call to its own ``requests/request_<n>.json`` file.
@@ -250,8 +350,7 @@ class StellarRpcServer:
         world state is left unchanged. We record a FAILED receipt so a later getTransaction
         finds it, without bumping the ledger.
         """
-        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
-        ledger = metadata.get('latest_ledger', 0)
+        ledger = self._latest_ledger()
         tx_hash = envelope['txHash']
 
         # This FAILED receipt mirrors the SUCCESS receipt the semantics build in
@@ -274,6 +373,11 @@ class StellarRpcServer:
             'latestLedgerCloseTime': now,
         }
         return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+
+
+def _is_int(value: Any) -> bool:
+    """True for actual JSON numbers only — bool is an int subclass in Python, so exclude it."""
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _next_request_index(requests_dir: Path) -> int:
