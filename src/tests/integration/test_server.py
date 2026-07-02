@@ -8,13 +8,16 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from stellar_sdk import Account, Keypair, Network, StrKey, TransactionBuilder, xdr
 from stellar_sdk.xdr.sc_val_type import SCValType
 
 from komet_node.server import StellarRpcServer
+
+if TYPE_CHECKING:
+    from stellar_sdk import TransactionEnvelope
 
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
 ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resolve(strict=True)
@@ -498,3 +501,197 @@ def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
 
     # All four transactions, including the non-Void invocation, advanced the ledger.
     assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 4
+
+
+# ---------------------------------------------------------------------------
+# simulateTransaction
+#
+# Response shape per the official OpenRPC spec (methods/simulateTransaction.json) and the
+# stellar-rpc Go serialization structs: `latestLedger` is a JSON number and the only
+# always-required field; `minResourceFee` is a stringified number; `results` holds exactly
+# one `{xdr, auth}` entry for the host-function invocation; optional fields are omitted
+# (Go `omitempty`), not null. On failure only `error` (+ `latestLedger`) is returned.
+# ---------------------------------------------------------------------------
+
+
+def _deploy_adder_contract(server: StellarRpcServer, keypair: Keypair, account: Account) -> str:
+    """Create the account, upload adder.wat, and deploy it; return the contract address.
+
+    Submits three transactions, so the ledger sequence afterwards is 3.
+    """
+    from stellar_sdk.utils import sha256
+
+    def send(tb: TransactionBuilder) -> None:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
+        assert res['result']['status'] == 'PENDING'
+        get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
+        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    send(builder().append_create_account_op(keypair.public_key, '1000'))
+    wasm_bytecode = wat_to_wasm(ADDER_CONTRACT_WAT)
+    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
+    wasm_hash = sha256(wasm_bytecode)
+    salt = b'\x00' * 32
+    send(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
+    return server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+
+
+def _build_add_invocation(account: Account, contract_address: str) -> TransactionEnvelope:
+    """Build an *unsigned* envelope invoking add(2, 3) — simulation takes unsigned txs."""
+    return (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_invoke_contract_function_op(
+            contract_address,
+            'add',
+            [
+                xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(2)),
+                xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(3)),
+            ],
+        )
+        .set_timeout(30)
+        .build()
+    )
+
+
+def test_simulate_transaction_missing_params_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'simulateTransaction', {})
+    assert result['error']['code'] == -32602
+
+
+def test_simulate_transaction_bad_xdr_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'simulateTransaction', {'transaction': 'not-valid-xdr'})
+    assert result['error']['code'] == -32602
+
+
+def test_simulate_transaction_returns_invocation_return_value(server: StellarRpcServer) -> None:
+    """A successful simulation reports the host function's return value as base64 SCVal XDR."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    contract_address = _deploy_adder_contract(server, keypair, account)
+
+    envelope = _build_add_invocation(account, contract_address)
+    response = _rpc(server.port(), 'simulateTransaction', {'transaction': envelope.to_xdr()})
+    assert 'error' not in response, f'simulateTransaction failed: {response}'
+    result = response['result']
+
+    # A successful simulation carries no error field.
+    assert 'error' not in result
+
+    # latestLedger is a JSON number reflecting the chain tip (three transactions committed).
+    assert isinstance(result['latestLedger'], int) and not isinstance(result['latestLedger'], bool)
+    assert result['latestLedger'] == 3
+
+    # minResourceFee is a stringified number (Go int64 with `,string` encoding).
+    assert isinstance(result['minResourceFee'], str)
+    assert result['minResourceFee'].isdigit()
+
+    # Exactly one host-function result: the return value of add(2, 3), plus auth entries.
+    results = result['results']
+    assert isinstance(results, list)
+    assert len(results) == 1
+    assert set(results[0]) == {'xdr', 'auth'}
+    return_value = xdr.SCVal.from_xdr(results[0]['xdr'])
+    assert return_value.type == SCValType.SCV_U32
+    assert return_value.u32 is not None
+    assert return_value.u32.uint32 == 5
+    assert isinstance(results[0]['auth'], list)
+    assert all(isinstance(entry, str) for entry in results[0]['auth'])
+
+    # transactionData is valid base64-encoded SorobanTransactionData XDR.
+    assert isinstance(result['transactionData'], str)
+    xdr.SorobanTransactionData.from_xdr(result['transactionData'])
+
+    # events is optional; when present it is an array of base64 strings.
+    if 'events' in result:
+        assert isinstance(result['events'], list)
+        assert all(isinstance(event, str) for event in result['events'])
+
+
+def test_simulate_transaction_does_not_commit(server: StellarRpcServer) -> None:
+    """Simulation must not change the chain: no ledger bump, no receipt, no trace."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    contract_address = _deploy_adder_contract(server, keypair, account)
+    assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 3
+
+    envelope = _build_add_invocation(account, contract_address)
+    tx_hash = envelope.hash_hex()
+    response = _rpc(server.port(), 'simulateTransaction', {'transaction': envelope.to_xdr()})
+    assert 'error' not in response, f'simulateTransaction failed: {response}'
+    assert 'error' not in response['result']
+
+    # The ledger did not advance and no per-transaction artifacts were persisted.
+    assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 3
+    assert not (server.io_dir / 'receipts' / f'receipt_{tx_hash}.json').exists()
+    assert not (server.io_dir / 'traces' / f'trace_{tx_hash}.jsonl').exists()
+    assert _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']['status'] == 'NOT_FOUND'
+
+    # Simulation is repeatable: simulating the same envelope again yields the same result.
+    repeat = _rpc(server.port(), 'simulateTransaction', {'transaction': envelope.to_xdr()})
+    assert repeat['result']['results'] == response['result']['results']
+    assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 3
+
+
+def test_simulate_transaction_failure_returns_error(server: StellarRpcServer) -> None:
+    """A failing simulation returns {error, latestLedger}; success-only fields are omitted."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    missing_contract = StrKey.encode_contract(b'\x22' * 32)  # valid C-strkey, never deployed
+    envelope = (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_invoke_contract_function_op(missing_contract, 'foo', [])
+        .set_timeout(30)
+        .build()
+    )
+    response = _rpc(server.port(), 'simulateTransaction', {'transaction': envelope.to_xdr()})
+    # Simulation failure is reported in the result body, not as a JSON-RPC error.
+    assert 'error' not in response, f'expected a result-level error, got: {response}'
+    result = response['result']
+
+    assert isinstance(result['error'], str)
+    assert result['error'] != ''
+    assert isinstance(result['latestLedger'], int) and not isinstance(result['latestLedger'], bool)
+    assert result['latestLedger'] == 0
+
+    # Not present in case of error (Go omitempty — omitted, not null).
+    assert 'results' not in result
+    assert 'transactionData' not in result
+    assert 'minResourceFee' not in result
+
+    # A failed simulation likewise commits nothing.
+    assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 0
+    assert not (server.io_dir / 'receipts' / f'receipt_{envelope.hash_hex()}.json').exists()
+
+
+def test_simulate_transaction_non_invoke_host_function_returns_error(server: StellarRpcServer) -> None:
+    """Simulating a non-InvokeHostFunction transaction reports a result-level error.
+
+    Per the spec, the provided transaction must contain only a single operation of type
+    invokeHostFunction; real stellar-rpc reports the violation in the result body.
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    envelope = (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
+        .set_timeout(30)
+        .build()
+    )
+    response = _rpc(server.port(), 'simulateTransaction', {'transaction': envelope.to_xdr()})
+    assert 'error' not in response, f'expected a result-level error, got: {response}'
+    result = response['result']
+
+    assert isinstance(result['error'], str)
+    assert result['error'] != ''
+    assert isinstance(result['latestLedger'], int) and not isinstance(result['latestLedger'], bool)
+    assert 'results' not in result
+
+    # Nothing was committed: the create-account operation did not execute.
+    assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 0
+    assert not (server.io_dir / 'receipts' / f'receipt_{envelope.hash_hex()}.json').exists()
