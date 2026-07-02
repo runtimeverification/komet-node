@@ -498,3 +498,211 @@ def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
 
     # All four transactions, including the non-Void invocation, advanced the ledger.
     assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 4
+
+
+# ---------------------------------------------------------------------------
+# getTransactions / getLedgers (transaction history)
+#
+# Ground truth: the official OpenRPC spec (stellar-docs, methods/getTransactions.json and
+# methods/getLedgers.json) and the Go serialization structs from stellar/go-stellar-sdk
+# protocols/rpc, which is what real stellar-rpc emits. Notable serialization traps asserted
+# below:
+#   - ledger sequences and the top-level close-time fields are JSON numbers,
+#   - per-transaction `createdAt` in getTransactions is a JSON *number* (upstream quirk;
+#     the singular getTransaction returns it as a string),
+#   - per-ledger `ledgerCloseTime` in getLedgers is a *string* (Go int64 `,string`),
+#   - XDR fields are `omitempty`: real base64 XDR or absent, never empty strings.
+# ---------------------------------------------------------------------------
+
+
+def _rpc_result(port: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    """Call an RPC method and return its result, failing the test on a JSON-RPC error."""
+    response = _rpc(port, method, params)
+    assert 'error' not in response, f'{method} returned an error: {response["error"]}'
+    return response['result']
+
+
+def _is_hex64(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(c in '0123456789abcdef' for c in value)
+
+
+def _send_create_accounts(server: StellarRpcServer, count: int) -> list[tuple[str, str]]:
+    """Submit ``count`` successful create-account transactions; return (hash, envelopeXdr) pairs.
+
+    Each successful transaction closes its own ledger, so after this call the latest ledger
+    is ``count`` and transaction ``i`` (1-based) sits alone in ledger ``i``.
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    sent: list[tuple[str, str]] = []
+    for _ in range(count):
+        envelope = (
+            TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+            .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
+            .set_timeout(30)
+            .build()
+        )
+        envelope.sign(keypair)
+        xdr_str = envelope.to_xdr()
+        send_res = _rpc(server.port(), 'sendTransaction', {'transaction': xdr_str})
+        assert send_res['result']['status'] == 'PENDING'
+        tx_hash = send_res['result']['hash']
+        assert _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']['status'] == 'SUCCESS'
+        sent.append((tx_hash, xdr_str))
+    return sent
+
+
+def test_get_transactions_spec_shape(server: StellarRpcServer) -> None:
+    """getTransactions returns the response shape of GetTransactionsResponse (Go SDK)."""
+    before = int(time.time())
+    sent = _send_create_accounts(server, 3)
+    after = int(time.time())
+
+    result = _rpc_result(server.port(), 'getTransactions', {'startLedger': 1})
+
+    # All six top-level fields lack `omitempty` in the Go struct, so all must be present.
+    required_keys = {
+        'transactions',
+        'latestLedger',
+        'latestLedgerCloseTimestamp',
+        'oldestLedger',
+        'oldestLedgerCloseTimestamp',
+        'cursor',
+    }
+    assert required_keys <= result.keys(), f'missing keys: {required_keys - result.keys()}'
+
+    assert type(result['latestLedger']) is int
+    assert result['latestLedger'] == 3
+    assert type(result['latestLedgerCloseTimestamp']) is int
+    assert type(result['oldestLedger']) is int
+    assert 0 <= result['oldestLedger'] <= 1
+    assert type(result['oldestLedgerCloseTimestamp']) is int
+    assert isinstance(result['cursor'], str)
+
+    txs = result['transactions']
+    assert isinstance(txs, list)
+    # All three transactions, in chain order (ascending ledger, then application order).
+    assert [tx['txHash'] for tx in txs] == [tx_hash for tx_hash, _ in sent]
+    for i, tx in enumerate(txs, start=1):
+        assert tx['status'] == 'SUCCESS'
+        assert _is_hex64(tx['txHash'])
+        assert type(tx['applicationOrder']) is int
+        assert tx['applicationOrder'] == 1  # one transaction per ledger on this node
+        assert tx['feeBump'] is False
+        assert type(tx['ledger']) is int
+        assert tx['ledger'] == i
+        # Upstream quirk: createdAt is a JSON number here (int64 without `,string` in Go),
+        # unlike getTransaction (singular) where it is a string.
+        assert type(tx['createdAt']) is int
+        assert before <= tx['createdAt'] <= after
+        assert tx['envelopeXdr'] == sent[i - 1][1]
+        # omitempty: XDR fields carry real base64 XDR or are absent — never empty strings.
+        for optional in ('resultXdr', 'resultMetaXdr'):
+            if optional in tx:
+                assert isinstance(tx[optional], str) and tx[optional] != ''
+
+    # xdrFormat: 'base64' is the default and must be accepted; unknown values are rejected.
+    with_format = _rpc_result(server.port(), 'getTransactions', {'startLedger': 1, 'xdrFormat': 'base64'})
+    assert [tx['txHash'] for tx in with_format['transactions']] == [tx_hash for tx_hash, _ in sent]
+    assert _rpc(server.port(), 'getTransactions', {'startLedger': 1, 'xdrFormat': 'bogus'})['error']['code'] == -32602
+
+    # The limit for getTransactions ranges from 1 to 200.
+    bad_limit = _rpc(server.port(), 'getTransactions', {'startLedger': 1, 'pagination': {'limit': 201}})
+    assert bad_limit['error']['code'] == -32602
+
+
+def test_get_transactions_pagination(server: StellarRpcServer) -> None:
+    """A limited page returns a cursor from which the next page resumes without overlap."""
+    sent = _send_create_accounts(server, 3)
+
+    page1 = _rpc_result(server.port(), 'getTransactions', {'startLedger': 1, 'pagination': {'limit': 2}})
+    assert [tx['txHash'] for tx in page1['transactions']] == [sent[0][0], sent[1][0]]
+    cursor = page1['cursor']
+    assert isinstance(cursor, str) and cursor != ''
+
+    # Resume from the cursor; startLedger must be omitted on cursor requests.
+    page2 = _rpc_result(server.port(), 'getTransactions', {'pagination': {'cursor': cursor, 'limit': 2}})
+    assert [tx['txHash'] for tx in page2['transactions']] == [sent[2][0]]
+
+
+def test_get_transactions_invalid_params(server: StellarRpcServer) -> None:
+    port = server.port()
+    # startLedger beyond the latest ledger (0 on a fresh chain) is out of retention range.
+    assert _rpc(port, 'getTransactions', {'startLedger': 999})['error']['code'] == -32602
+    # startLedger and cursor are mutually exclusive.
+    both = _rpc(port, 'getTransactions', {'startLedger': 1, 'pagination': {'cursor': '1'}})
+    assert both['error']['code'] == -32602
+    # startLedger must be a number.
+    assert _rpc(port, 'getTransactions', {'startLedger': 'one'})['error']['code'] == -32602
+
+
+def test_get_ledgers_spec_shape(server: StellarRpcServer) -> None:
+    """getLedgers returns the response shape of GetLedgersResponse (Go SDK)."""
+    _send_create_accounts(server, 2)
+
+    result = _rpc_result(server.port(), 'getLedgers', {'startLedger': 1})
+
+    required_keys = {
+        'ledgers',
+        'latestLedger',
+        'latestLedgerCloseTime',
+        'oldestLedger',
+        'oldestLedgerCloseTime',
+        'cursor',
+    }
+    assert required_keys <= result.keys(), f'missing keys: {required_keys - result.keys()}'
+
+    assert type(result['latestLedger']) is int
+    assert result['latestLedger'] == 2
+    assert type(result['latestLedgerCloseTime']) is int
+    assert type(result['oldestLedger']) is int
+    assert 0 <= result['oldestLedger'] <= 1
+    assert type(result['oldestLedgerCloseTime']) is int
+    assert isinstance(result['cursor'], str)
+
+    ledgers = result['ledgers']
+    assert isinstance(ledgers, list)
+    assert [ledger['sequence'] for ledger in ledgers] == [1, 2]
+    hashes = set()
+    for ledger in ledgers:
+        assert type(ledger['sequence']) is int
+        assert _is_hex64(ledger['hash'])
+        hashes.add(ledger['hash'])
+        # Per-ledger close time is a STRING containing a decimal number (Go int64 `,string`).
+        assert isinstance(ledger['ledgerCloseTime'], str)
+        assert ledger['ledgerCloseTime'].isdigit()
+        # headerXdr is a base64 LedgerHeaderHistoryEntry for this ledger.
+        header = xdr.LedgerHeaderHistoryEntry.from_xdr(ledger['headerXdr'])
+        assert header.header.ledger_seq.uint32 == ledger['sequence']
+        # metadataXdr is a base64 LedgerCloseMeta union for this ledger.
+        meta = xdr.LedgerCloseMeta.from_xdr(ledger['metadataXdr'])
+        meta_header = getattr(meta, f'v{meta.v}').ledger_header
+        assert meta_header.header.ledger_seq.uint32 == ledger['sequence']
+    # Ledger hashes identify ledgers and must be unique.
+    assert len(hashes) == 2
+
+    # The limit for getLedgers ranges from 1 to 200.
+    bad_limit = _rpc(server.port(), 'getLedgers', {'startLedger': 1, 'pagination': {'limit': 201}})
+    assert bad_limit['error']['code'] == -32602
+
+
+def test_get_ledgers_pagination(server: StellarRpcServer) -> None:
+    """A limited page returns a cursor from which the next page resumes without overlap."""
+    _send_create_accounts(server, 2)
+
+    page1 = _rpc_result(server.port(), 'getLedgers', {'startLedger': 1, 'pagination': {'limit': 1}})
+    assert [ledger['sequence'] for ledger in page1['ledgers']] == [1]
+    cursor = page1['cursor']
+    assert isinstance(cursor, str) and cursor != ''
+
+    page2 = _rpc_result(server.port(), 'getLedgers', {'pagination': {'cursor': cursor, 'limit': 1}})
+    assert [ledger['sequence'] for ledger in page2['ledgers']] == [2]
+
+
+def test_get_ledgers_invalid_params(server: StellarRpcServer) -> None:
+    port = server.port()
+    # startLedger beyond the latest ledger (0 on a fresh chain) is out of retention range.
+    assert _rpc(port, 'getLedgers', {'startLedger': 999})['error']['code'] == -32602
+    # startLedger and cursor are mutually exclusive.
+    both = _rpc(port, 'getLedgers', {'startLedger': 1, 'pagination': {'cursor': '1'}})
+    assert both['error']['code'] == -32602
