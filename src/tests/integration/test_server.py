@@ -19,6 +19,7 @@ from komet_node.server import StellarRpcServer
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
 ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resolve(strict=True)
 ADDER_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'adder.wat').resolve(strict=True)
+BYTES_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'bytes.wat').resolve(strict=True)
 
 
 def wat_to_wasm(wat_path: Path) -> bytes:
@@ -552,6 +553,9 @@ def test_get_transaction_success_returns_decodable_result_xdr(server: StellarRpc
 
     get_result = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
     assert get_result['status'] == 'SUCCESS'
+    # The K-side receipt's internal returnValue field must never reach RPC clients: the
+    # server rewrites it into resultXdr/resultMetaXdr before the receipt is ever served.
+    assert 'returnValue' not in get_result
 
     tx_result = _tx_result_of(get_result)
     assert tx_result.result.code == xdr.TransactionResultCode.txSUCCESS
@@ -580,6 +584,8 @@ def test_get_transaction_invocation_reports_return_value(server: StellarRpcServe
         assert res['result']['status'] == 'PENDING'
         get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
         assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+        # The internal K-side returnValue field must never leak into getTransaction responses.
+        assert 'returnValue' not in get_res
         # Every successful receipt, whatever the operation, has a decodable txSUCCESS result.
         assert _tx_result_of(get_res).result.code == xdr.TransactionResultCode.txSUCCESS
         return get_res
@@ -623,6 +629,49 @@ def test_get_transaction_invocation_reports_return_value(server: StellarRpcServe
     assert return_value.u32 == xdr.Uint32(5)
 
 
+def test_get_transaction_reports_empty_bytes_return_value(server: StellarRpcServer) -> None:
+    """A contract returning empty Bytes yields SCV_BYTES(b'') in sorobanMeta.returnValue.
+
+    Regression test for the zero-length edge of the receipt's hex encoding: an empty
+    byte string round-trips through the K-side JSON encoding as an empty hex string, not
+    as ``"0"`` (an odd-length non-hex value that breaks the XDR rewrite and would leak
+    the internal ``returnValue`` field to clients).
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    def send(tb: TransactionBuilder) -> dict[str, Any]:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
+        assert 'result' in res, f'sendTransaction failed: {res}'
+        get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
+        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+        return get_res
+
+    send(builder().append_create_account_op(keypair.public_key, '1000'))
+
+    wasm_bytecode = wat_to_wasm(BYTES_CONTRACT_WAT)
+    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
+
+    from stellar_sdk.utils import sha256
+
+    salt = b'\x00' * 32
+    send(builder().append_create_contract_op(sha256(wasm_bytecode), keypair.public_key, None, salt))
+
+    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+    invoke_result = send(builder().append_invoke_contract_function_op(contract_address, 'empty_bytes', []))
+    assert 'returnValue' not in invoke_result  # internal receipt field, must never be served
+
+    return_value = _soroban_return_value(_tx_meta_of(invoke_result))
+    assert return_value.type == SCValType.SCV_BYTES
+    assert return_value.bytes is not None
+    assert return_value.bytes.sc_bytes == b''
+
+
 def test_get_transaction_failed_reports_error_result_xdr(server: StellarRpcServer) -> None:
     """A FAILED receipt carries a real error TransactionResult, not an empty stub.
 
@@ -654,6 +703,7 @@ def test_get_transaction_failed_reports_error_result_xdr(server: StellarRpcServe
 
     get_result = _rpc(server.port(), 'getTransaction', {'hash': bad_hash})['result']
     assert get_result['status'] == 'FAILED'
+    assert 'returnValue' not in get_result  # internal receipt field, must never be served
 
     tx_result = _tx_result_of(get_result)
     assert tx_result.result.code == xdr.TransactionResultCode.txFAILED
@@ -675,5 +725,5 @@ def test_get_transaction_not_found_omits_transaction_fields(server: StellarRpcSe
     """A NOT_FOUND response carries no transaction details (omitted, not empty/null)."""
     get_result = _rpc(server.port(), 'getTransaction', {'hash': 'b' * 64})['result']
     assert get_result['status'] == 'NOT_FOUND'
-    for field in ('ledger', 'createdAt', 'envelopeXdr', 'resultXdr', 'resultMetaXdr'):
+    for field in ('ledger', 'createdAt', 'envelopeXdr', 'resultXdr', 'resultMetaXdr', 'returnValue'):
         assert field not in get_result, f'NOT_FOUND response must omit {field}'
