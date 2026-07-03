@@ -20,13 +20,18 @@ from komet.scval import (
     SCSymbol,
     SCVec,
 )
+from stellar_sdk import xdr
 from stellar_sdk.xdr.sc_address_type import SCAddressType
 from stellar_sdk.xdr.sc_val_type import SCValType
 
 if TYPE_CHECKING:
+    from typing import Any
+
     from komet.scval import SCValue
     from stellar_sdk.xdr.sc_address import SCAddress as XDRSCAddress
     from stellar_sdk.xdr.sc_val import SCVal
+
+_U64_MASK = (1 << 64) - 1
 
 
 def scval_to_json(scval: SCVal) -> dict:
@@ -77,6 +82,58 @@ def scval_to_json(scval: SCVal) -> dict:
             return {'type': 'address', 'addrType': 'contract', 'value': addr.contract_id.contract_id.hash.hex()}
         case _:
             raise NotImplementedError(f'Unsupported SCVal type for JSON encoding: {scval.type}')
+
+
+def scval_from_json(obj: Any) -> SCVal:
+    """Decode the ScVal JSON produced by the K semantics (``#scValJSON`` in ``node.md``)
+    into a Stellar XDR SCVal.
+
+    This is the inverse of :func:`scval_to_json`, extended with the ``vec``, ``string``,
+    and ``void`` cases the event capture can stage. Values the semantics cannot represent
+    are staged as ``null`` and rejected here (``NotImplementedError``), as is any
+    unrecognised type tag.
+    """
+    if not isinstance(obj, dict):
+        raise NotImplementedError(f'Unsupported staged SCVal encoding: {obj!r}')
+    value: Any = obj.get('value')
+    match obj.get('type'):
+        case 'bool':
+            return xdr.SCVal(type=SCValType.SCV_BOOL, b=bool(value))
+        case 'void':
+            return xdr.SCVal(type=SCValType.SCV_VOID)
+        case 'u32':
+            return xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(value))
+        case 'i32':
+            return xdr.SCVal(type=SCValType.SCV_I32, i32=xdr.Int32(value))
+        case 'u64':
+            return xdr.SCVal(type=SCValType.SCV_U64, u64=xdr.Uint64(value))
+        case 'i64':
+            return xdr.SCVal(type=SCValType.SCV_I64, i64=xdr.Int64(value))
+        case 'u128':
+            u128 = xdr.UInt128Parts(hi=xdr.Uint64(value >> 64), lo=xdr.Uint64(value & _U64_MASK))
+            return xdr.SCVal(type=SCValType.SCV_U128, u128=u128)
+        case 'i128':
+            i128 = xdr.Int128Parts(hi=xdr.Int64(value >> 64), lo=xdr.Uint64(value & _U64_MASK))
+            return xdr.SCVal(type=SCValType.SCV_I128, i128=i128)
+        case 'symbol':
+            return xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(value.encode()))
+        case 'string':
+            return xdr.SCVal(type=SCValType.SCV_STRING, str=xdr.SCString(value.encode()))
+        case 'bytes':
+            return xdr.SCVal(type=SCValType.SCV_BYTES, bytes=xdr.SCBytes(bytes.fromhex(value)))
+        case 'address':
+            raw = bytes.fromhex(value)
+            if obj.get('addrType') == 'account':
+                key = xdr.PublicKey(xdr.PublicKeyType.PUBLIC_KEY_TYPE_ED25519, ed25519=xdr.Uint256(raw))
+                address = xdr.SCAddress(SCAddressType.SC_ADDRESS_TYPE_ACCOUNT, account_id=xdr.AccountID(key))
+            else:
+                contract = xdr.ContractID(xdr.Hash(raw))
+                address = xdr.SCAddress(SCAddressType.SC_ADDRESS_TYPE_CONTRACT, contract_id=contract)
+            return xdr.SCVal(type=SCValType.SCV_ADDRESS, address=address)
+        case 'vec':
+            return xdr.SCVal(type=SCValType.SCV_VEC, vec=xdr.SCVec([scval_from_json(v) for v in value]))
+        case other:
+            raise NotImplementedError(f'Unsupported staged SCVal type: {other!r}')
 
 
 def sc_address_from_xdr(xdr: XDRSCAddress) -> SCAddress:

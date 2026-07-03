@@ -17,6 +17,8 @@ The semantics communicate with the Python process through files in the working d
 | `metadata.json` | K ↔ K | `{"latest_ledger": N}` — the ledger counter |
 | `receipts/receipt_<hash>.json` | K → Python | one stored receipt per transaction, keyed by tx hash |
 | `traces/trace_<hash>.jsonl` | K → Python | one execution trace per transaction (per-instruction records), keyed by tx hash |
+| `events_staged.jsonl` | K → Python | the contract events of the transaction in flight, one JSON record per `contract_event` call |
+| `events/events_<ledger>.json` | Python → K | one finished JSON array of Event objects per ledger, served by `getEvents` |
 
 ---
 
@@ -39,7 +41,7 @@ insert-handleRequestFile → handleRequestFile
          ▼
 #dispatchMethod(method, request)        ← routes on the "method" field
          │
-         ├─ getHealth / getNetwork / getLatestLedger / getTransaction / traceTransaction → #respond(...)
+         ├─ getHealth / getNetwork / getLatestLedger / getTransaction / traceTransaction / getEvents → #respond(...)
          │
          └─ sendTransaction → #runTx → run steps
                 → #finalizeTx → record receipt + bump ledger → #respond(...)
@@ -62,8 +64,9 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 - `getNetwork` → `{ "friendbotUrl": null, "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic)
 - `getLatestLedger` → reads `metadata.json` and returns `{ "id": <64 zeros>, "protocolVersion": ..., "sequence": <latest_ledger> }`
 - `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the current `latestLedger`/`latestLedgerCloseTime`, or `{ "status": "NOT_FOUND", ... }` when the file is absent
+- `getEvents` → scans the `events/events_<ledger>.json` files of the requested window, applies the request's filters (type, contract ids, topic matchers with `*`/`**`), and paginates; returns `{ "latestLedger": ..., "events": [...], "cursor": ... }`. The events themselves were captured during `sendTransaction`: a rule in `node.md` shadows the upstream no-op `contract_event` host function, resolves the topics/data host objects, and stages them in `events_staged.jsonl`; the Python server then produces the finished per-ledger files (base64 SCVal XDR and strkey ids are XDR work K cannot do). A `startLedger` beyond the chain tip is answered with `#respondError` (JSON-RPC `-32600`).
 
-`#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0.
+`#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0. `#respondError(ID, CODE, MESSAGE)` is its error-shaped counterpart, writing `{jsonrpc, id, error: {code, message}}`.
 
 ---
 

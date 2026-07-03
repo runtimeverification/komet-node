@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import tempfile
 import time
 import traceback
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from stellar_sdk import Network
+from stellar_sdk import Network, StrKey
 
 from komet_node.interpreter import NodeInterpreter
+from komet_node.scval import scval_from_json
 from komet_node.transaction import TransactionEncoder
 
 if TYPE_CHECKING:
@@ -23,6 +26,23 @@ _PROTOCOL_VERSION: Final = '22'
 # Only sendTransaction executes a transaction. traceTransaction is a read-only lookup of the
 # trace stored on a previously executed transaction's receipt (see _read_only_envelope).
 _TX_METHODS: Final = ('sendTransaction',)
+
+# Where the K semantics stage the contract events of the currently executing transaction
+# (one JSON record per line, appended by the `contract_event` interception in node.md).
+_EVENTS_STAGING: Final = 'events_staged.jsonl'
+
+# getEvents cursors and event ids are TOID-style: a 19-digit zero-padded TOID, a hyphen,
+# and a 10-digit zero-padded event index (SEP-35).
+_EVENT_CURSOR_RE: Final = re.compile(r'\d{19}-\d{10}')
+
+# getEvents limits from the spec: at most 5 filters, 5 topic filters each, 1-4 segment
+# matchers per topic filter (a trailing '**' does not count), and a page limit of 1-10000
+# (default 100).
+_MAX_EVENT_FILTERS: Final = 5
+_MAX_TOPIC_FILTERS: Final = 5
+_MAX_TOPIC_SEGMENTS: Final = 4
+_DEFAULT_EVENTS_LIMIT: Final = 100
+_MAX_EVENTS_LIMIT: Final = 10000
 
 _log = logging.getLogger('komet_node')
 
@@ -86,7 +106,10 @@ class StellarRpcServer:
         self.receipts_dir = self.io_dir / 'receipts'
         self.traces_dir = self.io_dir / 'traces'
         self.requests_dir = self.io_dir / 'requests'
-        for directory in (self.receipts_dir, self.traces_dir, self.requests_dir):
+        # events/ holds one finished JSON array per ledger (events_<ledger>.json), written by
+        # _finalize_events below and read back by the K getEvents rules.
+        self.events_dir = self.io_dir / 'events'
+        for directory in (self.receipts_dir, self.traces_dir, self.requests_dir, self.events_dir):
             directory.mkdir(exist_ok=True)
         # Continue the request archive numbering past anything a previous run left behind, so
         # resuming an io-dir never overwrites its earlier request files.
@@ -195,9 +218,14 @@ class StellarRpcServer:
                 # the client-facing message neutral rather than leaking internal exceptions.
                 traceback.print_exc()
                 return _error_str(request_id, -32602, 'Invalid params: could not process transaction')
+            # Stale staged events (e.g. from a previously failed transaction) must not leak
+            # into this transaction's event records.
+            (self.io_dir / _EVENTS_STAGING).unlink(missing_ok=True)
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
+                (self.io_dir / _EVENTS_STAGING).unlink(missing_ok=True)
                 return json.dumps(self._failure_response(request_id, envelope, now))
+            self._finalize_events(envelope['txHash'], now)
             return response
 
         read_only_envelope = self._read_only_envelope(method, params, request_id, now)
@@ -230,7 +258,110 @@ class StellarRpcServer:
             if not isinstance(tx_hash, str):
                 return _error_str(request_id, -32602, "Invalid params: 'hash' (string) is required")
             return {**base, 'hash': tx_hash}
+        if method == 'getEvents':
+            return self._get_events_envelope(base, params, request_id)
         return None
+
+    def _get_events_envelope(
+        self, base: dict[str, Any], params: dict[str, Any], request_id: Any
+    ) -> dict[str, Any] | str:
+        """Validate the getEvents params and build the request envelope.
+
+        Everything structural is checked here so the K rules (node.md) only handle
+        well-typed envelopes; the one state-dependent check (the window against the chain
+        tip) lives in K. Returns a pre-formatted JSON-RPC error string on invalid params.
+        """
+        xdr_format = params.get('xdrFormat') or 'base64'
+        if xdr_format == 'json':
+            return _error_str(request_id, -32602, "Invalid params: xdrFormat 'json' is not supported, use 'base64'")
+        if xdr_format != 'base64':
+            return _error_str(request_id, -32602, "Invalid params: xdrFormat must be 'base64' or 'json'")
+
+        pagination = params.get('pagination') or {}
+        if not isinstance(pagination, dict):
+            return _error_str(request_id, -32602, "Invalid params: 'pagination' must be an object")
+        cursor = pagination.get('cursor')
+        if cursor is not None and not (isinstance(cursor, str) and _EVENT_CURSOR_RE.fullmatch(cursor)):
+            return _error_str(request_id, -32602, "Invalid params: 'cursor' is malformed")
+        limit = pagination.get('limit')
+        if limit is None:
+            limit = _DEFAULT_EVENTS_LIMIT
+        if isinstance(limit, float) and limit.is_integer():
+            limit = int(limit)
+        if not _is_int(limit) or not 1 <= limit <= _MAX_EVENTS_LIMIT:
+            return _error_str(request_id, -32602, f'Invalid params: limit must be between 1 and {_MAX_EVENTS_LIMIT}')
+
+        start_ledger = params.get('startLedger')
+        end_ledger = params.get('endLedger')
+        if cursor is not None and (start_ledger is not None or end_ledger is not None):
+            return _error_str(request_id, -32600, 'startLedger and endLedger must be omitted when a cursor is set')
+        if cursor is None and start_ledger is None:
+            return _error_str(request_id, -32600, 'startLedger or a pagination cursor is required')
+        for name, value in (('startLedger', start_ledger), ('endLedger', end_ledger)):
+            if value is not None and not _is_int(value):
+                return _error_str(request_id, -32602, f'Invalid params: {name} must be a ledger sequence number')
+        if start_ledger is not None and start_ledger < 1:
+            return _error_str(request_id, -32600, 'startLedger must be positive')
+
+        filters = params.get('filters') or []
+        error = _validate_event_filters(filters)
+        if error is not None:
+            return _error_str(request_id, -32602, f'Invalid params: {error}')
+
+        return {
+            **base,
+            'startLedger': start_ledger,
+            'endLedger': end_ledger,
+            'filters': filters,
+            'cursor': cursor,
+            'limit': limit,
+        }
+
+    def _finalize_events(self, tx_hash: str, now: str) -> None:
+        """Convert the events staged by the K run into ``events/events_<ledger>.json``.
+
+        The semantics stage one JSON record per contract event (K-side ScVal JSON, hex
+        contract id — see "Event capture" in node.md); this turns each into the spec's
+        Event shape — base64 SCVal XDR topics/value, strkey contract id, TOID-style id —
+        which K cannot build itself. Runs after every successful sendTransaction; with
+        nothing staged it only removes the staging file.
+        """
+        staging = self.io_dir / _EVENTS_STAGING
+        if not staging.exists():
+            return
+        lines = [line for line in staging.read_text().splitlines() if line.strip()]
+        staging.unlink()
+        if not lines:
+            return
+        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
+        ledger = metadata['latest_ledger']
+        closed_at = datetime.fromtimestamp(int(now), tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+        # One transaction per ledger: TOID with application order 1, operation index 0.
+        toid = (ledger << 32) | (1 << 12)
+        events = []
+        for index, line in enumerate(lines):
+            staged = json.loads(line)
+            try:
+                topic = [scval_from_json(t).to_xdr() for t in staged['topics']]
+                value = scval_from_json(staged['data']).to_xdr()
+            except NotImplementedError as err:
+                _log.warning('dropping contract event with unsupported value: %s', err)
+                continue
+            events.append(
+                {
+                    'type': 'contract',
+                    'ledger': ledger,
+                    'ledgerClosedAt': closed_at,
+                    'contractId': StrKey.encode_contract(bytes.fromhex(staged['contractId'])),
+                    'id': f'{toid:019d}-{index:010d}',
+                    'inSuccessfulContractCall': True,
+                    'txHash': tx_hash,
+                    'topic': topic,
+                    'value': value,
+                }
+            )
+        if events:
+            (self.events_dir / f'events_{ledger}.json').write_text(json.dumps(events))
 
     def _archive_request(self, method: str | None, params: dict[str, Any], request_id: Any) -> None:
         """Write each incoming JSON-RPC call to its own ``requests/request_<n>.json`` file.
@@ -274,6 +405,47 @@ class StellarRpcServer:
             'latestLedgerCloseTime': now,
         }
         return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+
+
+def _is_int(value: Any) -> bool:
+    """True for a JSON integer (bool is an int subclass in Python, so exclude it)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_event_filters(filters: Any) -> str | None:
+    """Check a getEvents ``filters`` param against the EventFilters schema.
+
+    Returns a human-readable problem description, or ``None`` if the filters are valid.
+    """
+    if not isinstance(filters, list):
+        return "'filters' must be an array"
+    if len(filters) > _MAX_EVENT_FILTERS:
+        return f'maximum {_MAX_EVENT_FILTERS} filters per request'
+    for event_filter in filters:
+        if not isinstance(event_filter, dict):
+            return 'each filter must be an object'
+        event_type = event_filter.get('type')
+        if event_type is not None and event_type not in ('contract', 'system'):
+            return "filter 'type' must be 'contract' or 'system'"
+        contract_ids = event_filter.get('contractIds')
+        if contract_ids is not None:
+            if not isinstance(contract_ids, list):
+                return "'contractIds' must be an array"
+            if not all(isinstance(c, str) and StrKey.is_valid_contract(c) for c in contract_ids):
+                return "each entry of 'contractIds' must be a contract address"
+        topics = event_filter.get('topics')
+        if topics is not None:
+            if not isinstance(topics, list) or len(topics) > _MAX_TOPIC_FILTERS:
+                return f"'topics' must be an array of at most {_MAX_TOPIC_FILTERS} topic filters"
+            for topic_filter in topics:
+                if not isinstance(topic_filter, list) or not all(isinstance(s, str) for s in topic_filter):
+                    return 'each topic filter must be an array of segment matchers'
+                # A trailing '**' matches any remaining segments and does not count
+                # towards the 1-4 segment matcher limit.
+                segments = topic_filter[:-1] if topic_filter and topic_filter[-1] == '**' else topic_filter
+                if not 1 <= len(segments) <= _MAX_TOPIC_SEGMENTS or '**' in segments:
+                    return f'each topic filter must hold 1 to {_MAX_TOPIC_SEGMENTS} segment matchers'
+    return None
 
 
 def _next_request_index(requests_dir: Path) -> int:

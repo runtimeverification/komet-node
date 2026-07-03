@@ -23,6 +23,7 @@ State lives in the io dir as `state.kore` (KORE world state) and `metadata.json`
 ## Tests (`src/tests/integration/`)
 
 - `test_server.py` drives the running HTTP server end-to-end. It exercises the read-only methods, `sendTransaction` + `getTransaction`, ledger increments, the full lifecycle (create → upload wasm → deploy → invoke), and the `traceTransaction` flows. `test_call_tx_with_args` deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` arguments, exercising the `scval_to_json` / `#decodeArg` pipeline.
+- `test_get_events.py` covers `getEvents`: request validation, the empty-window shape, the full shape of an event emitted via `contract_event` (`data/wasm/events.wat`), filtering, and pagination.
 - `test_integration.py` and `test_unit.py` hold small sanity checks.
 
 Run with `make test` (requires `make kdist-build` first).
@@ -35,4 +36,5 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 
 - `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
-- `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
+- `simulateTransaction`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
+- `getEvents` serves contract events only: `system` events are never emitted (the semantics have no source of them), and events whose topics/data have no staging representation (maps, errors, 256-bit ints) are dropped with a warning. `xdrFormat: "json"` is rejected.

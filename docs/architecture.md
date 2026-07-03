@@ -92,10 +92,12 @@ All of the server's input and output artifacts live in one directory, the *io di
 | `receipts/receipt_<hash>.json` | persistent | the semantics (on success) or the server (on failure) | one stored receipt per transaction, keyed by tx hash, answering `getTransaction`. Each is `{status, ledger, createdAt, envelopeXdr, resultXdr, resultMetaXdr}`. |
 | `traces/trace_<hash>.jsonl` | persistent | the semantics | one execution trace per transaction, keyed by tx hash — the instruction-level records, one JSON object per line. `traceTransaction` returns this file's contents. |
 | `requests/request_<n>.json` | persistent | the server | an archive of each incoming JSON-RPC request, numbered by a monotonic counter, kept for debugging. |
+| `events/events_<ledger>.json` | persistent | the server | one JSON array per ledger with the contract events emitted in it, already in the spec's Event shape. Built by the server from the staged records after a successful transaction; read back by the K `getEvents` rules. |
 | `request.json` | transient | the server | the request envelope for the call in flight (`method`, `id`, `now`, and method-specific fields). The semantics remove it once they respond. |
 | `response.json` | transient | the semantics | the JSON-RPC response (`{jsonrpc, id, result}`) for the most recent call. The server reads it back; it is absent when a transaction gets stuck. |
+| `events_staged.jsonl` | transient | the K semantics | the contract events of the transaction in flight, one JSON record per `contract_event` call. The server converts them into `events/events_<ledger>.json` after a successful run and removes the file. |
 
-Receipts, traces, and request archives are split into one file per item — keyed by tx hash, or numbered — so that no single file grows without bound as the chain advances. The server creates the `receipts/`, `traces/`, and `requests/` directories before the semantics run, because the K file-system hooks open files with POSIX `open()`, which does not create parent directories.
+Receipts, traces, events, and request archives are split into one file per item — keyed by tx hash or ledger, or numbered — so that no single file grows without bound as the chain advances. The server creates the `receipts/`, `traces/`, `requests/`, and `events/` directories before the semantics run, because the K file-system hooks open files with POSIX `open()`, which does not create parent directories.
 
 The world state stays in KORE (rather than a JSON snapshot) because an uploaded wasm module is a `ModuleDecl` that the semantics cannot reconstruct from bytes — only `wasm2kast` (Python) can produce it. The receipts and the ledger counter, by contrast, are plain data and live in JSON files, which the semantics read and write directly via the file-system hooks.
 
@@ -177,6 +179,7 @@ sequenceDiagram
 
 - `resultXdr` / `resultMetaXdr` in `getTransaction` responses (contract return values)
 - `simulateTransaction` (dry-run without state mutation)
-- `getEvents`, `getLedgerEntries`, `getFeeStats` and other read-only RPC methods
+- `getLedgerEntries`, `getFeeStats` and other read-only RPC methods
+- `system` events in `getEvents` (the semantics have no source of them)
 - `ExtendFootprintTTL` and `RestoreFootprint` operations
 - `SCVec` / `SCMap` contract-argument types in the request encoder (`scval_to_json`)
