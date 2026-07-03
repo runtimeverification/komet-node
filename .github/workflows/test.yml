@@ -1,0 +1,31 @@
+name: 'Test'
+on:
+  pull_request:
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  tests:
+    name: 'Tests'
+    runs-on: [self-hosted, linux, normal]
+    timeout-minutes: 120
+    env:
+      GC_DONT_GC: '1'
+      # Enable flakes for every nix invocation so the job does not depend on
+      # flakes being globally enabled on the runner (same as release.yml).
+      NIX_CONFIG: 'extra-experimental-features = nix-command flakes'
+    steps:
+      - name: 'Check out code'
+        uses: actions/checkout@v4
+      # Even the unit tests need the kompiled semantics: importing komet_node
+      # loads komet.utils, which resolves the soroban-semantics.llvm kdist
+      # target at import time. The flake's dev shell provides the required
+      # toolchain (K, uv, wat2wasm), with the prebuilt `k` package substituted
+      # from the k-framework Nix cache.
+      - name: 'Build K semantics'
+        run: nix develop --command make kdist-build
+      - name: 'Run all tests'
+        run: nix develop --command make test
