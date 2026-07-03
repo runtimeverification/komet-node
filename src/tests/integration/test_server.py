@@ -8,13 +8,16 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from stellar_sdk import Account, Address, Keypair, Network, StrKey, TransactionBuilder, xdr
 from stellar_sdk.xdr.sc_val_type import SCValType
 
 from komet_node.server import StellarRpcServer
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
 ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resolve(strict=True)
@@ -60,7 +63,7 @@ def _post(port: int, body: bytes) -> dict[str, Any]:
 
 
 @pytest.fixture
-def server(tmp_path: Path):
+def server(tmp_path: Path) -> Iterator[StellarRpcServer]:
     port = _find_free_port()
     srv = StellarRpcServer(
         host='localhost',

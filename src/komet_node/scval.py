@@ -253,7 +253,8 @@ def scvalue_from_xdr(xdr: SCVal) -> SCValue:
 
         case SCValType.SCV_VEC:
             assert xdr.vec is not None
-            return SCVec(tuple(scvalue_from_xdr(v) for v in xdr.vec.sc_vec))
+            # komet annotates SCVec.val as tuple[SCValue] instead of tuple[SCValue, ...]
+            return SCVec(tuple(scvalue_from_xdr(v) for v in xdr.vec.sc_vec))  # type: ignore[arg-type]
 
         case SCValType.SCV_MAP:
             assert xdr.map is not None
