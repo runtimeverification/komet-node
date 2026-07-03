@@ -176,7 +176,7 @@ sequenceDiagram
 ## What's not yet implemented
 
 - `resultXdr` / `resultMetaXdr` in `getTransaction` responses (contract return values)
-- `simulateTransaction` (dry-run without state mutation)
+- `simulateTransaction` of upload/deploy host functions, auth recording, resource metering, `events`/`restorePreamble`/`stateChanges` (only invoke-contract dry runs with the return value are supported)
 - `getEvents`, `getLedgerEntries`, `getFeeStats` and other read-only RPC methods
 - `ExtendFootprintTTL` and `RestoreFootprint` operations
 - `SCVec` / `SCMap` contract-argument types in the request encoder (`scval_to_json`)

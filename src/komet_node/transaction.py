@@ -36,6 +36,17 @@ def _xlm_to_stroops(balance: object) -> int:
     return int(stroops)
 
 
+class SimulationRejected(Exception):
+    """The transaction decoded fine but cannot be simulated.
+
+    Raised by :meth:`TransactionEncoder.build_simulate_request` for transactions the
+    simulator rejects up front (wrong operation set, unsupported host function). The
+    message is user-facing: the server reports it verbatim as the result-level ``error``
+    of the ``simulateTransaction`` response, mirroring how real stellar-rpc reports these
+    violations in the result body rather than as a JSON-RPC error.
+    """
+
+
 class TransactionEncoder:
     """
     Decodes Stellar XDR transactions into the request envelope consumed by ``node.md``.
@@ -84,6 +95,35 @@ class TransactionEncoder:
         if json_steps is not None:
             return request, None
         return request, self._upload_steps(transaction)
+
+    def build_simulate_request(self, rpc_id: Any, transaction_xdr: str, now: str) -> dict[str, Any]:
+        """
+        Decode a transaction XDR envelope into a ``simulateTransaction`` request envelope.
+
+        Per the spec, the transaction must contain exactly one ``InvokeHostFunction``
+        operation. Of the three host-function kinds, only contract invocation is
+        simulated: uploads and deploys carry a wasm payload / deterministic address rather
+        than a computed return value, and simulating them is not supported yet. Both
+        violations raise :class:`SimulationRejected` (a result-level error); a malformed
+        XDR string raises from ``TransactionEnvelope.from_xdr`` (an invalid-params error).
+        """
+        envelope = TransactionEnvelope.from_xdr(transaction_xdr, self.network_passphrase)
+        transaction = envelope.transaction
+
+        if len(transaction.operations) != 1 or not isinstance(transaction.operations[0], InvokeHostFunction):
+            raise SimulationRejected('transaction must contain exactly one InvokeHostFunction operation')
+        op = transaction.operations[0]
+        if op.host_function.type != xdr.HostFunctionType.HOST_FUNCTION_TYPE_INVOKE_CONTRACT:
+            raise SimulationRejected(f'host function type {op.host_function.type.name} cannot be simulated yet')
+
+        step = self._encode_operation(op, transaction.source)
+        assert step is not None  # the invoke-contract case always encodes
+        return {
+            'method': 'simulateTransaction',
+            'id': rpc_id,
+            'now': now,
+            'steps': [step],
+        }
 
     def _encode_steps(self, transaction: Transaction) -> list[dict] | None:
         """Encode each operation as a JSON step dict, or ``None`` if any op needs the wasm path.

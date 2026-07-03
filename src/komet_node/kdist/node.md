@@ -55,6 +55,8 @@ module NODE
                    | #getTxResult( String, String, JSON, Int )
                    | #respondTrace( JSON, String )
                    | #respond( JSON, JSON )
+                   | #simulateStep( JSON )
+                   | #simulateRespond( JSON )
 
     syntax Step ::= setLedgerSequence(Int)    [symbol(setLedgerSequence)]
  // ----------------------------------------------------------------------
@@ -349,6 +351,119 @@ exists for that hash.
     rule <k> #respondTrace( ID, HASH ) => #respond( ID, null ) ... </k>
       requires notBool #fileExists( #traceFile( HASH ) )
 ```
+
+## simulateTransaction
+
+Run a single contract invocation against the current world state *without committing
+anything*: no receipt, no trace, no ledger bump, and the Python server does not persist the
+resulting configuration (`interpreter.run(..., commit=False)`). Tracing stays disabled
+because `<ioDir>` is left empty.
+
+The request envelope carries exactly one `callTx` step (the server rejects anything else
+before dispatching here). After the call, the invocation's return value sits on the
+`<hostStack>` as a fully resolved `ScVal` — the one thing `sendTransaction` discards and
+simulation exists to report.
+
+The K side responds with an *internal* result, `{ "latestLedger": N, "returnValue": <scval
+json> }` on success or `{ "latestLedger": N, "error": <string> }` when the call trapped.
+The server maps it to the spec response shape: the return value must be serialized as
+base64 SCVal XDR and `transactionData` as base64 `SorobanTransactionData`, and K can build
+neither (no XDR encoder, no base64 hook), so that final serialization step lives in Python
+(`server.py`). A simulation that gets stuck (e.g. calling a contract that does not exist)
+produces no `response.json`, and the server synthesises the error result.
+
+```k
+    rule <k> #dispatchMethod( "simulateTransaction", REQ )
+          => setLedgerSequence( #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ) )
+          ~> #simulateStep( #firstJSON( #getJSON( "steps", REQ, [ .JSONs ] ) ) )
+          ~> #simulateRespond( #getJSON( "id", REQ ) )
+             ...
+         </k>
+
+    syntax JSON ::= #firstJSON( JSON ) [function, symbol(firstJSON)]
+ // ----------------------------------------------------------------
+    rule #firstJSON( [ J , _ ] ) => J
+```
+
+Like komet's `callTx`, the invocation clears the `<host>` cell first, so afterwards the
+stack holds exactly the call's result. Unlike `callTx` (and `uncheckedCallTx`), there is no
+`#resetHost` after the call: `#simulateRespond` still needs the result, and the
+configuration is thrown away when the run ends, so nothing leaks into later requests. The
+step patterns must mirror the `callTx` case of `#decodeStep` (key order is significant).
+
+```k
+    rule [simulateStep-account]:
+        <k> #simulateStep({ "op" : "callTx" , "from" : FROM:String , "fromIsContract" : false , "func" : FUNC:String , "to" : TO:String , "args" : [ ARGS:JSONs ] })
+         => allocObjects(#decodeArgList(ARGS))
+         ~> callContractFromStack(Account(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""))
+            ...
+        </k>
+        (_:HostCell => <host> <hostStack> .HostStack </hostStack> ... </host>)
+
+    rule [simulateStep-contract]:
+        <k> #simulateStep({ "op" : "callTx" , "from" : FROM:String , "fromIsContract" : true , "func" : FUNC:String , "to" : TO:String , "args" : [ ARGS:JSONs ] })
+         => allocObjects(#decodeArgList(ARGS))
+         ~> callContractFromStack(Contract(HexBytes(FROM)), Contract(HexBytes(TO)), string2WasmToken("\"" +String FUNC +String "\""))
+            ...
+        </k>
+        (_:HostCell => <host> <hostStack> .HostStack </hostStack> ... </host>)
+
+    rule [simulateRespond]:
+        <k> #simulateRespond( ID )
+          => #respond( ID, #simulateResult( SCVAL,
+                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ) ) )
+             ...
+         </k>
+         <hostStack> SCVAL:ScVal : _ </hostStack>
+
+    // A trapped call self-heals (the world state is rolled back by `endWasm-error`) and
+    // leaves an `Error` ScVal on the stack; report it as a result-level error.
+    syntax JSON ::= #simulateResult( ScVal, Int ) [function, symbol(simulateResult)]
+ // --------------------------------------------------------------------------------
+    rule #simulateResult( Error(T, C), LL ) => {
+            "latestLedger" : LL,
+            "error"        : "host function invocation failed (error type "
+                             +String Int2String(ErrorType2Int(T))
+                             +String ", code " +String Int2String(C) +String ")"
+        }
+    rule #simulateResult( SCVAL, LL ) => {
+            "latestLedger" : LL,
+            "returnValue"  : #scValJSON( SCVAL )
+        } [owise]
+```
+
+`#scValJSON` encodes an `ScVal` return value as JSON for the Python side to XDR-serialize
+(`json_to_scval` in `scval.py` is its inverse — keep the two in sync). Python reads these
+objects with order-independent lookups, but the fields are emitted in the same order as the
+`#decodeArg` patterns for consistency. Unsupported return types (`ScMap`, unresolved host
+values, ...) have no rule: the run gets stuck and the server reports a simulation error.
+
+```k
+    syntax JSON ::= #scValJSON( ScVal ) [function, symbol(scValJSON)]
+ // -----------------------------------------------------------------
+    rule #scValJSON( SCBool(B)   ) => { "type" : "bool"   , "value" : B }
+    rule #scValJSON( Void        ) => { "type" : "void" }
+    rule #scValJSON( U32(I)      ) => { "type" : "u32"    , "value" : I }
+    rule #scValJSON( I32(I)      ) => { "type" : "i32"    , "value" : I }
+    rule #scValJSON( U64(I)      ) => { "type" : "u64"    , "value" : I }
+    rule #scValJSON( I64(I)      ) => { "type" : "i64"    , "value" : I }
+    rule #scValJSON( U128(I)     ) => { "type" : "u128"   , "value" : I }
+    rule #scValJSON( I128(I)     ) => { "type" : "i128"   , "value" : I }
+    rule #scValJSON( Symbol(S)   ) => { "type" : "symbol" , "value" : S }
+    rule #scValJSON( ScString(S) ) => { "type" : "string" , "value" : S }
+    rule #scValJSON( ScBytes(B)  ) => { "type" : "bytes"  , "value" : Bytes2Hex(B) }
+    rule #scValJSON( ScAddress(Account(B))  ) => { "type" : "address" , "addrType" : "account"  , "value" : Bytes2Hex(B) }
+    rule #scValJSON( ScAddress(Contract(B)) ) => { "type" : "address" , "addrType" : "contract" , "value" : Bytes2Hex(B) }
+    rule #scValJSON( ScVec(L)    ) => { "type" : "vec"    , "value" : [ #scValJSONs(L) ] }
+
+    syntax JSONs ::= #scValJSONs( List ) [function, symbol(scValJSONs)]
+ // -------------------------------------------------------------------
+    rule #scValJSONs( .List )                => .JSONs
+    rule #scValJSONs( ListItem(V:ScVal) L )  => #scValJSON(V) , #scValJSONs(L)
+```
+
+`Bytes2Hex` (the inverse of `HexBytes`, two hex digits per byte) is K's hooked builtin from
+the BYTES module; the Python decoder (`bytes.fromhex`) accepts either letter case.
 
 ###############################################################################
 # Step decoding

@@ -33,6 +33,7 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 
 ## Known gaps
 
-- `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
+- `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced in `getTransaction`).
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
-- `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
+- `simulateTransaction` only simulates invoke-contract host functions (not uploads/deploys); `auth` is always empty, `minResourceFee`/`transactionData` are synthetic constants, and `events`/`restorePreamble`/`stateChanges` and the `resourceConfig`/`authMode`/`xdrFormat` parameters are not supported. `ScMap` return values are not yet encoded.
+- `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
