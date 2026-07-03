@@ -39,7 +39,7 @@ insert-handleRequestFile → handleRequestFile
          ▼
 #dispatchMethod(method, request)        ← routes on the "method" field
          │
-         ├─ getHealth / getNetwork / getLatestLedger / getTransaction / traceTransaction → #respond(...)
+         ├─ getHealth / getNetwork / getLatestLedger / getTransaction / getLedgerEntries / traceTransaction → #respond(...)
          │
          └─ sendTransaction → #runTx → run steps
                 → #finalizeTx → record receipt + bump ledger → #respond(...)
@@ -62,6 +62,7 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 - `getNetwork` → `{ "friendbotUrl": null, "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic)
 - `getLatestLedger` → reads `metadata.json` and returns `{ "id": <64 zeros>, "protocolVersion": ..., "sequence": <latest_ledger> }`
 - `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the current `latestLedger`/`latestLedgerCloseTime`, or `{ "status": "NOT_FOUND", ... }` when the file is absent
+- `getLedgerEntries` → looks each *key descriptor* of the request up in the world-state cells (`<accounts>`, `<contracts>`, `<contractData>`, `<contractCodes>`) and responds with `{ "entries": [...], "latestLedger": <int> }`. The server decodes the base64 `LedgerKey` XDR into the descriptors beforehand and re-encodes the found entries as `LedgerEntryData` XDR afterwards (`ledger_entries.py`) — the entries in K's response are an intermediate JSON shape (per-kind payloads such as `balance`, `wasmHash`, or an ScVal value serialised by `#scVal2JSON`, the inverse of `#decodeArg`). Keys that match nothing are skipped via an `[owise]` rule — per the spec they are not an error
 
 `#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0.
 
@@ -140,6 +141,10 @@ rule HexBytes("") => .Bytes
 rule HexBytes(S)  => Int2Bytes(lengthString(S) /Int 2, String2Base(S, 16), BE)
   requires lengthString(S) >Int 0
 ```
+
+### `Bytes2Hex(Bytes) → String`
+
+The inverse direction is K's built-in `Bytes2Hex` (hook `BYTES.bytes2hex`): it encodes `Bytes` as a lowercase, zero-padded hex string. The `getLedgerEntries` rules use it to report hashes, addresses, and `ScBytes` values to the server.
 
 ### `string2WasmToken(String) → WasmStringToken`
 

@@ -74,6 +74,9 @@ that leading zero bytes are preserved.
       requires lengthString(S) >Int 0
 ```
 
+The inverse direction — Bytes to a lowercase, zero-padded hex string — is K's built-in
+`Bytes2Hex` (hook `BYTES.bytes2hex`), used by the getLedgerEntries rules below.
+
 `string2WasmToken` wraps a plain K String (for example, "foo") in double-quote delimiters and
 produces a WasmStringToken using K's generic string-to-token hook.
 
@@ -348,6 +351,194 @@ exists for that hash.
       requires #fileExists( #traceFile( HASH ) )
     rule <k> #respondTrace( ID, HASH ) => #respond( ID, null ) ... </k>
       requires notBool #fileExists( #traceFile( HASH ) )
+```
+
+## getLedgerEntries
+
+The Python server decodes each base64 `LedgerKey` of the request (K cannot parse XDR)
+into a JSON *key descriptor* and sends the list as the `keys` field of the request
+envelope. The rules below look each descriptor up in the world-state cells and reply with
+an intermediate JSON entry per *found* key — unknown keys are silently skipped, per the
+spec. The server then re-encodes each intermediate entry as base64 `LedgerEntryData` XDR
+and rebuilds the `entries` array (`ledger_entries.py`), the one step of this method that
+cannot be done in K.
+
+Descriptor shapes (key order is significant — it must match `ledger_entries.py`):
+
+  { "kind": "account",          "key": "<b64>", "accountId": "<hex32>" }
+  { "kind": "contractCode",     "key": "<b64>", "hash": "<hex32>" }
+  { "kind": "contractInstance", "key": "<b64>", "contract": "<hex32>" }
+  { "kind": "contractData",     "key": "<b64>", "contract": "<hex32>",
+                                "durability": "persistent"|"temporary", "scKey": <scval> }
+  { "kind": "unsupported",      "key": "<b64>" }
+
+```k
+    syntax KItem ::= #ledgerEntries( JSON, JSONs, JSONs )
+                   | #contractDataEntry( JSON, String, StorageKey, JSONs, JSONs )
+
+    rule <k> #dispatchMethod( "getLedgerEntries", REQ )
+          => #ledgerEntries(
+                 #getJSON( "id", REQ ),
+                 #stepsJSONs( #getJSON( "keys", REQ, [ .JSONs ] ) ),
+                 .JSONs
+             )
+             ...
+         </k>
+```
+
+All keys processed: respond with the found entries and the current ledger.
+`latestLedger` is emitted as an Int, i.e. a JSON number, as the spec requires.
+
+```k
+    rule <k> #ledgerEntries( ID, .JSONs, ENTRIES )
+          => #respond( ID, {
+                 "entries"      : [ ENTRIES ],
+                 "latestLedger" : #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) )
+             })
+             ...
+         </k>
+```
+
+ACCOUNT keys resolve against the `<accounts>` cell. The semantics track only the balance;
+the remaining `AccountEntry` fields are synthesised by the server.
+
+```k
+    rule <k> #ledgerEntries( ID, ({ "kind" : "account", "key" : KEY:String, "accountId" : AID:String }, REST:JSONs), ENTRIES )
+          => #ledgerEntries( ID, REST, #concatJSONs( ENTRIES,
+                 ({ "kind" : "account", "key" : KEY, "balance" : BAL }, .JSONs) ) )
+             ...
+         </k>
+         <account>
+           <accountId> Account(ACCTID) </accountId>
+           <balance> BAL </balance>
+         </account>
+      requires ACCTID ==K HexBytes(AID)
+```
+
+CONTRACT_CODE keys resolve against `<contractCodes>`. The stored wasm is a parsed
+`ModuleDecl` whose original bytes cannot be recovered here, so the entry reports only the
+hash and TTL; the server keeps the raw bytes (written at upload time, `wasms/<hash>.wasm`)
+and reattaches them when building the XDR.
+
+```k
+    rule <k> #ledgerEntries( ID, ({ "kind" : "contractCode", "key" : KEY:String, "hash" : HASH:String }, REST:JSONs), ENTRIES )
+          => #ledgerEntries( ID, REST, #concatJSONs( ENTRIES,
+                 ({ "kind" : "contractCode", "key" : KEY, "hash" : HASH, "liveUntil" : LIVE }, .JSONs) ) )
+             ...
+         </k>
+         <contractCode>
+           <codeHash> CH </codeHash>
+           <codeLiveUntil> LIVE </codeLiveUntil>
+           ...
+         </contractCode>
+      requires CH ==K HexBytes(HASH)
+```
+
+A CONTRACT_DATA key whose ScVal key is `SCV_LEDGER_KEY_CONTRACT_INSTANCE` resolves
+against the `<contracts>` cell: the entry carries the wasm hash the instance points at
+and the contract's instance storage.
+
+```k
+    rule <k> #ledgerEntries( ID, ({ "kind" : "contractInstance", "key" : KEY:String, "contract" : CADDR:String }, REST:JSONs), ENTRIES )
+          => #ledgerEntries( ID, REST, #concatJSONs( ENTRIES,
+                 ({ "kind"      : "contractInstance",
+                    "key"       : KEY,
+                    "wasmHash"  : Bytes2Hex(WH),
+                    "storage"   : [ #scMapEntries2JSONs( keys_list(ISTORE), ISTORE ) ],
+                    "liveUntil" : LIVE }, .JSONs) ) )
+             ...
+         </k>
+         <contract>
+           <contractId> Contract(CID) </contractId>
+           <wasmHash> WH </wasmHash>
+           <instanceStorage> ISTORE </instanceStorage>
+           <contractLiveUntil> LIVE </contractLiveUntil>
+         </contract>
+      requires CID ==K HexBytes(CADDR)
+```
+
+Other CONTRACT_DATA keys (persistent/temporary storage) resolve against the
+`<contractData>` map. The storage-key ScVal is rebuilt with `#decodeArg` — the same
+decoder the transaction path uses — so it matches the stored `#skey` exactly.
+
+```k
+    rule <k> #ledgerEntries( ID, ({ "kind" : "contractData", "key" : KEY:String, "contract" : CADDR:String, "durability" : DUR:String, "scKey" : SK:JSON }, REST:JSONs), ENTRIES )
+          => #contractDataEntry( ID, KEY, #skey( Contract(HexBytes(CADDR)), #decodeDurability(DUR), #decodeArg(SK) ), REST, ENTRIES )
+             ...
+         </k>
+
+    rule <k> #contractDataEntry( ID, KEY, SKEY, REST, ENTRIES )
+          => #ledgerEntries( ID, REST, #concatJSONs( ENTRIES,
+                 ({ "kind"      : "contractData",
+                    "key"       : KEY,
+                    "val"       : #scVal2JSON( #svalData( {CDATA[SKEY]}:>StorageVal ) ),
+                    "liveUntil" : #svalLive( {CDATA[SKEY]}:>StorageVal ) }, .JSONs) ) )
+             ...
+         </k>
+         <contractData> CDATA </contractData>
+      requires SKEY in_keys(CDATA)
+
+    rule <k> #contractDataEntry( ID, _KEY, SKEY, REST, ENTRIES ) => #ledgerEntries( ID, REST, ENTRIES ) ... </k>
+         <contractData> CDATA </contractData>
+      requires notBool SKEY in_keys(CDATA)
+```
+
+Any other key — an unsupported entry type, or a supported type not present in the world
+state — is not an error: it is skipped ([owise] fires when no lookup rule above matched).
+
+```k
+    rule <k> #ledgerEntries( ID, (_KEY:JSON, REST:JSONs), ENTRIES ) => #ledgerEntries( ID, REST, ENTRIES ) ... </k> [owise]
+
+    syntax Durability ::= #decodeDurability( String ) [function]
+ // ------------------------------------------------------------
+    rule #decodeDurability( "persistent" ) => #persistent
+    rule #decodeDurability( "temporary" )  => #temporary
+
+    syntax ScVal ::= #svalData( StorageVal ) [function]
+    syntax Int   ::= #svalLive( StorageVal ) [function]
+ // ---------------------------------------------------
+    rule #svalData( #sval( VAL, _ ) )  => VAL
+    rule #svalLive( #sval( _, LIVE ) ) => LIVE
+```
+
+`#scVal2JSON` serialises a stored ScVal back to the JSON encoding that `#decodeArg`
+consumes (same shapes, same key order), extended with the value-only types that never
+appear as call arguments (`void`, `string`, `u256`, `vec`, `map`). Values with no JSON
+form are emitted as `{"type": "unsupported"}`; the server drops the enclosing entry.
+
+```k
+    syntax JSON ::= #scVal2JSON( ScVal ) [function, total, symbol(scVal2JSON)]
+ // --------------------------------------------------------------------------
+    rule #scVal2JSON( SCBool(B) )   => { "type" : "bool",   "value" : B }
+    rule #scVal2JSON( I32(V) )      => { "type" : "i32",    "value" : V }
+    rule #scVal2JSON( U32(V) )      => { "type" : "u32",    "value" : V }
+    rule #scVal2JSON( I64(V) )      => { "type" : "i64",    "value" : V }
+    rule #scVal2JSON( U64(V) )      => { "type" : "u64",    "value" : V }
+    rule #scVal2JSON( I128(V) )     => { "type" : "i128",   "value" : V }
+    rule #scVal2JSON( U128(V) )     => { "type" : "u128",   "value" : V }
+    rule #scVal2JSON( U256(V) )     => { "type" : "u256",   "value" : V }
+    rule #scVal2JSON( Symbol(S) )   => { "type" : "symbol", "value" : S }
+    rule #scVal2JSON( ScBytes(B) )  => { "type" : "bytes",  "value" : Bytes2Hex(B) }
+    rule #scVal2JSON( ScString(S) ) => { "type" : "string", "value" : S }
+    rule #scVal2JSON( Void )        => { "type" : "void" }
+    rule #scVal2JSON( ScAddress(Account(B)) )  => { "type" : "address", "addrType" : "account",  "value" : Bytes2Hex(B) }
+    rule #scVal2JSON( ScAddress(Contract(B)) ) => { "type" : "address", "addrType" : "contract", "value" : Bytes2Hex(B) }
+    rule #scVal2JSON( ScVec(ITEMS) ) => { "type" : "vec", "value" : [ #scValList2JSONs(ITEMS) ] }
+    rule #scVal2JSON( ScMap(M) )     => { "type" : "map", "value" : [ #scMapEntries2JSONs(keys_list(M), M) ] }
+    rule #scVal2JSON( _ )            => { "type" : "unsupported" } [owise]
+
+    syntax JSONs ::= #scValList2JSONs( List ) [function, total]
+ // -----------------------------------------------------------
+    rule #scValList2JSONs( .List )                  => .JSONs
+    rule #scValList2JSONs( ListItem(V:ScVal) REST ) => ( #scVal2JSON(V), #scValList2JSONs(REST) )
+    rule #scValList2JSONs( ListItem(_) REST )       => ( { "type" : "unsupported" }, #scValList2JSONs(REST) ) [owise]
+
+    syntax JSONs ::= #scMapEntries2JSONs( List, Map ) [function, total]
+ // -------------------------------------------------------------------
+    rule #scMapEntries2JSONs( .List, _ ) => .JSONs
+    rule #scMapEntries2JSONs( ListItem(KEY:ScVal) REST, M )
+      => ( { "key" : #scVal2JSON(KEY), "val" : #scVal2JSON( M {{ KEY }} orDefault Void ) }, #scMapEntries2JSONs(REST, M) )
+    rule #scMapEntries2JSONs( ListItem(_) REST, M ) => ( { "type" : "unsupported" }, #scMapEntries2JSONs(REST, M) ) [owise]
 ```
 
 ###############################################################################

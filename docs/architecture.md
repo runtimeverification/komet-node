@@ -51,7 +51,7 @@ flowchart TB
 
 → **[Detailed documentation](server.md)**
 
-The server implements six RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `sendTransaction`, `getTransaction`, and `traceTransaction` — and the K semantics answer all of them.
+The server implements seven RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `sendTransaction`, `getTransaction`, `getLedgerEntries`, and `traceTransaction` — and the K semantics answer all of them. For `getLedgerEntries` the semantics' answer is an intermediate shape: K performs the state lookups, and `ledger_entries.py` translates between the base64 XDR wire format (`LedgerKey` in, `LedgerEntryData` out) and the JSON the semantics exchange, since K cannot parse or produce XDR.
 
 `sendTransaction` always returns `PENDING` and clients poll `getTransaction` for the result — matching the Stellar RPC async pattern even though the transaction executes synchronously. See [server.md](server.md) for details.
 
@@ -92,6 +92,7 @@ All of the server's input and output artifacts live in one directory, the *io di
 | `receipts/receipt_<hash>.json` | persistent | the semantics (on success) or the server (on failure) | one stored receipt per transaction, keyed by tx hash, answering `getTransaction`. Each is `{status, ledger, createdAt, envelopeXdr, resultXdr, resultMetaXdr}`. |
 | `traces/trace_<hash>.jsonl` | persistent | the semantics | one execution trace per transaction, keyed by tx hash — the instruction-level records, one JSON object per line. `traceTransaction` returns this file's contents. |
 | `requests/request_<n>.json` | persistent | the server | an archive of each incoming JSON-RPC request, numbered by a monotonic counter, kept for debugging. |
+| `wasms/<hash>.wasm` | persistent | the server | the raw bytes of each successfully uploaded wasm module, keyed by hex sha256. The K state stores modules parsed (`ModuleDecl`), so `getLedgerEntries` CONTRACT_CODE entries read the original bytes from here. |
 | `request.json` | transient | the server | the request envelope for the call in flight (`method`, `id`, `now`, and method-specific fields). The semantics remove it once they respond. |
 | `response.json` | transient | the semantics | the JSON-RPC response (`{jsonrpc, id, result}`) for the most recent call. The server reads it back; it is absent when a transaction gets stuck. |
 
@@ -102,7 +103,7 @@ The world state stays in KORE (rather than a JSON snapshot) because an uploaded 
 ```mermaid
 flowchart TB
     boot(["server start"]) --> exists{"state.kore exists?"}
-    exists -->|"no"| init["empty_config() builds the idle K config in KORE<br/>write state.kore · seed metadata.json {latest_ledger: 0}<br/>create receipts/ traces/ requests/"]
+    exists -->|"no"| init["empty_config() builds the idle K config in KORE<br/>write state.kore · seed metadata.json {latest_ledger: 0}<br/>create receipts/ traces/ requests/ wasms/"]
     exists -->|"yes"| reuse["use existing state.kore<br/>seed metadata.json if missing · ensure artifact dirs exist"]
     init --> ready(["ready for requests"])
     reuse --> ready
@@ -177,6 +178,6 @@ sequenceDiagram
 
 - `resultXdr` / `resultMetaXdr` in `getTransaction` responses (contract return values)
 - `simulateTransaction` (dry-run without state mutation)
-- `getEvents`, `getLedgerEntries`, `getFeeStats` and other read-only RPC methods
+- `getEvents`, `getFeeStats` and other read-only RPC methods (`getLedgerEntries` is implemented for the entry types the K state tracks: `ACCOUNT`, `CONTRACT_DATA`, `CONTRACT_CODE`)
 - `ExtendFootprintTTL` and `RestoreFootprint` operations
 - `SCVec` / `SCMap` contract-argument types in the request encoder (`scval_to_json`)

@@ -64,7 +64,7 @@ Once the socket is bound, `serve` logs three lines to stderr: whether it is star
 ```
 startup (state.kore absent):
           → empty_config() → state.kore ; metadata.json {latest_ledger:0}
-          → create receipts/ traces/ requests/
+          → create receipts/ traces/ requests/ wasms/
 
 per successful transaction:
           → the semantics run the steps (trace → traces/trace_<hash>.jsonl),
@@ -143,6 +143,23 @@ All methods are answered by the K semantics and follow the [Stellar RPC specific
 
 `resultXdr` and `resultMetaXdr` are currently empty stubs. The receipt carries no trace — use `traceTransaction` with the same hash to fetch it.
 
+### `getLedgerEntries`
+
+`getLedgerEntries` takes `keys` (an array of up to 200 base64-encoded `LedgerKey` XDR strings; required) and an optional `xdrFormat` (only `"base64"` is supported — `"json"` is rejected with `-32602`). It returns the entries found for the supported key types — `ACCOUNT`, `CONTRACT_DATA` (both the contract-instance entry and persistent/temporary storage), and `CONTRACT_CODE` — the ones the K world state tracks. Keys that do not resolve (unknown, or of an untracked type) are not an error; they are simply absent from `entries`.
+
+**Response** (`latestLedger` and `lastModifiedLedgerSeq` are JSON numbers; `liveUntilLedgerSeq` appears only on Soroban entries):
+```json
+{
+  "entries": [
+    { "key": "<base64 LedgerKey>", "xdr": "<base64 LedgerEntryData>",
+      "lastModifiedLedgerSeq": 4, "liveUntilLedgerSeq": 4095 }
+  ],
+  "latestLedger": 4
+}
+```
+
+This is the one method whose response the server post-processes: the semantics look the keys up in the K state and answer with intermediate JSON entries, and `ledger_entries.py` re-encodes them as `LedgerEntryData` XDR (K cannot produce XDR). Because the K state keeps uploaded wasm parsed, the server stores the raw bytes under `wasms/<hash>.wasm` at upload time and reattaches them to `CONTRACT_CODE` entries. The semantics do not track per-entry modification ledgers, so `lastModifiedLedgerSeq` reports the current ledger; `ACCOUNT` entries carry the real balance but synthesised constants for the remaining required fields (sequence number 0, master weight 1, no signers).
+
 ---
 
 ## Failure fallback
@@ -161,4 +178,4 @@ komet-node [--host HOST] [--port PORT] [--io-dir DIR]
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port |
-| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `receipts/`, `traces/`, `requests/`) |
+| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `receipts/`, `traces/`, `requests/`, `wasms/`) |

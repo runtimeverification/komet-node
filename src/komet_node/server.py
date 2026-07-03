@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Final
 from stellar_sdk import Network
 
 from komet_node.interpreter import NodeInterpreter
+from komet_node.ledger_entries import InvalidParamsError, format_ledger_entries_response, ledger_key_descriptors
 from komet_node.transaction import TransactionEncoder
 
 if TYPE_CHECKING:
@@ -44,6 +45,9 @@ class StellarRpcServer:
       - ``receipts/receipt_<hash>.json`` — one stored receipt per transaction
       - ``traces/trace_<hash>.jsonl``    — one execution trace per transaction
       - ``requests/request_<n>.json``    — an archive of each incoming JSON-RPC request
+      - ``wasms/<hash>.wasm``            — raw bytes of each uploaded wasm module (the K
+        configuration stores modules parsed, so getLedgerEntries CONTRACT_CODE lookups
+        read the original bytes from here)
 
     Splitting receipts, traces, and requests into per-item files keeps any single file from
     growing without bound as the chain advances.
@@ -86,7 +90,8 @@ class StellarRpcServer:
         self.receipts_dir = self.io_dir / 'receipts'
         self.traces_dir = self.io_dir / 'traces'
         self.requests_dir = self.io_dir / 'requests'
-        for directory in (self.receipts_dir, self.traces_dir, self.requests_dir):
+        self.wasms_dir = self.io_dir / 'wasms'
+        for directory in (self.receipts_dir, self.traces_dir, self.requests_dir, self.wasms_dir):
             directory.mkdir(exist_ok=True)
         # Continue the request archive numbering past anything a previous run left behind, so
         # resuming an io-dir never overwrites its earlier request files.
@@ -188,7 +193,9 @@ class StellarRpcServer:
             if not isinstance(transaction, str):
                 return _error_str(request_id, -32602, "Invalid params: 'transaction' (XDR string) is required")
             try:
-                envelope, program_steps = self.encoder.build_tx_request(method, request_id, transaction, now)
+                envelope, program_steps, uploaded_wasms = self.encoder.build_tx_request(
+                    method, request_id, transaction, now
+                )
             except Exception:
                 # build_tx_request both decodes XDR and validates it (e.g. rejecting
                 # sub-stroop amounts); either is a client error. Log the detail, but keep
@@ -198,7 +205,15 @@ class StellarRpcServer:
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
                 return json.dumps(self._failure_response(request_id, envelope, now))
+            # Keep the raw bytes of successfully uploaded wasm modules: the K configuration
+            # stores modules parsed, and getLedgerEntries CONTRACT_CODE entries must return
+            # the original bytes.
+            for wasm_hash, wasm in uploaded_wasms.items():
+                (self.wasms_dir / f'{wasm_hash}.wasm').write_bytes(wasm)
             return response
+
+        if method == 'getLedgerEntries':
+            return self._get_ledger_entries(params, request_id, now)
 
         read_only_envelope = self._read_only_envelope(method, params, request_id, now)
         if isinstance(read_only_envelope, str):  # a pre-formatted JSON-RPC error
@@ -209,6 +224,24 @@ class StellarRpcServer:
         if response is None:
             return _error_str(request_id, -32603, 'Internal error')
         return response
+
+    def _get_ledger_entries(self, params: dict[str, Any], request_id: Any, now: str) -> str:
+        """Handle getLedgerEntries: decode the LedgerKey XDR, run the K lookup, re-encode.
+
+        Unlike the other read-only methods, the semantics' response is an intermediate
+        shape here: K performs the state lookups and emits per-kind JSON payloads, and
+        this side re-encodes them as base64 ``LedgerEntryData`` XDR (which K cannot
+        produce) before returning the final response. See ``ledger_entries.py``.
+        """
+        try:
+            descriptors = ledger_key_descriptors(params)
+        except InvalidParamsError as err:
+            return _error_str(request_id, -32602, f'Invalid params: {err}')
+        envelope = {'method': 'getLedgerEntries', 'id': request_id, 'now': now, 'keys': descriptors}
+        response = self.interpreter.run(self.state_file, self.io_dir, envelope, None)
+        if response is None:
+            return _error_str(request_id, -32603, 'Internal error')
+        return format_ledger_entries_response(response, self.wasms_dir)
 
     def _read_only_envelope(
         self, method: str | None, params: dict[str, Any], request_id: Any, now: str

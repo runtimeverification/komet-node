@@ -13,7 +13,8 @@
 | [`server.py`](server.md) — `StellarRpcServer` | Long-running HTTP/JSON-RPC server wrapping the one-shot K interpreter; `handle_rpc` dispatch; owns the io-dir files. Holds no ledger or receipt state. |
 | [`transaction.py`](transaction.md) — `TransactionEncoder` | XDR → request envelope + (for wasm uploads) kasmer steps; address/contract-id helpers. |
 | [`interpreter.py`](interpreter.md) — `NodeInterpreter` | Runs request envelopes through `llvm_interpret`; persists `state.kore`. No `kast`↔`kore` whole-config conversions. |
-| `scval.py` | XDR `SCVal` ↔ Komet `SCValue` (`scvalue_from_xdr`) and XDR `SCVal` → request JSON (`scval_to_json`). |
+| `scval.py` | XDR `SCVal` ↔ Komet `SCValue` (`scvalue_from_xdr`), XDR `SCVal` ↔ request/response JSON (`scval_to_json`, `scval_from_json`). |
+| `ledger_entries.py` | `getLedgerEntries` XDR translation: base64 `LedgerKey` → key descriptors for the semantics, intermediate entries → base64 `LedgerEntryData`. |
 | [`kdist/node.md`](node-semantics.md) | The K RPC layer: reads `request.json`, dispatches, updates `metadata.json` and the per-transaction `receipts/` files, writes `response.json`. |
 
 State lives in the io dir as `state.kore` (KORE world state) and `metadata.json` (ledger counter), with per-transaction receipts and traces under `receipts/` and `traces/`. See [architecture.md](architecture.md).
@@ -22,7 +23,7 @@ State lives in the io dir as `state.kore` (KORE world state) and `metadata.json`
 
 ## Tests (`src/tests/integration/`)
 
-- `test_server.py` drives the running HTTP server end-to-end. It exercises the read-only methods, `sendTransaction` + `getTransaction`, ledger increments, the full lifecycle (create → upload wasm → deploy → invoke), and the `traceTransaction` flows. `test_call_tx_with_args` deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` arguments, exercising the `scval_to_json` / `#decodeArg` pipeline.
+- `test_server.py` drives the running HTTP server end-to-end. It exercises the read-only methods, `sendTransaction` + `getTransaction`, ledger increments, the full lifecycle (create → upload wasm → deploy → invoke), the `traceTransaction` flows, and `getLedgerEntries` (account, contract code, contract instance, and persistent storage entries via `storage.wat`, plus its parameter validation). `test_call_tx_with_args` deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` arguments, exercising the `scval_to_json` / `#decodeArg` pipeline.
 - `test_integration.py` and `test_unit.py` hold small sanity checks.
 
 Run with `make test` (requires `make kdist-build` first).
@@ -35,4 +36,5 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 
 - `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
-- `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
+- `simulateTransaction`, `getEvents`, `getFeeStats`, and TTL/footprint operations are not implemented.
+- `getLedgerEntries` covers the entry types the K state tracks (`ACCOUNT`, `CONTRACT_DATA`, `CONTRACT_CODE`); other key types are reported as not found. `lastModifiedLedgerSeq` is approximated by the current ledger (per-entry modification ledgers are not tracked), and only the balance is real in `ACCOUNT` entries (sequence number, thresholds, etc. are synthesised constants).

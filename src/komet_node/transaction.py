@@ -57,12 +57,15 @@ class TransactionEncoder:
         rpc_id: Any,
         transaction_xdr: str,
         now: str,
-    ) -> tuple[dict[str, Any], list[KInner] | None]:
+    ) -> tuple[dict[str, Any], list[KInner] | None, dict[str, bytes]]:
         """
         Decode a transaction XDR envelope into a request envelope for the K semantics.
 
         Returns the envelope dict plus, for the wasm-upload path, the kasmer steps to embed
-        in the ``<program>`` cell (``None`` for the common JSON-steps path).
+        in the ``<program>`` cell (``None`` for the common JSON-steps path) and the raw
+        uploaded wasm bytes keyed by hex hash (empty for the JSON-steps path). The raw
+        bytes cannot be recovered from the K configuration (the module is stored parsed),
+        so the server persists them for ``getLedgerEntries`` CONTRACT_CODE lookups.
         """
         envelope = TransactionEnvelope.from_xdr(transaction_xdr, self.network_passphrase)
         transaction = envelope.transaction
@@ -82,8 +85,9 @@ class TransactionEncoder:
         # operation per transaction, so such a transaction is exactly one upload op, whose
         # step we build in K-AST form for direct injection into the <program> cell.
         if json_steps is not None:
-            return request, None
-        return request, self._upload_steps(transaction)
+            return request, None, {}
+        upload_steps, uploaded_wasms = self._upload_steps(transaction)
+        return request, upload_steps, uploaded_wasms
 
     def _encode_steps(self, transaction: Transaction) -> list[dict] | None:
         """Encode each operation as a JSON step dict, or ``None`` if any op needs the wasm path.
@@ -147,9 +151,13 @@ class TransactionEncoder:
             case _:
                 return None
 
-    def _upload_steps(self, transaction: Transaction) -> list[KInner]:
-        """Build the kasmer ``uploadWasm`` step(s) for a wasm-upload transaction."""
+    def _upload_steps(self, transaction: Transaction) -> tuple[list[KInner], dict[str, bytes]]:
+        """Build the kasmer ``uploadWasm`` step(s) for a wasm-upload transaction.
+
+        Also returns the raw wasm bytes keyed by hex hash, for the server's side store.
+        """
         steps: list[KInner] = []
+        uploaded_wasms: dict[str, bytes] = {}
         for op in transaction.operations:
             match op:
                 case InvokeHostFunction(host_function=hf) if (
@@ -157,9 +165,10 @@ class TransactionEncoder:
                 ):
                     assert hf.wasm is not None
                     steps.append(upload_wasm(sha256(hf.wasm), wasm2kast(BytesIO(hf.wasm))))
+                    uploaded_wasms[sha256(hf.wasm).hex()] = hf.wasm
                 case _:
                     raise NotImplementedError(f'Unexpected operation in wasm-upload transaction: {type(op)}')
-        return steps
+        return steps, uploaded_wasms
 
     # ------------------------------------------------------------------
     # Address / contract-id helpers
