@@ -258,11 +258,17 @@ class StellarRpcServer:
         receipt_file = self.receipts_dir / f'receipt_{tx_hash}.json'
         receipt = json.loads(receipt_file.read_text())
         return_value_json = receipt.pop('returnValue', None)
-        return_value = scval_from_json(return_value_json) if return_value_json is not None else None
-        tx_envelope = TransactionEnvelope.from_xdr(receipt['envelopeXdr'], self.encoder.network_passphrase)
-        receipt['resultXdr'] = transaction_result_xdr(tx_envelope, return_value, success=True)
-        receipt['resultMetaXdr'] = transaction_meta_xdr(tx_envelope, return_value)
-        receipt_file.write_text(json.dumps(receipt))
+        try:
+            return_value = scval_from_json(return_value_json) if return_value_json is not None else None
+            tx_envelope = TransactionEnvelope.from_xdr(receipt['envelopeXdr'], self.encoder.network_passphrase)
+            receipt['resultXdr'] = transaction_result_xdr(tx_envelope, return_value, success=True)
+            receipt['resultMetaXdr'] = transaction_meta_xdr(tx_envelope, return_value)
+        finally:
+            # Persist the receipt even when the rewrite fails (e.g. a return value this
+            # encoder cannot decode): the transaction has already committed, and the stored
+            # receipt must never keep the K-internal `returnValue` field. A receipt with
+            # `resultXdr` omitted is spec-legal; a leaked internal field is not.
+            receipt_file.write_text(json.dumps(receipt))
 
     def _failure_response(self, rpc_id: Any, envelope: dict[str, Any], now: str) -> dict[str, Any]:
         """Synthesise the sendTransaction response for a transaction that got stuck (failed).

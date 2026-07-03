@@ -497,13 +497,16 @@ Values with no JSON encoding (e.g. `Error`) render as `null`, i.e. as "no return
 ```
 
 `#bytesToHex` is the inverse of `HexBytes`: lowercase hex, two digits per byte (zero-padded,
-since Base2String drops leading zeroes).
+since Base2String drops leading zeroes). Empty bytes encode as the empty string — the
+general rule would yield `"0"` (Base2String of 0), which `#padZeros` cannot trim.
 
 ```k
     syntax String ::= #bytesToHex( Bytes )      [function, total, symbol(bytesToHex)]
                     | #padZeros( String, Int )  [function, total, symbol(padZeros)]
  // --------------------------------------------------------------------------------
+    rule #bytesToHex( B ) => "" requires lengthBytes(B) ==Int 0
     rule #bytesToHex( B ) => #padZeros( Base2String( Bytes2Int(B, BE, Unsigned), 16 ), 2 *Int lengthBytes(B) )
+      requires lengthBytes(B) >Int 0
 
     rule #padZeros( S, N ) => #padZeros( "0" +String S, N ) requires lengthString(S) <Int N
     rule #padZeros( S, _ ) => S                              [owise]
