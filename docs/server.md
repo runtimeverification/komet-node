@@ -122,6 +122,8 @@ The node retains every ledger since genesis, so `oldestLedger` is always 0 and t
 
 Resubmitting a transaction whose hash already has a receipt returns status `DUPLICATE` without re-executing it: the ledger does not advance and the stored receipt is untouched.
 
+A transaction that decodes as XDR but cannot be processed (e.g. it contains an operation the semantics do not support) is rejected at admission time with status `ERROR` and an `errorResultXdr` carrying a `txMALFORMED` `TransactionResult` — mirroring how real stellar-rpc reports core's admission rejections. Such a transaction never reaches the ledger: no receipt is stored (`getTransaction` stays `NOT_FOUND`) and the ledger does not advance. Undecodable XDR remains a plain `-32602 Invalid params` error, as in real stellar-rpc. `TRY_AGAIN_LATER` is never returned: it signals mempool backpressure, and komet-node executes synchronously without a mempool, so the condition it reports cannot arise.
+
 ### `traceTransaction`
 
 `traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored on that transaction's receipt. The result is the trace itself: a JSONL string with one record per executed WebAssembly instruction, or `null` when no transaction with that hash exists.
