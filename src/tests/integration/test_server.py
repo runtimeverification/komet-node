@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from stellar_sdk import Account, Keypair, Network, StrKey, TransactionBuilder, xdr
+from stellar_sdk import Account, Asset, Keypair, Network, StrKey, TransactionBuilder, xdr
 from stellar_sdk.xdr.sc_val_type import SCValType
 
 from komet_node.server import StellarRpcServer
@@ -337,6 +337,40 @@ def test_send_transaction_and_get_result(server: StellarRpcServer) -> None:
     assert get_result['applicationOrder'] == 1
     assert get_result['feeBump'] is False
     assert set(get_result) <= _GET_TRANSACTION_KEYS
+
+
+def test_send_transaction_unsupported_operation_returns_error_status(server: StellarRpcServer) -> None:
+    """A transaction that decodes but cannot be processed is rejected with status ERROR.
+
+    Mirrors real stellar-rpc's admission-time rejection: the response carries a txMALFORMED
+    TransactionResult in errorResultXdr, the transaction never reaches the ledger (no
+    receipt, no ledger bump), and getTransaction stays NOT_FOUND.
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    envelope = (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_payment_op(destination=Keypair.random().public_key, asset=Asset.native(), amount='1')
+        .set_timeout(30)
+        .build()
+    )
+    envelope.sign(keypair)
+
+    result = _rpc(server.port(), 'sendTransaction', {'transaction': envelope.to_xdr()})['result']
+    assert result['status'] == 'ERROR'
+    assert result['hash'] == envelope.hash_hex()
+    assert _is_number(result['latestLedger'])
+    assert _is_int_string(result['latestLedgerCloseTime'])
+    assert set(result) == {'hash', 'status', 'errorResultXdr', 'latestLedger', 'latestLedgerCloseTime'}
+
+    tx_result = xdr.TransactionResult.from_xdr(result['errorResultXdr'])
+    assert tx_result.result.code == xdr.TransactionResultCode.txMALFORMED
+    assert tx_result.fee_charged.int64 == 0
+
+    # The rejected transaction never reached the ledger.
+    assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 0
+    get_result = _rpc(server.port(), 'getTransaction', {'hash': envelope.hash_hex()})['result']
+    assert get_result['status'] == 'NOT_FOUND'
 
 
 def test_send_transaction_duplicate_is_not_reexecuted(server: StellarRpcServer) -> None:
