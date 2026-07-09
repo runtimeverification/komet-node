@@ -130,10 +130,11 @@ curl -s http://localhost:8000 -H 'Content-Type: application/json' \
   "jsonrpc": "2.0",
   "id": 1,
   "result": [
-    {"pos": null, "instr": ["callContract"],
-        "from": {"type": "address", "addrType": "account",  "value": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"},
-        "to":   {"type": "address", "addrType": "contract", "value": "6a20fec1a9081773a5f23ce370f925f236346e510438ddd6d40f6b2711c134e0"},
-        "function": "foo", "args":[], "depth":1, "storage":[]
+    {
+      "pos": null, "instr": ["callContract"],
+      "from": {"type": "address", "addrType": "account",  "value": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"},
+      "to":   {"type": "address", "addrType": "contract", "value": "6a20fec1a9081773a5f23ce370f925f236346e510438ddd6d40f6b2711c134e0"},
+      "function": "foo", "args":[], "depth":1, "storage":[]
     },
     {"pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
     {"pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
