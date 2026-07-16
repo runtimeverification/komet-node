@@ -23,6 +23,20 @@ if TYPE_CHECKING:
 _STROOPS_PER_XLM = Decimal('10000000')
 
 
+def malformed_tx_result_xdr() -> str:
+    """Base64 ``TransactionResult`` with code ``txMALFORMED`` and no fee charged.
+
+    Returned as ``errorResultXdr`` when ``sendTransaction`` rejects a transaction at
+    admission time (it decodes as XDR but cannot be processed by the semantics).
+    """
+    result = xdr.TransactionResult(
+        fee_charged=xdr.Int64(0),
+        result=xdr.TransactionResultResult(code=xdr.TransactionResultCode.txMALFORMED),
+        ext=xdr.TransactionResultExt(0),
+    )
+    return result.to_xdr()
+
+
 def _xlm_to_stroops(balance: object) -> int:
     """Convert an XLM amount (which may carry up to 7 decimals) to integer stroops.
 
