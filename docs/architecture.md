@@ -51,7 +51,7 @@ flowchart TB
 
 → **[Detailed documentation](server.md)**
 
-The server implements seven RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `sendTransaction`, `getTransaction`, `getLedgerEntries`, and `traceTransaction` — and the K semantics answer all of them. For `getLedgerEntries` the semantics' answer is an intermediate shape: K performs the state lookups, and `ledger_entries.py` translates between the base64 XDR wire format (`LedgerKey` in, `LedgerEntryData` out) and the JSON the semantics exchange, since K cannot parse or produce XDR.
+The server implements eleven RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `getVersionInfo`, `getFeeStats`, `sendTransaction`, `getTransaction`, `getTransactions`, `getLedgers`, `getLedgerEntries`, and the komet-specific `traceTransaction` extension — and the K semantics answer all of them. JSON-RPC framing (single calls, batch arrays, notifications) is handled in Python; the semantics see one request envelope per invocation. For `getLedgerEntries` the semantics' answer is an intermediate shape: K performs the state lookups, and `ledger_entries.py` translates between the base64 XDR wire format (`LedgerKey` in, `LedgerEntryData` out) and the JSON the semantics exchange, since K cannot parse or produce XDR.
 
 `sendTransaction` always returns `PENDING` and clients poll `getTransaction` for the result — matching the Stellar RPC async pattern even though the transaction executes synchronously. See [server.md](server.md) for details.
 
@@ -91,12 +91,13 @@ All of the server's input and output artifacts live in one directory, the *io di
 | `metadata.json` | persistent | the K semantics | `{"latest_ledger": N}` — the server ledger counter, bumped by 1 per committed transaction. |
 | `receipts/receipt_<hash>.json` | persistent | the semantics (on success) or the server (on failure) | one stored receipt per transaction, keyed by tx hash, answering `getTransaction`. Each is `{status, ledger, createdAt, envelopeXdr, resultXdr, resultMetaXdr}`. |
 | `traces/trace_<hash>.jsonl` | persistent | the semantics | one execution trace per transaction, keyed by tx hash — the instruction-level records, one JSON object per line. `traceTransaction` returns this file's contents. |
+| `ledgers/ledger_<seq>.json` | persistent | the server (on success) | one record per closed ledger — `{sequence, txHash, closedAt, hash, headerXdr, metadataXdr}` — the ledger→transaction index behind `getTransactions` and `getLedgers`. Written in Python because the header artifacts are XDR, which K cannot construct. |
 | `requests/request_<n>.json` | persistent | the server | an archive of each incoming JSON-RPC request, numbered by a monotonic counter, kept for debugging. |
 | `wasms/<hash>.wasm` | persistent | the server | the raw bytes of each successfully uploaded wasm module, keyed by hex sha256. The K state stores modules parsed (`ModuleDecl`), so `getLedgerEntries` CONTRACT_CODE entries read the original bytes from here. |
 | `request.json` | transient | the server | the request envelope for the call in flight (`method`, `id`, `now`, and method-specific fields). The semantics remove it once they respond. |
 | `response.json` | transient | the semantics | the JSON-RPC response (`{jsonrpc, id, result}`) for the most recent call. The server reads it back; it is absent when a transaction gets stuck. |
 
-Receipts, traces, and request archives are split into one file per item — keyed by tx hash, or numbered — so that no single file grows without bound as the chain advances. The server creates the `receipts/`, `traces/`, and `requests/` directories before the semantics run, because the K file-system hooks open files with POSIX `open()`, which does not create parent directories.
+Receipts, traces, ledger records, and request archives are split into one file per item — keyed by tx hash, ledger sequence, or a counter — so that no single file grows without bound as the chain advances. The server creates the `receipts/`, `traces/`, `ledgers/`, and `requests/` directories before the semantics run, because the K file-system hooks open files with POSIX `open()`, which does not create parent directories.
 
 The world state stays in KORE (rather than a JSON snapshot) because an uploaded wasm module is a `ModuleDecl` that the semantics cannot reconstruct from bytes — only `wasm2kast` (Python) can produce it. The receipts and the ledger counter, by contrast, are plain data and live in JSON files, which the semantics read and write directly via the file-system hooks.
 
@@ -178,6 +179,6 @@ sequenceDiagram
 
 - `resultXdr` / `resultMetaXdr` in `getTransaction` responses (contract return values)
 - `simulateTransaction` (dry-run without state mutation)
-- `getEvents`, `getFeeStats` and other read-only RPC methods (`getLedgerEntries` is implemented for the entry types the K state tracks: `ACCOUNT`, `CONTRACT_DATA`, `CONTRACT_CODE`)
+- `getEvents` and other read-only RPC methods (`getLedgerEntries` is implemented for the entry types the K state tracks: `ACCOUNT`, `CONTRACT_DATA`, `CONTRACT_CODE`)
 - `ExtendFootprintTTL` and `RestoreFootprint` operations
 - `SCVec` / `SCMap` contract-argument types in the request encoder (`scval_to_json`)
