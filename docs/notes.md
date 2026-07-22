@@ -33,23 +33,9 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 
 ## Known gaps
 
-Measured against the official Stellar RPC surface for protocol 22 (the OpenRPC spec plus the `protocols/rpc` structs in go-stellar-sdk, which are what real stellar-rpc emits).
-
-### Missing methods
-
-`simulateTransaction`, `getLedgerEntries`, `getEvents`, `getTransactions`, `getLedgers`, `getFeeStats`, and `getVersionInfo` are not implemented and return `-32601` Method not found. TTL/footprint operations are likewise unsupported.
-
-### Deviations in the implemented methods
-
-- `getHealth` returns only `{status}`; the spec adds `latestLedger`, `oldestLedger`, and `ledgerRetentionWindow` (numbers).
-- `getNetwork` returns `protocolVersion` as a string (`"22"`) where the spec has a number, and `friendbotUrl: null` where real stellar-rpc omits the field entirely.
-- `getLatestLedger` returns `protocolVersion` as a string, and `id` is a constant all-zeros hash instead of a per-ledger value.
-- `sendTransaction` returns `latestLedger` as a string; the statuses `DUPLICATE`, `ERROR`, and `TRY_AGAIN_LATER` are never returned (resubmitting a transaction re-executes it instead of reporting `DUPLICATE`), and `errorResultXdr` / `diagnosticEventsXdr` are never returned.
-- `getTransaction` is missing the required `oldestLedger` / `oldestLedgerCloseTime` (all statuses) and `applicationOrder` / `feeBump` (success/failed); `latestLedger` and `ledger` are strings where the spec has numbers; `resultXdr` / `resultMetaXdr` are empty-string stubs (contract return values are not surfaced); the `hash` parameter is not validated against the 64-lowercase-hex format.
-
-### Cross-cutting
-
-- The `xdrFormat` parameter is accepted on `getTransaction` and `sendTransaction`, but only the default `'base64'` is supported; `'json'` is rejected with `-32602`.
-- The K semantics' unknown-method fallback answers with `result: null` instead of error `-32601`. This is currently unreachable — the Python layer rejects unknown methods before the semantics run — but latent.
+- `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
+- `sendTransaction`'s `errorResultXdr` is always a generic `txMALFORMED` result (no per-cause codes such as `txBAD_SEQ` — sequence numbers, fees, and signatures are not modelled), and `diagnosticEventsXdr` is never populated (both fields are optional in the spec). `TRY_AGAIN_LATER` is never returned by design: it signals mempool backpressure, which cannot arise in a synchronous node without a mempool.
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
-- `traceTransaction` is a komet-specific extension, absent from real Stellar RPC (see [server.md](server.md#tracetransaction-komet-specific-extension)).
+- The `xdrFormat` parameter is accepted on `getTransaction` and `sendTransaction`, but only the default `'base64'` is supported; `'json'` is rejected with `-32602`.
+- `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
+- Receipts are not a stable format: older io-dirs store `ledger`/`createdAt` with pre-spec types and lack `applicationOrder`/`feeBump`. Resume only io-dirs written by the same version, or start fresh.

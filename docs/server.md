@@ -42,7 +42,7 @@ server = StellarRpcServer(io_dir=Path('out'))
 server.handle_rpc('sendTransaction', {'transaction': xdr})
 ```
 
-For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run`; for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `traceTransaction`) it builds a small envelope and runs it. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the one exception is the failure fallback (below). Each call is logged to stderr.
+For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `traceTransaction`) it builds a small envelope and runs it. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the one exception is the failure fallback (below). Each call is logged to stderr.
 
 ---
 
@@ -97,24 +97,30 @@ Because these artifacts live on disk, the server can be stopped and restarted wi
 
 ## RPC methods
 
-All methods are answered by the K semantics. All follow the [Stellar RPC specification](https://developers.stellar.org/docs/data/apis/rpc/methods) except `traceTransaction`, which is a komet-specific extension (see below).
+All methods are answered by the K semantics and follow the [Stellar RPC specification](https://developers.stellar.org/docs/data/apis/rpc/methods) — except `traceTransaction`, which is a komet-specific extension (see below) — including its serialization quirks: ledger sequence numbers and `protocolVersion` are JSON numbers, while close-time fields (`latestLedgerCloseTime`, `oldestLedgerCloseTime`, `createdAt`) are int64s serialized as JSON strings holding a decimal integer, matching what real stellar-rpc emits.
 
 ### `getHealth`
 
-`getHealth` returns `{"status": "healthy"}`.
+```json
+{ "status": "healthy", "latestLedger": 4, "latestLedgerCloseTime": "1716000000", "oldestLedger": 0, "oldestLedgerCloseTime": "0", "ledgerRetentionWindow": 5 }
+```
+
+The node retains every ledger since genesis, so `oldestLedger` is always 0 and the retention window covers all ledgers so far. Per-ledger close times are not recorded: the latest close time is approximated by the request time and the oldest by the epoch.
 
 ### `getNetwork`
 
 ```json
-{ "friendbotUrl": null, "passphrase": "Test SDF Network ; September 2015", "protocolVersion": "22" }
+{ "passphrase": "Test SDF Network ; September 2015", "protocolVersion": 22 }
 ```
+
+`friendbotUrl` is omitted (not `null`) because the node runs no friendbot — matching real stellar-rpc's `omitempty` serialization.
 
 ### `getLatestLedger`
 
-`getLatestLedger` returns the current ledger sequence (the `latest_ledger` from `metadata.json`), which increments by 1 per successfully committed transaction.
+`getLatestLedger` returns the current ledger sequence (the `latest_ledger` from `metadata.json`), which increments by 1 per successfully committed transaction. The `id` is a deterministic per-ledger stand-in for the ledger-header hash, derived from the sequence (see `#ledgerId` in [node-semantics.md](node-semantics.md)).
 
 ```json
-{ "id": "0000...0000", "protocolVersion": "22", "sequence": 4 }
+{ "id": "1715609f7c74...", "protocolVersion": 22, "sequence": 4 }
 ```
 
 ### `sendTransaction`
@@ -125,8 +131,12 @@ All methods are answered by the K semantics. All follow the [Stellar RPC specifi
 
 **Response**:
 ```json
-{ "hash": "<64-char hex>", "status": "PENDING", "latestLedger": "5", "latestLedgerCloseTime": "1716000000" }
+{ "hash": "<64-char hex>", "status": "PENDING", "latestLedger": 5, "latestLedgerCloseTime": "1716000000" }
 ```
+
+Resubmitting a transaction whose hash already has a receipt returns status `DUPLICATE` without re-executing it: the ledger does not advance and the stored receipt is untouched.
+
+A transaction that decodes as XDR but cannot be processed (e.g. it contains an operation the semantics do not support) is rejected at admission time with status `ERROR` and an `errorResultXdr` carrying a `txMALFORMED` `TransactionResult` — mirroring how real stellar-rpc reports core's admission rejections. Such a transaction never reaches the ledger: no receipt is stored (`getTransaction` stays `NOT_FOUND`) and the ledger does not advance. Undecodable XDR remains a plain `-32602 Invalid params` error, as in real stellar-rpc. `TRY_AGAIN_LATER` is never returned: it signals mempool backpressure, and komet-node executes synchronously without a mempool, so the condition it reports cannot arise.
 
 ### `traceTransaction` (komet-specific extension)
 
@@ -140,7 +150,7 @@ All methods are answered by the K semantics. All follow the [Stellar RPC specifi
 
 ### `getTransaction`
 
-`getTransaction` reads the hash's `receipts/receipt_<hash>.json` file.
+`getTransaction` reads the hash's `receipts/receipt_<hash>.json` file. The `hash` parameter must be a 64-character hex string; anything else is rejected with `-32602 Invalid params` (this and `traceTransaction` share the validation).
 
 | Status | Meaning |
 |---|---|
@@ -151,13 +161,17 @@ All methods are answered by the K semantics. All follow the [Stellar RPC specifi
 **`SUCCESS` response**:
 ```json
 {
-  "status": "SUCCESS", "ledger": "5", "createdAt": "1716000000",
+  "status": "SUCCESS", "applicationOrder": 1, "feeBump": false,
   "envelopeXdr": "<base64 XDR>", "resultXdr": "", "resultMetaXdr": "",
-  "latestLedger": "5", "latestLedgerCloseTime": "1716000000"
+  "ledger": 5, "createdAt": "1716000000",
+  "latestLedger": 5, "latestLedgerCloseTime": "1716000000",
+  "oldestLedger": 0, "oldestLedgerCloseTime": "0"
 }
 ```
 
-`resultXdr` and `resultMetaXdr` are currently empty stubs. The receipt carries no trace — use `traceTransaction` with the same hash to fetch it.
+The ledger-range fields (`latestLedger` through `oldestLedgerCloseTime`) are present on every response, `NOT_FOUND` included. Every ledger contains exactly one transaction, so `applicationOrder` is always 1; fee-bump envelopes are not supported, so `feeBump` is always false. `resultXdr` and `resultMetaXdr` are currently empty stubs. The receipt carries no trace — use `traceTransaction` with the same hash to fetch it.
+
+Receipts are an internal format, not a stable one: receipts written by older komet-node versions stored `ledger` as a string and lack `applicationOrder`/`feeBump`, and `getTransaction` returns stored receipts verbatim. Start from a fresh io-dir after upgrading rather than resuming one with old receipts.
 
 ---
 
