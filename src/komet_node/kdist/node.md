@@ -464,6 +464,13 @@ int64-as-string. Every ledger on this node contains exactly one transaction, so
 always false. (The Python failure fallback in server.py writes a `FAILED` receipt with the
 same field set — keep the two in sync.)
 
+The receipt also carries the contract call's return value (if the transaction made one):
+after `uncheckedCallTx` runs, the call's result `ScVal` is still sitting on the
+`<hostStack>` (see below), so we serialise it into the receipt's internal `returnValue`
+field and only then reset the host. The Python server immediately rewrites that field into
+the spec-mandated `resultXdr`/`resultMetaXdr` base64 XDR fields (K cannot construct XDR), so
+`returnValue` never reaches an RPC client.
+
 ```k
     rule <k> #finalizeTx( REQ )
           => #recordAndRespond(
@@ -477,23 +484,31 @@ same field set — keep the two in sync.)
     rule <k> #recordAndRespond( REQ, L )
           => #writeFile( "metadata.json", JSON2String({ "latest_ledger" : L +Int 1 }) )
           ~> #writeFile( #receiptFile( #getString( "txHash", REQ ) ),
-                 JSON2String( #txReceipt( REQ, L +Int 1 ) ) )
+                 JSON2String( #txReceipt( REQ, L +Int 1, #returnValueJSON( STACK ) ) ) )
+          ~> #resetHost
           ~> #respondTx( REQ, "PENDING", L +Int 1 )
              ...
          </k>
+         <hostStack> STACK </hostStack>
 
-    syntax JSON ::= #txReceipt( JSON, Int ) [function, symbol(txReceipt)]
- // ---------------------------------------------------------------------
-    rule #txReceipt( REQ, NEWL ) => {
+    syntax JSON ::= #txReceipt( JSON, Int, JSON ) [function, symbol(txReceipt)]
+ // ---------------------------------------------------------------------------
+    rule #txReceipt( REQ, NEWL, RETVAL ) => {
             "status"           : "SUCCESS",
             "applicationOrder" : 1,
             "feeBump"          : false,
             "envelopeXdr"      : #getString( "envelopeXdr", REQ ),
-            "resultXdr"        : "",
-            "resultMetaXdr"    : "",
             "ledger"           : NEWL,
-            "createdAt"        : #getString( "now", REQ )
+            "createdAt"        : #getString( "now", REQ ),
+            "returnValue"      : RETVAL
         }
+
+    // The return value of the transaction's contract call: the ScVal left on top of the
+    // host stack, or null when the transaction made no contract call.
+    syntax JSON ::= #returnValueJSON( HostStack ) [function, total, symbol(returnValueJSON)]
+ // ----------------------------------------------------------------------------------------
+    rule #returnValueJSON( VAL:ScVal : _ ) => #scValToJSON( VAL )
+    rule #returnValueJSON( _ )             => null                 [owise]
 
     rule <k> #respondTx( REQ, STATUS, LL )
           => #respond( #getJSON( "id", REQ ), {
@@ -1096,6 +1111,10 @@ SCVal arg encoding (key order also significant):
 
 `uncheckedCallTx` is like komet's `callTx` but it does not entail a return value check.
 
+Unlike `callTx`, it does not `#resetHost` after the call either: the call's return value is
+left on the `<hostStack>` so `#recordAndRespond` can serialise it into the receipt. The host
+is reset there instead (and each `uncheckedCallTx` clears the host cell before it runs, so a
+leftover value never bleeds into a later call).
 
 ```k
     syntax Step ::= uncheckedCallTx( from: Address, to: Address, func: WasmString, args: List)     [symbol(uncheckedCallTx)]
@@ -1104,11 +1123,70 @@ SCVal arg encoding (key order also significant):
         <k> uncheckedCallTx(FROM, TO, FUNC, ARGS)
          => allocObjects(ARGS)
          ~> callContractFromStack(FROM, TO, FUNC)
-         ~> #resetHost
             ...
         </k>
         // clear the host cell before contract calls
         (_:HostCell => <host> <hostStack> .HostStack </hostStack> ... </host>)
+```
+
+###############################################################################
+# ScVal serialisation
+
+`#scValToJSON` renders an `ScVal` as JSON for the receipt's internal `returnValue` field.
+The encoding mirrors the SCVal *argument* encoding accepted by `#decodeArg` above (and
+produced by `scval_to_json` in `scval.py`), extended with the value-only cases that can come
+back from a contract but never go in as arguments: `void`, `string`, `u256`, `vec`, `map`.
+The Python server decodes it with `scval_from_json` (`scval.py`) — keep the three in sync.
+Values with no JSON encoding (e.g. `Error`) render as `null`, i.e. as "no return value".
+
+```k
+    syntax JSON ::= #scValToJSON( ScVal ) [function, total, symbol(scValToJSON)]
+ // ----------------------------------------------------------------------------
+    rule #scValToJSON( SCBool(B)  ) => { "type" : "bool"   , "value" : B }
+    rule #scValToJSON( Void       ) => { "type" : "void" }
+    rule #scValToJSON( I32(V)     ) => { "type" : "i32"    , "value" : V }
+    rule #scValToJSON( U32(V)     ) => { "type" : "u32"    , "value" : V }
+    rule #scValToJSON( I64(V)     ) => { "type" : "i64"    , "value" : V }
+    rule #scValToJSON( U64(V)     ) => { "type" : "u64"    , "value" : V }
+    rule #scValToJSON( I128(V)    ) => { "type" : "i128"   , "value" : V }
+    rule #scValToJSON( U128(V)    ) => { "type" : "u128"   , "value" : V }
+    rule #scValToJSON( U256(V)    ) => { "type" : "u256"   , "value" : V }
+    rule #scValToJSON( Symbol(S)  ) => { "type" : "symbol" , "value" : S }
+    rule #scValToJSON( ScString(S)) => { "type" : "string" , "value" : S }
+    rule #scValToJSON( ScBytes(B) ) => { "type" : "bytes"  , "value" : #bytesToHex(B) }
+    rule #scValToJSON( ScAddress(Account(B))  ) => { "type" : "address" , "addrType" : "account"  , "value" : #bytesToHex(B) }
+    rule #scValToJSON( ScAddress(Contract(B)) ) => { "type" : "address" , "addrType" : "contract" , "value" : #bytesToHex(B) }
+    rule #scValToJSON( ScVec(L)   ) => { "type" : "vec"    , "value" : [ #scValsToJSONs(L) ] }
+    rule #scValToJSON( ScMap(M)   ) => { "type" : "map"    , "value" : [ #mapToJSONs(keys_list(M), M) ] }
+    rule #scValToJSON( _          ) => null                                     [owise]
+
+    syntax JSONs ::= #scValsToJSONs( List ) [function, symbol(scValsToJSONs)]
+ // -------------------------------------------------------------------------
+    rule #scValsToJSONs( .List ) => .JSONs
+    rule #scValsToJSONs( ListItem(V) REST ) => #scValToJSON({V}:>ScVal) , #scValsToJSONs(REST)
+
+    // Each map entry becomes a two-element [key, value] array, in key order.
+    syntax JSONs ::= #mapToJSONs( List, Map ) [function, symbol(mapToJSONs)]
+ // ------------------------------------------------------------------------
+    rule #mapToJSONs( .List, _ ) => .JSONs
+    rule #mapToJSONs( ListItem(KEY) REST, M )
+      => [ #scValToJSON({KEY}:>ScVal) , #scValToJSON({M[KEY]}:>ScVal) , .JSONs ] , #mapToJSONs(REST, M)
+```
+
+`#bytesToHex` is the inverse of `HexBytes`: lowercase hex, two digits per byte (zero-padded,
+since Base2String drops leading zeroes). Empty bytes encode as the empty string — the
+general rule would yield `"0"` (Base2String of 0), which `#padZeros` cannot trim.
+
+```k
+    syntax String ::= #bytesToHex( Bytes )      [function, total, symbol(bytesToHex)]
+                    | #padZeros( String, Int )  [function, total, symbol(padZeros)]
+ // --------------------------------------------------------------------------------
+    rule #bytesToHex( B ) => "" requires lengthBytes(B) ==Int 0
+    rule #bytesToHex( B ) => #padZeros( Base2String( Bytes2Int(B, BE, Unsigned), 16 ), 2 *Int lengthBytes(B) )
+      requires lengthBytes(B) >Int 0
+
+    rule #padZeros( S, N ) => #padZeros( "0" +String S, N ) requires lengthString(S) <Int N
+    rule #padZeros( S, _ ) => S                              [owise]
 
 endmodule
 ```

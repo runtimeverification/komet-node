@@ -17,6 +17,7 @@ from stellar_sdk import Network, TransactionEnvelope, xdr
 from komet_node.interpreter import NodeInterpreter
 from komet_node.ledger import build_ledger_artifacts
 from komet_node.ledger_entries import InvalidParamsError, format_ledger_entries_response, ledger_key_descriptors
+from komet_node.result_xdr import transaction_meta_xdr, transaction_result_xdr
 from komet_node.scval import scval_from_json
 from komet_node.transaction import SimulationRejected, TransactionEncoder, malformed_tx_result_xdr
 
@@ -314,11 +315,18 @@ class StellarRpcServer:
             # answer DUPLICATE without running the steps (see node.md). Steps injected into
             # the <program> cell (wasm uploads) would execute *before* dispatch, though, so
             # they must not be injected for a duplicate.
-            if (self.receipts_dir / f'receipt_{envelope["txHash"]}.json').exists():
+            is_duplicate = (self.receipts_dir / f'receipt_{envelope["txHash"]}.json').exists()
+            if is_duplicate:
                 program_steps = None
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
                 return json.dumps(self._failure_response(request_id, envelope, now))
+            # Rewrite the freshly written SUCCESS receipt's internal `returnValue` into real
+            # resultXdr/resultMetaXdr. Skip it for a duplicate: that receipt was already
+            # finalised on first submission and no longer carries `returnValue`, so
+            # reprocessing it would overwrite the stored result with an empty one.
+            if not is_duplicate:
+                self._attach_result_xdr(envelope['txHash'])
             # Keep the raw bytes of successfully uploaded wasm modules: the K configuration
             # stores modules parsed, and getLedgerEntries CONTRACT_CODE entries must return
             # the original bytes.
@@ -516,6 +524,30 @@ class StellarRpcServer:
         metadata = json.loads((self.io_dir / 'metadata.json').read_text())
         return int(metadata.get('latest_ledger', 0))
 
+    def _attach_result_xdr(self, tx_hash: str) -> None:
+        """Rewrite a fresh SUCCESS receipt's internal ``returnValue`` into real result XDR.
+
+        The K semantics record the transaction's contract-call return value in the receipt
+        as a JSON-encoded SCVal (``null`` when the transaction made no call), because K
+        cannot construct XDR. Replace it with the spec-mandated ``resultXdr``/
+        ``resultMetaXdr`` (base64 TransactionResult / TransactionMeta), so getTransaction
+        can serve the stored receipt as-is.
+        """
+        receipt_file = self.receipts_dir / f'receipt_{tx_hash}.json'
+        receipt = json.loads(receipt_file.read_text())
+        return_value_json = receipt.pop('returnValue', None)
+        try:
+            return_value = scval_from_json(return_value_json) if return_value_json is not None else None
+            tx_envelope = TransactionEnvelope.from_xdr(receipt['envelopeXdr'], self.encoder.network_passphrase)
+            receipt['resultXdr'] = transaction_result_xdr(tx_envelope, return_value, success=True)
+            receipt['resultMetaXdr'] = transaction_meta_xdr(tx_envelope, return_value)
+        finally:
+            # Persist the receipt even when the rewrite fails (e.g. a return value this
+            # encoder cannot decode): the transaction has already committed, and the stored
+            # receipt must never keep the K-internal `returnValue` field. A receipt with
+            # `resultXdr` omitted is spec-legal; a leaked internal field is not.
+            receipt_file.write_text(json.dumps(receipt))
+
     def _record_closed_ledger(self, envelope: dict[str, Any], now: str) -> None:
         """Materialise ``ledgers/ledger_<seq>.json`` for the ledger a transaction just closed.
 
@@ -581,18 +613,22 @@ class StellarRpcServer:
         """
         ledger = self._latest_ledger()
         tx_hash = envelope['txHash']
+        tx_envelope = TransactionEnvelope.from_xdr(envelope['envelopeXdr'], self.encoder.network_passphrase)
 
         # This FAILED receipt mirrors the SUCCESS receipt the semantics build in
-        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule (ledger a
-        # JSON number, createdAt an int64-as-string). Like the success path, the receipt
-        # carries no trace — any trace lives in its own file.
+        # `#txReceipt` (kdist/node.md) after `_attach_result_xdr` finalises it: keep the
+        # field set in sync (ledger a JSON number, createdAt an int64-as-string). A failed
+        # transaction never commits, so the chain does not advance: `ledger` pins the latest
+        # ledger at failure time. `resultXdr` carries a real `txFAILED` result;
+        # `resultMetaXdr` is omitted — the spec allows that, and no meta exists for a
+        # rolled-back run. Like the success path, the receipt carries no trace — any trace
+        # lives in its own file.
         receipt = {
             'status': 'FAILED',
             'applicationOrder': 1,
             'feeBump': False,
             'envelopeXdr': envelope['envelopeXdr'],
-            'resultXdr': '',
-            'resultMetaXdr': '',
+            'resultXdr': transaction_result_xdr(tx_envelope, None, success=False),
             'ledger': ledger,
             'createdAt': now,
         }

@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
 ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resolve(strict=True)
 ADDER_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'adder.wat').resolve(strict=True)
+BYTES_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'bytes.wat').resolve(strict=True)
 STORAGE_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'storage.wat').resolve(strict=True)
 
 
@@ -1621,3 +1622,231 @@ def test_simulate_transaction_non_invoke_host_function_returns_error(server: Ste
     # Nothing was committed: the create-account operation did not execute.
     assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 0
     assert not (server.io_dir / 'receipts' / f'receipt_{envelope.hash_hex()}.json').exists()
+
+
+# ---------------------------------------------------------------------------
+# getTransaction: resultXdr / resultMetaXdr contents.
+#
+# Per the official spec, `resultXdr` is "a base64 encoded string of the raw
+# TransactionResult XDR struct" and `resultMetaXdr` the raw TransactionMeta, present
+# when status is SUCCESS or FAILED. Fields are either omitted or valid XDR — an
+# empty-string stub is neither.
+# ---------------------------------------------------------------------------
+
+
+def _tx_result_of(get_result: dict[str, Any]) -> xdr.TransactionResult:
+    """Decode a receipt's resultXdr, asserting it is real base64 XDR (not an empty stub)."""
+    result_xdr = get_result.get('resultXdr')
+    assert isinstance(result_xdr, str), f'resultXdr missing or not a string: {get_result}'
+    assert result_xdr != '', 'resultXdr must be real XDR or omitted, not an empty string'
+    return xdr.TransactionResult.from_xdr(result_xdr)
+
+
+def _tx_meta_of(get_result: dict[str, Any]) -> xdr.TransactionMeta:
+    """Decode a receipt's resultMetaXdr, asserting it is real base64 XDR (not an empty stub)."""
+    meta_xdr = get_result.get('resultMetaXdr')
+    assert isinstance(meta_xdr, str), f'resultMetaXdr missing or not a string: {get_result}'
+    assert meta_xdr != '', 'resultMetaXdr must be real XDR or omitted, not an empty string'
+    return xdr.TransactionMeta.from_xdr(meta_xdr)
+
+
+def _soroban_return_value(meta: xdr.TransactionMeta) -> xdr.SCVal:
+    """Extract sorobanMeta.returnValue from a TransactionMeta (v3 at protocol version 22)."""
+    assert meta.v == 3, f'expected TransactionMeta v3 at protocol version 22, got v{meta.v}'
+    assert meta.v3 is not None and meta.v3.soroban_meta is not None
+    return meta.v3.soroban_meta.return_value
+
+
+def test_get_transaction_success_returns_decodable_result_xdr(server: StellarRpcServer) -> None:
+    """A SUCCESS receipt carries a real TransactionResult and TransactionMeta.
+
+    The TransactionResult must decode from base64 and report code txSUCCESS; the
+    TransactionMeta must decode as well.
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    envelope = (
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
+        .set_timeout(30)
+        .build()
+    )
+    envelope.sign(keypair)
+    tx_hash = _rpc(server.port(), 'sendTransaction', {'transaction': envelope.to_xdr()})['result']['hash']
+
+    get_result = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
+    assert get_result['status'] == 'SUCCESS'
+    # The K-side receipt's internal returnValue field must never reach RPC clients: the
+    # server rewrites it into resultXdr/resultMetaXdr before the receipt is ever served.
+    assert 'returnValue' not in get_result
+
+    tx_result = _tx_result_of(get_result)
+    assert tx_result.result.code == xdr.TransactionResultCode.txSUCCESS
+
+    _tx_meta_of(get_result)  # must decode as TransactionMeta
+
+
+def test_get_transaction_invocation_reports_return_value(server: StellarRpcServer) -> None:
+    """A successful contract invocation surfaces its return value in resultMetaXdr.
+
+    ``add(2, 3)`` returns U32(5). Real stellar-rpc reports the invocation's return value
+    as ``sorobanMeta.returnValue`` inside the TransactionMeta, and the TransactionResult
+    carries a successful InvokeHostFunction operation result. Every receipt along the
+    lifecycle (create account, upload, deploy) must carry decodable result XDR too.
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    def send(tb: TransactionBuilder) -> dict[str, Any]:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
+        assert res['result']['status'] == 'PENDING'
+        get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
+        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+        # The internal K-side returnValue field must never leak into getTransaction responses.
+        assert 'returnValue' not in get_res
+        # Every successful receipt, whatever the operation, has a decodable txSUCCESS result.
+        assert _tx_result_of(get_res).result.code == xdr.TransactionResultCode.txSUCCESS
+        return get_res
+
+    # Set up: create account, upload adder.wat, deploy contract
+    send(builder().append_create_account_op(keypair.public_key, '1000'))
+
+    wasm_bytecode = wat_to_wasm(ADDER_CONTRACT_WAT)
+    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
+
+    from stellar_sdk.utils import sha256
+
+    wasm_hash = sha256(wasm_bytecode)
+    salt = b'\x00' * 32
+    send(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
+
+    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+    invoke_result = send(
+        builder().append_invoke_contract_function_op(
+            contract_address,
+            'add',
+            [
+                xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(2)),
+                xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(3)),
+            ],
+        )
+    )
+
+    # The TransactionResult reports the successful InvokeHostFunction operation.
+    tx_result = _tx_result_of(invoke_result)
+    op_results = tx_result.result.results
+    assert op_results, 'TransactionResult must carry the InvokeHostFunction operation result'
+    assert op_results[0].tr is not None
+    invoke_op_result = op_results[0].tr.invoke_host_function_result
+    assert invoke_op_result is not None
+    assert invoke_op_result.code == xdr.InvokeHostFunctionResultCode.INVOKE_HOST_FUNCTION_SUCCESS
+
+    # The TransactionMeta reports the call's return value: U32(5).
+    return_value = _soroban_return_value(_tx_meta_of(invoke_result))
+    assert return_value.type == SCValType.SCV_U32
+    assert return_value.u32 == xdr.Uint32(5)
+
+
+def test_get_transaction_reports_empty_bytes_return_value(server: StellarRpcServer) -> None:
+    """A contract returning empty Bytes yields SCV_BYTES(b'') in sorobanMeta.returnValue.
+
+    Regression test for the zero-length edge of the receipt's hex encoding: an empty
+    byte string round-trips through the K-side JSON encoding as an empty hex string, not
+    as ``"0"`` (an odd-length non-hex value that breaks the XDR rewrite and would leak
+    the internal ``returnValue`` field to clients).
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    def send(tb: TransactionBuilder) -> dict[str, Any]:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
+        assert 'result' in res, f'sendTransaction failed: {res}'
+        get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
+        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+        return get_res
+
+    send(builder().append_create_account_op(keypair.public_key, '1000'))
+
+    wasm_bytecode = wat_to_wasm(BYTES_CONTRACT_WAT)
+    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
+
+    from stellar_sdk.utils import sha256
+
+    salt = b'\x00' * 32
+    send(builder().append_create_contract_op(sha256(wasm_bytecode), keypair.public_key, None, salt))
+
+    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+    invoke_result = send(builder().append_invoke_contract_function_op(contract_address, 'empty_bytes', []))
+    assert 'returnValue' not in invoke_result  # internal receipt field, must never be served
+
+    return_value = _soroban_return_value(_tx_meta_of(invoke_result))
+    assert return_value.type == SCValType.SCV_BYTES
+    assert return_value.bytes is not None
+    assert return_value.bytes.sc_bytes == b''
+
+
+def test_get_transaction_failed_reports_error_result_xdr(server: StellarRpcServer) -> None:
+    """A FAILED receipt carries a real error TransactionResult, not an empty stub.
+
+    Invoking a never-deployed contract fails. The spec requires `resultXdr` (a base64
+    TransactionResult, here with code txFAILED) when status is FAILED, and `ledger`/
+    `createdAt` to be reported with the same shape as on SUCCESS receipts.
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def send(tb: TransactionBuilder) -> str:
+        env = tb.set_timeout(30).build()
+        env.sign(keypair)
+        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
+        tx_hash = res['result']['hash']
+        assert isinstance(tx_hash, str)
+        return tx_hash
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    # A successful reference transaction first, to compare receipt shapes across statuses.
+    ok_hash = send(builder().append_create_account_op(keypair.public_key, '1000'))
+    ok_result = _rpc(server.port(), 'getTransaction', {'hash': ok_hash})['result']
+    assert ok_result['status'] == 'SUCCESS'
+
+    missing_contract = StrKey.encode_contract(b'\x22' * 32)  # valid C-strkey, never deployed
+    bad_hash = send(builder().append_invoke_contract_function_op(missing_contract, 'foo', []))
+
+    get_result = _rpc(server.port(), 'getTransaction', {'hash': bad_hash})['result']
+    assert get_result['status'] == 'FAILED'
+    assert 'returnValue' not in get_result  # internal receipt field, must never be served
+
+    tx_result = _tx_result_of(get_result)
+    assert tx_result.result.code == xdr.TransactionResultCode.txFAILED
+
+    # resultMetaXdr may be omitted on a failed transaction, but must never be an empty stub.
+    if 'resultMetaXdr' in get_result:
+        _tx_meta_of(get_result)
+
+    # `ledger`/`createdAt` are present on FAILED receipts, with the same JSON types as on
+    # SUCCESS receipts (their exact number-vs-string encoding is covered elsewhere).
+    for field in ('ledger', 'createdAt'):
+        assert field in get_result, f'FAILED receipt must report {field}'
+        assert type(get_result[field]) is type(ok_result[field]), f'{field} type differs across statuses'
+    # createdAt in getTransaction (singular) is an int64 rendered as a decimal string.
+    assert isinstance(get_result['createdAt'], str) and get_result['createdAt'].isdigit()
+
+
+def test_get_transaction_not_found_omits_transaction_fields(server: StellarRpcServer) -> None:
+    """A NOT_FOUND response carries no transaction details (omitted, not empty/null)."""
+    get_result = _rpc(server.port(), 'getTransaction', {'hash': 'b' * 64})['result']
+    assert get_result['status'] == 'NOT_FOUND'
+    for field in ('ledger', 'createdAt', 'envelopeXdr', 'resultXdr', 'resultMetaXdr', 'returnValue'):
+        assert field not in get_result, f'NOT_FOUND response must omit {field}'

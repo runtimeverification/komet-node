@@ -31,8 +31,6 @@ if TYPE_CHECKING:
     from stellar_sdk.xdr.sc_address import SCAddress as XDRSCAddress
     from stellar_sdk.xdr.sc_val import SCVal
 
-_UINT64_MASK = (1 << 64) - 1
-
 
 def scval_to_json(scval: SCVal) -> dict:
     """Encode a Stellar XDR SCVal as a JSON-serialisable dict for the node request envelope.
@@ -88,8 +86,11 @@ def scval_from_json(value: dict) -> SCVal:
     """Decode the JSON ScVal encoding emitted by the semantics back into an XDR SCVal.
 
     Inverse of :func:`scval_to_json`, extended with the value-only types the semantics can
-    hold in contract storage but that never appear as call arguments (``void``, ``string``,
-    ``u256``, ``vec``, ``map``) — see ``#scVal2JSON`` in ``node.md``. Raises
+    hold in contract storage or return from a contract call but that never appear as call
+    arguments (``void``, ``string``, ``u256``, ``vec``, ``map``). Covers all three K-side
+    encoders (``#scVal2JSON``, ``#scValJSON``, ``#scValToJSON`` in ``node.md``); the ``map``
+    case accepts both entry shapes they emit — ``{"key": ..., "val": ...}`` objects and
+    ``[key, val]`` pairs — so keep the encoders and this decoder in sync. Raises
     ``NotImplementedError`` for values with no JSON form (``{"type": "unsupported"}``).
     """
     match value.get('type'):
@@ -152,15 +153,26 @@ def scval_from_json(value: dict) -> SCVal:
             items = [scval_from_json(item) for item in value['value']]
             return stellar_xdr.SCVal(type=SCValType.SCV_VEC, vec=stellar_xdr.SCVec(items))
         case 'map':
-            if not all({'key', 'val'} <= set(pair) for pair in value['value']):
-                raise NotImplementedError(f'Unsupported SCMap entry in JSON encoding: {value!r}')
             entries = [
-                stellar_xdr.SCMapEntry(key=scval_from_json(pair['key']), val=scval_from_json(pair['val']))
-                for pair in value['value']
+                stellar_xdr.SCMapEntry(key=scval_from_json(key), val=scval_from_json(val))
+                for key, val in (_map_entry(pair) for pair in value['value'])
             ]
             return stellar_xdr.SCVal(type=SCValType.SCV_MAP, map=stellar_xdr.SCMap(entries))
         case _:
             raise NotImplementedError(f'Unsupported SCVal JSON encoding: {value!r}')
+
+
+def _map_entry(pair: object) -> tuple[dict, dict]:
+    """Unpack one SCMap entry from either JSON shape the K encoders emit.
+
+    ``#scVal2JSON`` emits ``{"key": ..., "val": ...}`` objects; ``#scValToJSON`` emits
+    ``[key, val]`` two-element arrays. Both decode to the same ``(key, val)`` pair.
+    """
+    if isinstance(pair, dict) and {'key', 'val'} <= set(pair):
+        return pair['key'], pair['val']
+    if isinstance(pair, (list, tuple)) and len(pair) == 2:
+        return pair[0], pair[1]
+    raise NotImplementedError(f'Unsupported SCMap entry in JSON encoding: {pair!r}')
 
 
 def sc_address_from_xdr(xdr: XDRSCAddress) -> SCAddress:

@@ -34,7 +34,9 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 
 ## Known gaps
 
-- `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
+- `resultXdr` / `resultMetaXdr` are synthesised: `feeCharged` is 0, ledger-entry change
+  sets are empty, and the InvokeHostFunction success hash covers only the return value
+  (komet-node does not track fees, entry changes, or events).
 - `sendTransaction`'s `errorResultXdr` is always a generic `txMALFORMED` result (no per-cause codes such as `txBAD_SEQ` — sequence numbers, fees, and signatures are not modelled), and `diagnosticEventsXdr` is never populated (both fields are optional in the spec). `TRY_AGAIN_LATER` is never returned by design: it signals mempool backpressure, which cannot arise in a synchronous node without a mempool.
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
 - The `xdrFormat` parameter is accepted on `getTransaction`, `sendTransaction`, `getTransactions`, `getLedgers`, and `getLedgerEntries`, but only the default `'base64'` is supported; `'json'` is rejected with `-32602`.
