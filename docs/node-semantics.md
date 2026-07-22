@@ -41,7 +41,7 @@ insert-handleRequestFile → handleRequestFile
 #dispatchMethod(method, request)        ← routes on the "method" field
          │
          ├─ getHealth / getNetwork / getLatestLedger / getVersionInfo / getFeeStats
-         │    / getTransaction / getTransactions / getLedgers / traceTransaction → #respond(...)
+         │    / getTransaction / getTransactions / getLedgers / getLedgerEntries / traceTransaction → #respond(...)
          │
          └─ sendTransaction → #runTx → run steps
                 → #finalizeTx → record receipt + bump ledger → #respond(...)
@@ -67,6 +67,7 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 - `getFeeStats` → constant `#feeDistribution` objects (komet-node has no fee market) for `sorobanInclusionFee`/`inclusionFee`, plus a live `latestLedger` number from `metadata.json`; all distribution fields except `ledgerCount` are decimal strings, matching real stellar-rpc's Go `,string` encoding
 - `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the ledger-range fields (`latestLedger`/`latestLedgerCloseTime`/`oldestLedger`/`oldestLedgerCloseTime`), or `{ "status": "NOT_FOUND", ... }` (with the same ledger-range fields) when the file is absent
 - `getTransactions` / `getLedgers` → walk the per-ledger index files `ledgers/ledger_<seq>.json` from the envelope's `startSeq` up to the latest ledger, taking at most `limit` records (`#txInfos` / `#ledgerInfos`), and format the history page (`#txHistoryPage` / `#ledgerHistoryPage`). Parameter validation and cursor resolution happen in the server; the response `cursor` (`#pageCursor`) names the page's last record when the page is full — a TOID for transactions, the plain sequence for ledgers — and is empty otherwise. Serialization matches real stellar-rpc, including its quirks: per-transaction `createdAt` is a JSON number (unlike singular `getTransaction`), per-ledger `ledgerCloseTime` is a decimal string, and empty `resultXdr`/`resultMetaXdr` stubs are omitted (`#optXdrEntry`)
+- `getLedgerEntries` → looks each *key descriptor* of the request up in the world-state cells (`<accounts>`, `<contracts>`, `<contractData>`, `<contractCodes>`) and responds with `{ "entries": [...], "latestLedger": <int> }`. The server decodes the base64 `LedgerKey` XDR into the descriptors beforehand and re-encodes the found entries as `LedgerEntryData` XDR afterwards (`ledger_entries.py`) — the entries in K's response are an intermediate JSON shape (per-kind payloads such as `balance`, `wasmHash`, or an ScVal value serialised by `#scVal2JSON`, the inverse of `#decodeArg`). Keys that match nothing are skipped via an `[owise]` rule — per the spec they are not an error
 
 `#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0. `#respondError(ID, CODE, MSG)` is its error counterpart, writing `{jsonrpc, id, error: {code, message}}` instead; the unknown-method fallback uses it to answer `-32601 Method not found` (a safety net — the Python server filters unknown methods before they reach K).
 
@@ -148,6 +149,10 @@ rule HexBytes("") => .Bytes
 rule HexBytes(S)  => Int2Bytes(lengthString(S) /Int 2, String2Base(S, 16), BE)
   requires lengthString(S) >Int 0
 ```
+
+### `Bytes2Hex(Bytes) → String`
+
+The inverse direction is K's built-in `Bytes2Hex` (hook `BYTES.bytes2hex`): it encodes `Bytes` as a lowercase, zero-padded hex string. The `getLedgerEntries` rules use it to report hashes, addresses, and `ScBytes` values to the server.
 
 ### `string2WasmToken(String) → WasmStringToken`
 

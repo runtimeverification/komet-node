@@ -10,17 +10,21 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
-from stellar_sdk import Account, Asset, Keypair, Network, StrKey, TransactionBuilder, xdr
+from stellar_sdk import Account, Address, Asset, Keypair, Network, StrKey, TransactionBuilder, xdr
 from stellar_sdk.xdr.sc_val_type import SCValType
 
 from komet_node.server import StellarRpcServer
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
 ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resolve(strict=True)
 ADDER_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'adder.wat').resolve(strict=True)
+STORAGE_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'storage.wat').resolve(strict=True)
 
 
 def wat_to_wasm(wat_path: Path) -> bytes:
@@ -130,7 +134,7 @@ def _create_account_xdr(keypair: Keypair, account: Account) -> str:
 
 
 @pytest.fixture
-def server(tmp_path: Path):
+def server(tmp_path: Path) -> Iterator[StellarRpcServer]:
     port = _find_free_port()
     srv = StellarRpcServer(
         host='localhost',
@@ -728,6 +732,238 @@ def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
 
     # All four transactions, including the non-Void invocation, advanced the ledger.
     assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 4
+
+
+# ----------------------------------------------------------------------
+# getLedgerEntries
+# ----------------------------------------------------------------------
+#
+# Spec: stellar-docs OpenRPC getLedgerEntries.json + stellar-rpc's Go serialization
+# (GetLedgerEntriesResponse). Result is {entries, latestLedger}; latestLedger and
+# lastModifiedLedgerSeq are JSON numbers; liveUntilLedgerSeq is optional (omitted when the
+# entry has no TTL); only found entries are returned; `key`/`xdr` are base64 LedgerKey /
+# LedgerEntryData strings.
+
+
+def _account_ledger_key(public_key: str) -> str:
+    return xdr.LedgerKey(
+        type=xdr.LedgerEntryType.ACCOUNT,
+        account=xdr.LedgerKeyAccount(account_id=Keypair.from_public_key(public_key).xdr_account_id()),
+    ).to_xdr()
+
+
+def _contract_code_ledger_key(wasm_hash: bytes) -> str:
+    return xdr.LedgerKey(
+        type=xdr.LedgerEntryType.CONTRACT_CODE,
+        contract_code=xdr.LedgerKeyContractCode(hash=xdr.Hash(wasm_hash)),
+    ).to_xdr()
+
+
+def _contract_data_ledger_key(contract_address: str, key: xdr.SCVal, durability: xdr.ContractDataDurability) -> str:
+    return xdr.LedgerKey(
+        type=xdr.LedgerEntryType.CONTRACT_DATA,
+        contract_data=xdr.LedgerKeyContractData(
+            contract=Address(contract_address).to_xdr_sc_address(),
+            key=key,
+            durability=durability,
+        ),
+    ).to_xdr()
+
+
+def _assert_ledger_entry_shape(entry: dict[str, Any], expected_key: str) -> None:
+    """Assert one entry matches the Go LedgerEntryResult serialization (base64 format)."""
+    assert {'key', 'xdr', 'lastModifiedLedgerSeq'} <= set(entry)
+    assert set(entry) <= {'key', 'xdr', 'lastModifiedLedgerSeq', 'liveUntilLedgerSeq'}
+    assert entry['key'] == expected_key
+    assert type(entry['xdr']) is str and entry['xdr'] != ''
+    assert type(entry['lastModifiedLedgerSeq']) is int  # JSON number, not string
+    if 'liveUntilLedgerSeq' in entry:  # optional; only Soroban entries carry a TTL
+        assert type(entry['liveUntilLedgerSeq']) is int
+
+
+def _send_tx(server: StellarRpcServer, keypair: Keypair, tb: TransactionBuilder) -> None:
+    env = tb.set_timeout(30).build()
+    env.sign(keypair)
+    res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
+    assert res['result']['status'] == 'PENDING'
+    get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
+    assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+
+
+def test_get_ledger_entries_account(server: StellarRpcServer) -> None:
+    """An ACCOUNT ledger key resolves to an AccountEntry; unknown keys are silently dropped."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    _send_tx(
+        server,
+        keypair,
+        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE).append_create_account_op(
+            destination=keypair.public_key, starting_balance='1000'
+        ),
+    )
+
+    account_key = _account_ledger_key(keypair.public_key)
+    missing_key = _account_ledger_key(Keypair.random().public_key)
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': [account_key, missing_key]})['result']
+
+    assert set(result) == {'entries', 'latestLedger'}
+    assert result['latestLedger'] == 1
+    assert type(result['latestLedger']) is int  # JSON number, not string
+
+    # Only the found entry is returned; the unknown key is not an error, just absent.
+    assert len(result['entries']) == 1
+    entry = result['entries'][0]
+    _assert_ledger_entry_shape(entry, account_key)
+    assert 0 <= entry['lastModifiedLedgerSeq'] <= result['latestLedger']
+
+    data = xdr.LedgerEntryData.from_xdr(entry['xdr'])
+    assert data.type == xdr.LedgerEntryType.ACCOUNT
+    assert data.account is not None
+    assert data.account.account_id == Keypair.from_public_key(keypair.public_key).xdr_account_id()
+    assert data.account.balance.int64 == 10_000_000_000  # 1000 XLM in stroops
+
+
+def test_get_ledger_entries_contract_code_and_data(server: StellarRpcServer) -> None:
+    """CONTRACT_CODE, the CONTRACT_DATA instance entry, and persistent CONTRACT_DATA storage."""
+    from stellar_sdk.utils import sha256
+
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def builder() -> TransactionBuilder:
+        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+
+    # Set up: create account, upload storage.wat, deploy, invoke store() which writes the
+    # persistent storage entry U32(7) -> U32(42).
+    _send_tx(server, keypair, builder().append_create_account_op(keypair.public_key, '1000'))
+    wasm_bytecode = wat_to_wasm(STORAGE_CONTRACT_WAT)
+    _send_tx(server, keypair, builder().append_upload_contract_wasm_op(wasm_bytecode))
+    wasm_hash = sha256(wasm_bytecode)
+    salt = b'\x00' * 32
+    _send_tx(server, keypair, builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
+    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+    _send_tx(server, keypair, builder().append_invoke_contract_function_op(contract_address, 'store', []))
+
+    code_key = _contract_code_ledger_key(wasm_hash)
+    instance_key = _contract_data_ledger_key(
+        contract_address,
+        xdr.SCVal(type=SCValType.SCV_LEDGER_KEY_CONTRACT_INSTANCE),
+        xdr.ContractDataDurability.PERSISTENT,
+    )
+    storage_key_scval = xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(7))
+    storage_key = _contract_data_ledger_key(contract_address, storage_key_scval, xdr.ContractDataDurability.PERSISTENT)
+
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': [code_key, instance_key, storage_key]})['result']
+    assert set(result) == {'entries', 'latestLedger'}
+    assert result['latestLedger'] == 4
+    assert type(result['latestLedger']) is int
+
+    entries = {entry['key']: entry for entry in result['entries']}
+    assert set(entries) == {code_key, instance_key, storage_key}
+    for key, entry in entries.items():
+        _assert_ledger_entry_shape(entry, key)
+
+    # CONTRACT_CODE: the uploaded wasm bytecode round-trips through the ledger entry.
+    code_data = xdr.LedgerEntryData.from_xdr(entries[code_key]['xdr'])
+    assert code_data.type == xdr.LedgerEntryType.CONTRACT_CODE
+    assert code_data.contract_code is not None
+    assert code_data.contract_code.hash.hash == wasm_hash
+    assert code_data.contract_code.code == wasm_bytecode
+
+    # CONTRACT_DATA (instance): the deployed contract's instance entry points at the wasm.
+    instance_data = xdr.LedgerEntryData.from_xdr(entries[instance_key]['xdr'])
+    assert instance_data.type == xdr.LedgerEntryType.CONTRACT_DATA
+    assert instance_data.contract_data is not None
+    assert instance_data.contract_data.contract == Address(contract_address).to_xdr_sc_address()
+    assert instance_data.contract_data.durability == xdr.ContractDataDurability.PERSISTENT
+    assert instance_data.contract_data.key.type == SCValType.SCV_LEDGER_KEY_CONTRACT_INSTANCE
+    assert instance_data.contract_data.val.type == SCValType.SCV_CONTRACT_INSTANCE
+    instance = instance_data.contract_data.val.instance
+    assert instance is not None
+    assert instance.executable.type == xdr.ContractExecutableType.CONTRACT_EXECUTABLE_WASM
+    assert instance.executable.wasm_hash is not None
+    assert instance.executable.wasm_hash.hash == wasm_hash
+
+    # CONTRACT_DATA (persistent): the value written by store() is readable.
+    storage_data = xdr.LedgerEntryData.from_xdr(entries[storage_key]['xdr'])
+    assert storage_data.type == xdr.LedgerEntryType.CONTRACT_DATA
+    assert storage_data.contract_data is not None
+    assert storage_data.contract_data.contract == Address(contract_address).to_xdr_sc_address()
+    assert storage_data.contract_data.durability == xdr.ContractDataDurability.PERSISTENT
+    assert storage_data.contract_data.key == storage_key_scval
+    assert storage_data.contract_data.val == xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(42))
+
+
+def test_get_ledger_entries_no_matches_returns_empty_entries(server: StellarRpcServer) -> None:
+    """Unknown keys are not an error: the result is an empty entries array."""
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': [_account_ledger_key(Keypair.random().public_key)]})[
+        'result'
+    ]
+    assert result['entries'] == []
+    assert result['latestLedger'] == 0
+    assert type(result['latestLedger']) is int
+
+
+def test_get_ledger_entries_unsupported_entry_type_is_not_found(server: StellarRpcServer) -> None:
+    """A well-formed key of a type komet-node does not track (DATA) is simply not found."""
+    data_key = xdr.LedgerKey(
+        type=xdr.LedgerEntryType.DATA,
+        data=xdr.LedgerKeyData(
+            account_id=Keypair.random().xdr_account_id(),
+            data_name=xdr.String64(b'config'),
+        ),
+    ).to_xdr()
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': [data_key]})['result']
+    assert result['entries'] == []
+
+
+def test_get_ledger_entries_xdr_format_base64_accepted(server: StellarRpcServer) -> None:
+    """xdrFormat 'base64' is the explicit spelling of the default and must be accepted."""
+    keys = [_account_ledger_key(Keypair.random().public_key)]
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': keys, 'xdrFormat': 'base64'})
+    assert 'error' not in result
+    assert result['result']['entries'] == []
+
+
+def test_get_ledger_entries_xdr_format_json_rejected(server: StellarRpcServer) -> None:
+    """komet-node does not support the JSON XDR format; asking for it is an invalid-params error."""
+    keys = [_account_ledger_key(Keypair.random().public_key)]
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': keys, 'xdrFormat': 'json'})
+    assert result['error']['code'] == -32602
+    assert type(result['error']['message']) is str and result['error']['message'] != ''
+
+
+def test_get_ledger_entries_invalid_xdr_format_rejected(server: StellarRpcServer) -> None:
+    keys = [_account_ledger_key(Keypair.random().public_key)]
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': keys, 'xdrFormat': 'xml'})
+    assert result['error']['code'] == -32602
+
+
+def test_get_ledger_entries_missing_keys_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'getLedgerEntries', {})
+    assert result['error']['code'] == -32602
+
+
+def test_get_ledger_entries_non_array_keys_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': 'AAAAAA=='})
+    assert result['error']['code'] == -32602
+
+
+def test_get_ledger_entries_non_string_key_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': [42]})
+    assert result['error']['code'] == -32602
+
+
+def test_get_ledger_entries_invalid_key_xdr_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': ['not-a-ledger-key']})
+    assert result['error']['code'] == -32602
+
+
+def test_get_ledger_entries_too_many_keys_returns_invalid_params(server: StellarRpcServer) -> None:
+    """The spec caps a request at 200 ledger keys."""
+    key = _account_ledger_key(Keypair.random().public_key)
+    result = _rpc(server.port(), 'getLedgerEntries', {'keys': [key] * 201})
+    assert result['error']['code'] == -32602
 
 
 # ---------------------------------------------------------------------------
