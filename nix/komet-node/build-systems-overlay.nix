@@ -12,6 +12,17 @@ let
   buildSystemOverrides = {
     # add dependencies here, e.g.:
     # pyperclip.setuptools = [ ];
+
+    # First-party RV packages are consumed as git dependencies (see uv.lock),
+    # so uv2nix builds them from source with build isolation disabled. Their
+    # build backends are therefore not on PYTHONPATH automatically and must be
+    # declared here, otherwise the wheel build fails with e.g.
+    # `ModuleNotFoundError: No module named 'hatchling'`.
+    komet-node.hatchling = [ ];   # this repo's root package
+    komet.hatchling = [ ];        # github.com/runtimeverification/komet
+    pykwasm.hatchling = [ ];      # wasm-semantics//pykwasm
+    py-wasm.setuptools = [ ];     # github.com/runtimeverification/py-wasm (legacy setup.py)
+    py-wasm.wheel = [ ];
   };
 in
 mapAttrs (

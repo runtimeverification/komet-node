@@ -29,6 +29,56 @@ if TYPE_CHECKING:
     from stellar_sdk.xdr.sc_val import SCVal
 
 
+def scval_to_json(scval: SCVal) -> dict:
+    """Encode a Stellar XDR SCVal as a JSON-serialisable dict for the node request envelope.
+
+    Key ordering matters: K pattern-matches on JSON key order, so these dicts must be
+    produced with keys in the same order as the ``#decodeArg`` rules in ``node.md``.
+    """
+    match scval.type:
+        case SCValType.SCV_BOOL:
+            assert scval.b is not None
+            return {'type': 'bool', 'value': scval.b}
+        case SCValType.SCV_I32:
+            assert scval.i32 is not None
+            return {'type': 'i32', 'value': scval.i32.int32}
+        case SCValType.SCV_U32:
+            assert scval.u32 is not None
+            return {'type': 'u32', 'value': scval.u32.uint32}
+        case SCValType.SCV_I64:
+            assert scval.i64 is not None
+            return {'type': 'i64', 'value': scval.i64.int64}
+        case SCValType.SCV_U64:
+            assert scval.u64 is not None
+            return {'type': 'u64', 'value': scval.u64.uint64}
+        case SCValType.SCV_I128:
+            assert scval.i128 is not None
+            val = (scval.i128.hi.int64 << 64) | scval.i128.lo.uint64
+            return {'type': 'i128', 'value': val}
+        case SCValType.SCV_U128:
+            assert scval.u128 is not None
+            val = (scval.u128.hi.uint64 << 64) | scval.u128.lo.uint64
+            return {'type': 'u128', 'value': val}
+        case SCValType.SCV_SYMBOL:
+            assert scval.sym is not None
+            return {'type': 'symbol', 'value': scval.sym.sc_symbol.decode()}
+        case SCValType.SCV_BYTES:
+            assert scval.bytes is not None
+            return {'type': 'bytes', 'value': scval.bytes.sc_bytes.hex()}
+        case SCValType.SCV_ADDRESS:
+            assert scval.address is not None
+            addr = scval.address
+            if addr.type == SCAddressType.SC_ADDRESS_TYPE_ACCOUNT:
+                assert addr.account_id is not None
+                assert addr.account_id.account_id.ed25519 is not None
+                raw = addr.account_id.account_id.ed25519.uint256
+                return {'type': 'address', 'addrType': 'account', 'value': raw.hex()}
+            assert addr.contract_id is not None
+            return {'type': 'address', 'addrType': 'contract', 'value': addr.contract_id.contract_id.hash.hex()}
+        case _:
+            raise NotImplementedError(f'Unsupported SCVal type for JSON encoding: {scval.type}')
+
+
 def sc_address_from_xdr(xdr: XDRSCAddress) -> SCAddress:
     """Convert an XDR SCAddress to a Komet SCAddress."""
     match xdr.type:
