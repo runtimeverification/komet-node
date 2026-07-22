@@ -23,6 +23,20 @@ if TYPE_CHECKING:
 _STROOPS_PER_XLM = Decimal('10000000')
 
 
+def malformed_tx_result_xdr() -> str:
+    """Base64 ``TransactionResult`` with code ``txMALFORMED`` and no fee charged.
+
+    Returned as ``errorResultXdr`` when ``sendTransaction`` rejects a transaction at
+    admission time (it decodes as XDR but cannot be processed by the semantics).
+    """
+    result = xdr.TransactionResult(
+        fee_charged=xdr.Int64(0),
+        result=xdr.TransactionResultResult(code=xdr.TransactionResultCode.txMALFORMED),
+        ext=xdr.TransactionResultExt(0),
+    )
+    return result.to_xdr()
+
+
 def _xlm_to_stroops(balance: object) -> int:
     """Convert an XLM amount (which may carry up to 7 decimals) to integer stroops.
 
@@ -34,6 +48,17 @@ def _xlm_to_stroops(balance: object) -> int:
     if stroops != stroops.to_integral_value():
         raise NodeInterpreterError(f'XLM amount has sub-stroop precision: {balance!r}')
     return int(stroops)
+
+
+class SimulationRejected(Exception):
+    """The transaction decoded fine but cannot be simulated.
+
+    Raised by :meth:`TransactionEncoder.build_simulate_request` for transactions the
+    simulator rejects up front (wrong operation set, unsupported host function). The
+    message is user-facing: the server reports it verbatim as the result-level ``error``
+    of the ``simulateTransaction`` response, mirroring how real stellar-rpc reports these
+    violations in the result body rather than as a JSON-RPC error.
+    """
 
 
 class TransactionEncoder:
@@ -57,12 +82,15 @@ class TransactionEncoder:
         rpc_id: Any,
         transaction_xdr: str,
         now: str,
-    ) -> tuple[dict[str, Any], list[KInner] | None]:
+    ) -> tuple[dict[str, Any], list[KInner] | None, dict[str, bytes]]:
         """
         Decode a transaction XDR envelope into a request envelope for the K semantics.
 
         Returns the envelope dict plus, for the wasm-upload path, the kasmer steps to embed
-        in the ``<program>`` cell (``None`` for the common JSON-steps path).
+        in the ``<program>`` cell (``None`` for the common JSON-steps path) and the raw
+        uploaded wasm bytes keyed by hex hash (empty for the JSON-steps path). The raw
+        bytes cannot be recovered from the K configuration (the module is stored parsed),
+        so the server persists them for ``getLedgerEntries`` CONTRACT_CODE lookups.
         """
         envelope = TransactionEnvelope.from_xdr(transaction_xdr, self.network_passphrase)
         transaction = envelope.transaction
@@ -82,8 +110,38 @@ class TransactionEncoder:
         # operation per transaction, so such a transaction is exactly one upload op, whose
         # step we build in K-AST form for direct injection into the <program> cell.
         if json_steps is not None:
-            return request, None
-        return request, self._upload_steps(transaction)
+            return request, None, {}
+        upload_steps, uploaded_wasms = self._upload_steps(transaction)
+        return request, upload_steps, uploaded_wasms
+
+    def build_simulate_request(self, rpc_id: Any, transaction_xdr: str, now: str) -> dict[str, Any]:
+        """
+        Decode a transaction XDR envelope into a ``simulateTransaction`` request envelope.
+
+        Per the spec, the transaction must contain exactly one ``InvokeHostFunction``
+        operation. Of the three host-function kinds, only contract invocation is
+        simulated: uploads and deploys carry a wasm payload / deterministic address rather
+        than a computed return value, and simulating them is not supported yet. Both
+        violations raise :class:`SimulationRejected` (a result-level error); a malformed
+        XDR string raises from ``TransactionEnvelope.from_xdr`` (an invalid-params error).
+        """
+        envelope = TransactionEnvelope.from_xdr(transaction_xdr, self.network_passphrase)
+        transaction = envelope.transaction
+
+        if len(transaction.operations) != 1 or not isinstance(transaction.operations[0], InvokeHostFunction):
+            raise SimulationRejected('transaction must contain exactly one InvokeHostFunction operation')
+        op = transaction.operations[0]
+        if op.host_function.type != xdr.HostFunctionType.HOST_FUNCTION_TYPE_INVOKE_CONTRACT:
+            raise SimulationRejected(f'host function type {op.host_function.type.name} cannot be simulated yet')
+
+        step = self._encode_operation(op, transaction.source)
+        assert step is not None  # the invoke-contract case always encodes
+        return {
+            'method': 'simulateTransaction',
+            'id': rpc_id,
+            'now': now,
+            'steps': [step],
+        }
 
     def _encode_steps(self, transaction: Transaction) -> list[dict] | None:
         """Encode each operation as a JSON step dict, or ``None`` if any op needs the wasm path.
@@ -147,9 +205,13 @@ class TransactionEncoder:
             case _:
                 return None
 
-    def _upload_steps(self, transaction: Transaction) -> list[KInner]:
-        """Build the kasmer ``uploadWasm`` step(s) for a wasm-upload transaction."""
+    def _upload_steps(self, transaction: Transaction) -> tuple[list[KInner], dict[str, bytes]]:
+        """Build the kasmer ``uploadWasm`` step(s) for a wasm-upload transaction.
+
+        Also returns the raw wasm bytes keyed by hex hash, for the server's side store.
+        """
         steps: list[KInner] = []
+        uploaded_wasms: dict[str, bytes] = {}
         for op in transaction.operations:
             match op:
                 case InvokeHostFunction(host_function=hf) if (
@@ -157,9 +219,10 @@ class TransactionEncoder:
                 ):
                     assert hf.wasm is not None
                     steps.append(upload_wasm(sha256(hf.wasm), wasm2kast(BytesIO(hf.wasm))))
+                    uploaded_wasms[sha256(hf.wasm).hex()] = hf.wasm
                 case _:
                     raise NotImplementedError(f'Unexpected operation in wasm-upload transaction: {type(op)}')
-        return steps
+        return steps, uploaded_wasms
 
     # ------------------------------------------------------------------
     # Address / contract-id helpers

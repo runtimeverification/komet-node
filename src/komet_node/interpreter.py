@@ -124,6 +124,8 @@ class NodeInterpreter:
         io_dir: Path,
         request: dict[str, Any],
         program_steps: list[KInner] | None = None,
+        *,
+        commit: bool = True,
     ) -> str | None:
         """
         Run a single RPC request envelope against the saved KORE configuration.
@@ -137,6 +139,10 @@ class NodeInterpreter:
         persist the new configuration to ``state.kore``. If ``response.json`` was not
         produced the request got stuck (a failed transaction) — we keep the previous
         ``state.kore`` and return ``None`` so the caller can synthesise a failure response.
+
+        With ``commit=False`` the resulting configuration is discarded even on success:
+        the run executes against the current state but never writes ``state.kore`` back.
+        This is what makes ``simulateTransaction`` a dry run.
         """
         state_file = state_file.resolve()
         io_dir = io_dir.resolve()
@@ -153,7 +159,8 @@ class NodeInterpreter:
         result = _llvm_interpret(self.definition.path, pattern, cwd=io_dir)
 
         if response_file.exists():
-            state_file.write_text(result.text)
+            if commit:
+                state_file.write_text(result.text)
             return response_file.read_text()
         return None
 
