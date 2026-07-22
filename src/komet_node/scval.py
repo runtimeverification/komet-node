@@ -24,6 +24,8 @@ from stellar_sdk import xdr as stellar_xdr
 from stellar_sdk.xdr.sc_address_type import SCAddressType
 from stellar_sdk.xdr.sc_val_type import SCValType
 
+_UINT64_MASK = (1 << 64) - 1
+
 if TYPE_CHECKING:
     from komet.scval import SCValue
     from stellar_sdk.xdr.sc_address import SCAddress as XDRSCAddress

@@ -38,7 +38,8 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 - `sendTransaction`'s `errorResultXdr` is always a generic `txMALFORMED` result (no per-cause codes such as `txBAD_SEQ` — sequence numbers, fees, and signatures are not modelled), and `diagnosticEventsXdr` is never populated (both fields are optional in the spec). `TRY_AGAIN_LATER` is never returned by design: it signals mempool backpressure, which cannot arise in a synchronous node without a mempool.
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
 - The `xdrFormat` parameter is accepted on `getTransaction`, `sendTransaction`, `getTransactions`, `getLedgers`, and `getLedgerEntries`, but only the default `'base64'` is supported; `'json'` is rejected with `-32602`.
-- `simulateTransaction`, `getEvents`, and TTL/footprint operations are not implemented.
+- `simulateTransaction` only simulates invoke-contract host functions (not uploads/deploys); `auth` is always empty, `minResourceFee`/`transactionData` are synthetic constants, and `events`/`restorePreamble`/`stateChanges` and the `resourceConfig`/`authMode`/`xdrFormat` parameters are not supported. `ScMap` return values are not yet encoded.
+- `getEvents` and TTL/footprint operations are not implemented.
 - `getFeeStats` reports constant distributions (there is no fee market); only its `latestLedger` is live.
 - `getTransactions` / `getLedgers` serve only ledgers with an index file under `ledgers/`; io-dirs created before the ledger index existed resume fine, but their earlier ledgers do not appear in the history.
 - `getLedgerEntries` covers the entry types the K state tracks (`ACCOUNT`, `CONTRACT_DATA`, `CONTRACT_CODE`); other key types are reported as not found. `lastModifiedLedgerSeq` is approximated by the current ledger (per-entry modification ledgers are not tracked), and only the balance is real in `ACCOUNT` entries (sequence number, thresholds, etc. are synthesised constants).

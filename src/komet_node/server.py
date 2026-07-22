@@ -12,12 +12,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from stellar_sdk import Network, TransactionEnvelope
+from stellar_sdk import Network, TransactionEnvelope, xdr
 
 from komet_node.interpreter import NodeInterpreter
 from komet_node.ledger import build_ledger_artifacts
 from komet_node.ledger_entries import InvalidParamsError, format_ledger_entries_response, ledger_key_descriptors
-from komet_node.transaction import TransactionEncoder, malformed_tx_result_xdr
+from komet_node.scval import scval_from_json
+from komet_node.transaction import SimulationRejected, TransactionEncoder, malformed_tx_result_xdr
 
 if TYPE_CHECKING:
     from http.server import HTTPServer as HTTPServerType
@@ -44,8 +45,37 @@ _COMMIT_HASH: Final = '0' * 40
 _BUILD_TIMESTAMP: Final = '1970-01-01T00:00:00'
 _CAPTIVE_CORE_VERSION: Final = f'komet {importlib.metadata.version("komet")} (K semantics of Soroban)'
 
-# Only sendTransaction executes a transaction. traceTransaction is a read-only lookup of the
-# trace stored on a previously executed transaction's receipt (see _read_only_envelope).
+# Synthetic minimum resource fee (in stroops) reported by simulateTransaction. The K
+# semantics do not meter resources, so any plausible constant is as honest as another;
+# clients only need a stringified number they can add on top of the inclusion fee.
+_MIN_RESOURCE_FEE: Final = '100000'
+
+
+def _empty_transaction_data() -> str:
+    """Minimal valid ``SorobanTransactionData``: empty footprint, all-zero resources.
+
+    komet-node does not compute ledger footprints or resource usage, so all-zero values
+    are the honest choice; the field exists because clients expect to XDR-decode it.
+    """
+    data = xdr.SorobanTransactionData(
+        ext=xdr.SorobanTransactionDataExt(0),
+        resources=xdr.SorobanResources(
+            footprint=xdr.LedgerFootprint(read_only=[], read_write=[]),
+            instructions=xdr.Uint32(0),
+            disk_read_bytes=xdr.Uint32(0),
+            write_bytes=xdr.Uint32(0),
+        ),
+        resource_fee=xdr.Int64(0),
+    )
+    return data.to_xdr()
+
+
+_TRANSACTION_DATA: Final = _empty_transaction_data()
+
+# Only sendTransaction executes and commits a transaction. simulateTransaction also executes
+# one, but as a dry run with its own dispatch path (see _handle_simulate); traceTransaction
+# is a read-only lookup of the trace stored on a previously executed transaction's receipt
+# (see _read_only_envelope).
 _TX_METHODS: Final = ('sendTransaction',)
 
 # Methods whose spec accepts an optional `xdrFormat` param (protocols/rpc:
@@ -297,6 +327,9 @@ class StellarRpcServer:
             self._record_closed_ledger(envelope, now)
             return response
 
+        if method == 'simulateTransaction':
+            return self._handle_simulate(params, request_id, now)
+
         if method == 'getLedgerEntries':
             return self._get_ledger_entries(params, request_id, now)
 
@@ -366,6 +399,63 @@ class StellarRpcServer:
         if method in ('getTransactions', 'getLedgers'):
             return self._history_envelope(method, params, request_id, base)
         return None
+
+    # ------------------------------------------------------------------
+    # simulateTransaction
+    # ------------------------------------------------------------------
+
+    def _handle_simulate(self, params: dict[str, Any], request_id: Any, now: str) -> str:
+        """Dispatch a ``simulateTransaction`` call: a dry run that commits nothing.
+
+        The K semantics execute the invocation against the current state and report the
+        return value (see the simulateTransaction section of ``node.md``); the run is not
+        persisted (``commit=False``), no receipt or trace is written, and the ledger does
+        not advance. Simulation failures are reported in the result body (``{error,
+        latestLedger}``), matching real stellar-rpc; only an undecodable ``transaction``
+        param is a JSON-RPC error.
+        """
+        transaction = params.get('transaction')
+        if not isinstance(transaction, str):
+            return _error_str(request_id, -32602, "Invalid params: 'transaction' (XDR string) is required")
+        try:
+            envelope = self.encoder.build_simulate_request(request_id, transaction, now)
+        except SimulationRejected as err:
+            return json.dumps(self._simulate_error_response(request_id, str(err)))
+        except Exception:
+            traceback.print_exc()
+            return _error_str(request_id, -32602, 'Invalid params: could not process transaction')
+
+        response = self.interpreter.run(self.state_file, self.io_dir, envelope, None, commit=False)
+        if response is None:
+            # The run got stuck: the invocation could not be executed at all (e.g. the
+            # target contract does not exist). Report it as a simulation error.
+            return json.dumps(self._simulate_error_response(request_id, 'transaction simulation failed'))
+        return json.dumps(self._simulate_response(request_id, json.loads(response)['result']))
+
+    def _simulate_response(self, rpc_id: Any, k_result: dict[str, Any]) -> dict[str, Any]:
+        """Map the internal K simulation result to the spec response shape.
+
+        This is the one read path where Python builds response content: the spec requires
+        the return value as base64 SCVal XDR and ``transactionData`` as base64
+        ``SorobanTransactionData``, and K can construct neither (no XDR encoder, no base64
+        hook). ``latestLedger`` and the error/success split come from K unchanged.
+        """
+        if 'error' in k_result:
+            result: dict[str, Any] = {'error': k_result['error'], 'latestLedger': k_result['latestLedger']}
+        else:
+            result = {
+                'latestLedger': k_result['latestLedger'],
+                'minResourceFee': _MIN_RESOURCE_FEE,
+                'results': [{'xdr': scval_from_json(k_result['returnValue']).to_xdr(), 'auth': []}],
+                'transactionData': _TRANSACTION_DATA,
+            }
+        return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+
+    def _simulate_error_response(self, rpc_id: Any, message: str) -> dict[str, Any]:
+        """Build the ``{error, latestLedger}`` result for a simulation that never ran in K."""
+        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
+        result = {'error': message, 'latestLedger': metadata.get('latest_ledger', 0)}
+        return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
 
     def _history_envelope(
         self, method: str, params: dict[str, Any], request_id: Any, base: dict[str, Any]

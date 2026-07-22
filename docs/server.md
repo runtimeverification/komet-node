@@ -43,7 +43,7 @@ server = StellarRpcServer(io_dir=Path('out'))
 server.handle_rpc('sendTransaction', {'transaction': xdr})
 ```
 
-For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `getTransactions`, `getLedgers`, `traceTransaction`) it builds a small envelope and runs it. For the history methods (`getTransactions`, `getLedgers`) the server also validates the pagination parameters — limit range, `startLedger` bounds, `cursor`/`startLedger` exclusivity — and resolves the cursor to the first ledger sequence to serve, because the JSON-RPC parameter-error path lives here. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the exceptions are the failure fallback (below) and the per-ledger XDR artifacts (`_record_closed_ledger`), which K cannot construct. Each call is logged to stderr.
+For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for `simulateTransaction` it builds the envelope with `encoder.build_simulate_request` and runs it without committing; for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `getTransactions`, `getLedgers`, `getLedgerEntries`, `traceTransaction`) it builds a small envelope and runs it. For the history methods (`getTransactions`, `getLedgers`) the server also validates the pagination parameters — limit range, `startLedger` bounds, `cursor`/`startLedger` exclusivity — and resolves the cursor to the first ledger sequence to serve, because the JSON-RPC parameter-error path lives here. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the exceptions are the failure fallback (below), the per-ledger XDR artifacts (`_record_closed_ledger`), and the XDR fields of the `simulateTransaction` response, which K cannot construct or serialize. Each call is logged to stderr.
 
 ---
 
@@ -157,6 +157,29 @@ Resubmitting a transaction whose hash already has a receipt returns status `DUPL
 
 A transaction that decodes as XDR but cannot be processed (e.g. it contains an operation the semantics do not support) is rejected at admission time with status `ERROR` and an `errorResultXdr` carrying a `txMALFORMED` `TransactionResult` — mirroring how real stellar-rpc reports core's admission rejections. Such a transaction never reaches the ledger: no receipt is stored (`getTransaction` stays `NOT_FOUND`) and the ledger does not advance. Undecodable XDR remains a plain `-32602 Invalid params` error, as in real stellar-rpc. `TRY_AGAIN_LATER` is never returned: it signals mempool backpressure, and komet-node executes synchronously without a mempool, so the condition it reports cannot arise.
 
+### `simulateTransaction`
+
+`simulateTransaction` takes a base64-encoded XDR transaction envelope (which may be unsigned) containing exactly one `InvokeHostFunction` operation and executes it as a dry run: the invocation runs against the current world state, but nothing is committed — no receipt, no trace, no ledger bump, and the resulting configuration is discarded (`interpreter.run(..., commit=False)`).
+
+**Response** (success):
+```json
+{
+  "latestLedger": 4,
+  "minResourceFee": "100000",
+  "results": [ { "xdr": "<base64 SCVal XDR>", "auth": [] } ],
+  "transactionData": "<base64 SorobanTransactionData XDR>"
+}
+```
+
+`results[0].xdr` is the host function's return value. The K semantics report it as a JSON-encoded ScVal (see the simulateTransaction section of `node.md`), and the server serializes it to SCVal XDR (`scval_from_json` in `scval.py`) — K has no XDR encoder and no base64 hook, so this is the one read path where Python builds part of the response content. `minResourceFee` is a synthetic constant and `transactionData` an empty-footprint, all-zero-resources placeholder, because the semantics do not meter resources. `auth` is always empty (authorization recording is not implemented).
+
+**Response** (failure — the invocation trapped, the target contract does not exist, the transaction is not a single `InvokeHostFunction`, or the host function is an upload/deploy, which cannot be simulated yet):
+```json
+{ "error": "<reason>", "latestLedger": 4 }
+```
+
+Failures are reported in the result body, matching real stellar-rpc; only an undecodable `transaction` parameter is a JSON-RPC error (`-32602`). A failed simulation likewise commits nothing. The optional `events`, `restorePreamble`, and `stateChanges` response fields and the `resourceConfig`/`authMode`/`xdrFormat` parameters are not supported.
+
 ### `traceTransaction` (komet-specific extension)
 
 `traceTransaction` is **not part of the Stellar RPC specification** — it exists only on komet-node, and clients must not expect it from real Stellar RPC endpoints. It keeps its plain name rather than a vendor-prefixed one (`komet_traceTransaction`): the official spec has no method of that name and none is announced, so there is no collision to avoid, and renaming would break every existing client for no gain. If stellar-rpc ever claims the name, the method will be renamed with a prefix.
@@ -249,7 +272,7 @@ This is the one method whose response the server post-processes: the semantics l
 
 ## Failure fallback
 
-A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. Only `sendTransaction` executes a transaction, so it is the only method that reaches this path. The server then synthesises the response in Python: it writes a `FAILED` `receipts/receipt_<hash>.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING`. This is the only response content the server builds itself.
+A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. For `sendTransaction` the server then synthesises the response in Python: it writes a `FAILED` `receipts/receipt_<hash>.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING`. A stuck `simulateTransaction` run is answered with a result-level `{error, latestLedger}` and leaves no artifacts behind.
 
 ---
 
