@@ -91,8 +91,11 @@ def scval_from_json(value: dict) -> SCVal:
     encoders (``#scVal2JSON``, ``#scValJSON``, ``#scValToJSON`` in ``node.md``); the ``map``
     case accepts both entry shapes they emit — ``{"key": ..., "val": ...}`` objects and
     ``[key, val]`` pairs — so keep the encoders and this decoder in sync. Raises
-    ``NotImplementedError`` for values with no JSON form (``{"type": "unsupported"}``).
+    ``NotImplementedError`` for values with no JSON form (``{"type": "unsupported"}`` or a
+    non-object such as the ``null`` the event capture stages for an unrepresentable value).
     """
+    if not isinstance(value, dict):
+        raise NotImplementedError(f'Unsupported SCVal JSON encoding: {value!r}')
     match value.get('type'):
         case 'bool':
             return stellar_xdr.SCVal(type=SCValType.SCV_BOOL, b=bool(value['value']))

@@ -16,6 +16,7 @@ class StellarRpcServer:
     traces_dir:   Path               # io_dir / 'traces'    — trace_<hash>.jsonl per transaction
     ledgers_dir:  Path               # io_dir / 'ledgers'   — ledger_<seq>.json per closed ledger
     requests_dir: Path               # io_dir / 'requests'  — request_<n>.json archive
+    events_dir:   Path               # io_dir / 'events'    — events_<ledger>.json per ledger
 ```
 
 The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `BaseHTTPRequestHandler` reads each POST body and calls `_handle`, which parses the JSON-RPC frame and delegates to `handle_rpc`.
@@ -43,7 +44,7 @@ server = StellarRpcServer(io_dir=Path('out'))
 server.handle_rpc('sendTransaction', {'transaction': xdr})
 ```
 
-For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for `simulateTransaction` it builds the envelope with `encoder.build_simulate_request` and runs it without committing; for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `getTransactions`, `getLedgers`, `getLedgerEntries`, `traceTransaction`) it builds a small envelope and runs it. For the history methods (`getTransactions`, `getLedgers`) the server also validates the pagination parameters — limit range, `startLedger` bounds, `cursor`/`startLedger` exclusivity — and resolves the cursor to the first ledger sequence to serve, because the JSON-RPC parameter-error path lives here. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the exceptions are the failure fallback (below), the per-ledger XDR artifacts (`_record_closed_ledger`), and the XDR fields of the `simulateTransaction` response, which K cannot construct or serialize. Each call is logged to stderr.
+For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for `simulateTransaction` it builds the envelope with `encoder.build_simulate_request` and runs it without committing; for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `getTransactions`, `getLedgers`, `getLedgerEntries`, `getEvents`, `traceTransaction`) it builds a small envelope and runs it. For the history methods (`getTransactions`, `getLedgers`) and `getEvents` the server also validates the request parameters — pagination limits, ledger-window bounds, cursor format and exclusivity, filter/topic counts — because the JSON-RPC parameter-error path lives here. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the exceptions are the failure fallback (below), the per-ledger XDR artifacts (`_record_closed_ledger`), the finished per-ledger event files (`_finalize_events`), and the XDR fields of the `simulateTransaction` response, which K cannot construct or serialize. Each call is logged to stderr.
 
 ---
 
@@ -66,7 +67,7 @@ At construction the server prepares the *io dir*, where `state.kore` lives at `i
 - **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}`.
 - **`state.kore` present** — it is used as-is, and `metadata.json` is seeded only if missing. This lets you resume a previous session (ledger counter and stored receipts included) or start against a pre-built state.
 
-In both cases the server creates the `receipts/`, `traces/`, `ledgers/`, and `requests/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
+In both cases the server creates the `receipts/`, `traces/`, `ledgers/`, `requests/`, `wasms/`, and `events/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
 
 Once the socket is bound, `serve` logs three lines to stderr: whether it is starting from a fresh state (an empty io-dir) or resuming an existing one (with the latest ledger), the io-dir path, and the listening address. Instruction tracing is always on, so every transaction the semantics run produces a trace. (Tracing only produces records for contract invocations.)
 
@@ -267,6 +268,30 @@ Per-ledger `ledgerCloseTime` is a *string* holding a decimal number (matching re
 ```
 
 This is the one method whose response the server post-processes: the semantics look the keys up in the K state and answer with intermediate JSON entries, and `ledger_entries.py` re-encodes them as `LedgerEntryData` XDR (K cannot produce XDR). Because the K state keeps uploaded wasm parsed, the server stores the raw bytes under `wasms/<hash>.wasm` at upload time and reattaches them to `CONTRACT_CODE` entries. The semantics do not track per-entry modification ledgers, so `lastModifiedLedgerSeq` reports the current ledger; `ACCOUNT` entries carry the real balance but synthesised constants for the remaining required fields (sequence number 0, master weight 1, no signers).
+
+### `getEvents`
+
+`getEvents` returns the contract events emitted in a ledger window — `startLedger` (inclusive) to `endLedger` (exclusive) — optionally narrowed by up to five filters (`type`, `contractIds`, `topics` with `*`/`**` wildcards) and paginated with `pagination.cursor` / `pagination.limit` (default 100). A cursor replaces `startLedger`/`endLedger` and resumes strictly after the last returned event.
+
+Events are captured during `sendTransaction`: the semantics intercept the `contract_event` host function and stage each event's topics and data, and after a successful run the server converts the staged records into one finished `events/events_<ledger>.json` per ledger (`_finalize_events` — the base64 SCVal XDR, strkey, and TOID encodings are XDR work K cannot do). The K `getEvents` rules scan, filter, and paginate those files. Parameter validation lives in `_get_events_envelope`; `xdrFormat: "json"` is not supported and is rejected with `-32602`.
+
+**Response**:
+```json
+{
+  "latestLedger": 4,
+  "events": [
+    {
+      "type": "contract", "ledger": 4, "ledgerClosedAt": "2024-05-18T04:00:00Z",
+      "contractId": "C...", "id": "0000000017179873280-0000000000",
+      "inSuccessfulContractCall": true, "txHash": "<64-char hex>",
+      "topic": ["<base64 SCVal XDR>"], "value": "<base64 SCVal XDR>"
+    }
+  ],
+  "cursor": "0000000021474836480-0000000000"
+}
+```
+
+`system` events are never emitted (the semantics have no source of them), and events carrying values with no staging representation (maps, errors, 256-bit ints) are dropped with a warning rather than served with fabricated XDR.
 
 ---
 

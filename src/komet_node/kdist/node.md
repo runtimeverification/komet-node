@@ -60,6 +60,8 @@ module NODE
                    | #respondError( JSON, Int, String )
                    | #respondHealth( JSON, String, Int )
                    | #respondLatestLedger( JSON, Int, Int )
+                   | #getEvents( JSON, Int )
+                   | #respondEvents( JSON, Int, JSONs )
 
     syntax Step ::= setLedgerSequence(Int)    [symbol(setLedgerSequence)]
  // ----------------------------------------------------------------------
@@ -1187,6 +1189,304 @@ general rule would yield `"0"` (Base2String of 0), which `#padZeros` cannot trim
 
     rule #padZeros( S, N ) => #padZeros( "0" +String S, N ) requires lengthString(S) <Int N
     rule #padZeros( S, _ ) => S                              [owise]
+```
+
+## getEvents
+
+Contract events are captured during `sendTransaction` (see "Event capture" below) and
+persisted by the Python server as one finished JSON array per ledger in
+`events/events_<ledger>.json` — each entry already in the spec's Event shape (base64 SCVal
+XDR topics/value, strkey contract id, TOID-style id). `getEvents` scans the requested
+ledger window, applies the request's filters, and paginates.
+
+The Python server validates the request parameters (types, filter/topic counts, cursor
+format, `xdrFormat`) and guarantees the envelope carries: `startLedger` (Int or null),
+`endLedger` (Int or null), `filters` (array), `cursor` (String or null, exclusive with
+`startLedger`/`endLedger`), and `limit` (Int ≥ 1). Only the state-dependent check — the
+requested window against the chain tip — is performed here.
+
+```k
+    rule <k> #dispatchMethod( "getEvents", REQ )
+          => #getEvents( REQ, #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ) )
+             ...
+         </k>
+
+    rule [getEvents-start-beyond-latest]:
+        <k> #getEvents( REQ, LL )
+         => #respondError( #getJSON( "id", REQ ), -32600,
+                "startLedger must be within the ledger range: 1 - " +String Int2String( LL ) )
+            ...
+        </k>
+      requires #getJSON( "cursor", REQ ) ==K null
+       andBool #getInt( "startLedger", REQ ) >Int LL
+
+    rule [getEvents-scan]:
+        <k> #getEvents( REQ, LL )
+         => #respondEvents( REQ, LL,
+                #matchingEvents( #scanStart( REQ ), #scanEnd( REQ, LL ), #afterId( REQ ), #getJSON( "filters", REQ ) ) )
+            ...
+        </k>
+      [owise]
+
+    rule <k> #respondEvents( REQ, LL, MATCHED )
+          => #respond( #getJSON( "id", REQ ), {
+                 "latestLedger" : LL,
+                 "events"       : [ #takeJSONs( #getInt( "limit", REQ ), MATCHED ) ],
+                 "cursor"       : #eventsPageCursor( MATCHED, #getInt( "limit", REQ ), #scanEnd( REQ, LL ) )
+             })
+             ...
+         </k>
+```
+
+The scan window: `startLedger` is inclusive, `endLedger` exclusive, both capped at the
+latest ledger. A pagination cursor replaces `startLedger` — scanning resumes at the
+cursor's ledger (its TOID's high 32 bits) and only events with an id strictly greater than
+the cursor are returned. Event ids are fixed-width zero-padded, so id order is plain string
+order.
+
+```k
+    syntax Int ::= #scanStart( JSON ) [function]
+ // --------------------------------------------
+    rule #scanStart( REQ ) => #cursorLedger( #getString( "cursor", REQ ) )
+      requires #getJSON( "cursor", REQ ) =/=K null
+    rule #scanStart( REQ ) => #getInt( "startLedger", REQ ) [owise]
+
+    syntax Int ::= #cursorLedger( String ) [function]
+ // -------------------------------------------------
+    rule #cursorLedger( C ) => String2Int( substrString( C, 0, 19 ) ) >>Int 32
+
+    syntax Int ::= #scanEnd( JSON, Int ) [function]   // exclusive end of the scan window
+ // -------------------------------------------------------------------------------------
+    rule #scanEnd( REQ, LL ) => minInt( #getInt( "endLedger", REQ ), LL +Int 1 )
+      requires #getJSON( "endLedger", REQ ) =/=K null
+    rule #scanEnd( _, LL ) => LL +Int 1 [owise]
+
+    syntax String ::= #afterId( JSON ) [function]   // only events with id > this are returned
+ // ------------------------------------------------------------------------------------------
+    rule #afterId( REQ ) => #getString( "cursor", REQ )
+      requires #getJSON( "cursor", REQ ) =/=K null
+    rule #afterId( _ ) => "" [owise]
+
+    syntax String ::= #eventsFile( Int ) [function, symbol(eventsFile)]
+ // -------------------------------------------------------------------
+    rule #eventsFile( L ) => "events/events_" +String Int2String( L ) +String ".json"
+
+    syntax JSONs ::= #matchingEvents( Int, Int, String, JSON ) [function]
+ // ---------------------------------------------------------------------
+    rule #matchingEvents( L, END, _, _ ) => .JSONs requires L >=Int END
+    rule #matchingEvents( L, END, AFTER, FILTERS )
+      => #concatJSONs( #filterEvents( #ledgerEvents( L ), AFTER, FILTERS ),
+                       #matchingEvents( L +Int 1, END, AFTER, FILTERS ) )
+      [owise]
+
+    syntax JSONs ::= #ledgerEvents( Int ) [function]
+ // ------------------------------------------------
+    rule #ledgerEvents( L ) => #arrayJSONs( String2JSON( {#readFile( #eventsFile( L ) )}:>String ) )
+      requires #fileExists( #eventsFile( L ) )
+    rule #ledgerEvents( _ ) => .JSONs [owise]
+
+    syntax JSONs ::= #arrayJSONs( JSON ) [function]
+ // -----------------------------------------------
+    rule #arrayJSONs( [ ES ] ) => ES
+    rule #arrayJSONs( _ )      => .JSONs [owise]
+
+    syntax JSONs ::= #filterEvents( JSONs, String, JSON ) [function]
+ // ----------------------------------------------------------------
+    rule #filterEvents( .JSONs, _, _ ) => .JSONs
+    rule #filterEvents( ( E, ES ), AFTER, FILTERS ) => ( E, #filterEvents( ES, AFTER, FILTERS ) )
+      requires AFTER <String #getString( "id", E ) andBool #matchesFilters( E, FILTERS )
+    rule #filterEvents( ( _, ES ), AFTER, FILTERS ) => #filterEvents( ES, AFTER, FILTERS ) [owise]
+```
+
+An event passes if any filter matches (or the filter list is empty); a filter matches if
+all of its present criteria — `type`, `contractIds`, `topics` — match.
+
+```k
+    syntax Bool ::= #matchesFilters( JSON, JSON ) [function]
+ // --------------------------------------------------------
+    rule #matchesFilters( _, null )       => true
+    rule #matchesFilters( _, [ .JSONs ] ) => true
+    rule #matchesFilters( E, [ FS ] )     => #matchesAnyFilter( E, FS ) [owise]
+
+    syntax Bool ::= #matchesAnyFilter( JSON, JSONs ) [function]
+ // -----------------------------------------------------------
+    rule #matchesAnyFilter( _, .JSONs )     => false
+    rule #matchesAnyFilter( E, ( F, FS ) )  => #matchesFilter( E, F ) orBool #matchesAnyFilter( E, FS )
+
+    syntax Bool ::= #matchesFilter( JSON, JSON ) [function]
+ // -------------------------------------------------------
+    rule #matchesFilter( E, F )
+      => #matchesType( #getString( "type", E ), #getJSON( "type", F ) )
+         andBool #matchesContractIds( #getString( "contractId", E ), #getJSON( "contractIds", F ) )
+         andBool #matchesTopicFilters( #getJSON( "topic", E ), #getJSON( "topics", F ) )
+
+    syntax Bool ::= #matchesType( String, JSON ) [function]
+ // -------------------------------------------------------
+    rule #matchesType( _, null )     => true
+    rule #matchesType( T, F:String ) => T ==String F
+    rule #matchesType( _, _ )        => false [owise]
+
+    syntax Bool ::= #matchesContractIds( String, JSON ) [function]
+ // --------------------------------------------------------------
+    rule #matchesContractIds( _, null )            => true
+    rule #matchesContractIds( _, [ .JSONs ] )      => true
+    rule #matchesContractIds( C, [ I0:JSON, IS ] ) => #containsString( C, ( I0, IS ) )
+    rule #matchesContractIds( _, _ )               => false [owise]
+
+    syntax Bool ::= #containsString( String, JSONs ) [function]
+ // -----------------------------------------------------------
+    rule #containsString( _, .JSONs )           => false
+    rule #containsString( S, ( S2:String, SS ) ) => S ==String S2 orBool #containsString( S, SS )
+    rule #containsString( S, ( _, SS ) )         => #containsString( S, SS ) [owise]
+```
+
+Topic filters: each filter is a list of segment matchers compared pairwise against the
+event's topics — a base64 SCVal XDR string for an exact match, `"*"` for exactly one
+segment, and a final `"**"` for zero or more remaining segments.
+
+```k
+    syntax Bool ::= #matchesTopicFilters( JSON, JSON ) [function]
+ // -------------------------------------------------------------
+    rule #matchesTopicFilters( _, null )              => true
+    rule #matchesTopicFilters( _, [ .JSONs ] )        => true
+    rule #matchesTopicFilters( T, [ TF:JSON, TFS ] )  => #anyTopicFilter( T, ( TF, TFS ) )
+    rule #matchesTopicFilters( _, _ )                 => false [owise]
+
+    syntax Bool ::= #anyTopicFilter( JSON, JSONs ) [function]
+ // ---------------------------------------------------------
+    rule #anyTopicFilter( _, .JSONs )      => false
+    rule #anyTopicFilter( T, ( TF, TFS ) ) => #matchesTopicFilter( T, TF ) orBool #anyTopicFilter( T, TFS )
+
+    syntax Bool ::= #matchesTopicFilter( JSON, JSON ) [function]
+ // ------------------------------------------------------------
+    rule #matchesTopicFilter( [ TS ], [ MS ] ) => #matchSegments( TS, MS )
+    rule #matchesTopicFilter( _, _ )           => false [owise]
+
+    syntax Bool ::= #matchSegments( JSONs, JSONs ) [function]
+ // ---------------------------------------------------------
+    rule #matchSegments( _, ( "**", .JSONs ) )              => true
+    rule #matchSegments( .JSONs, .JSONs )                   => true
+    rule #matchSegments( ( _:JSON, TS ), ( "*", MS ) )      => #matchSegments( TS, MS )
+    rule #matchSegments( ( T:String, TS ), ( M:String, MS ) )
+      => T ==String M andBool #matchSegments( TS, MS )
+      requires M =/=String "*" andBool M =/=String "**"
+    rule #matchSegments( _, _ )                             => false [owise]
+```
+
+Pagination: at most `limit` events are returned. The response cursor resumes the scan — the
+id of the last returned event when the page filled up, otherwise a position just past the
+scanned window (the TOID of the window's exclusive end ledger, which every later event id
+exceeds).
+
+```k
+    syntax JSONs ::= #takeJSONs( Int, JSONs ) [function, total]
+ // -----------------------------------------------------------
+    rule #takeJSONs( N, _ )          => .JSONs requires N <=Int 0
+    rule #takeJSONs( N, .JSONs )     => .JSONs requires N >Int 0
+    rule #takeJSONs( N, ( E, ES ) )  => ( E, #takeJSONs( N -Int 1, ES ) ) requires N >Int 0
+
+    syntax String ::= #lastEventId( JSONs ) [function]
+ // --------------------------------------------------
+    rule #lastEventId( ( E, .JSONs ) ) => #getString( "id", E )
+    rule #lastEventId( ( _, ES ) )     => #lastEventId( ES ) [owise]
+
+    syntax String ::= #eventsPageCursor( JSONs, Int, Int ) [function]
+ // -----------------------------------------------------------
+    rule #eventsPageCursor( MATCHED, LIMIT, ENDEXCL ) => #ledgerCursor( ENDEXCL )
+      requires #lengthJSONs( MATCHED ) <=Int LIMIT
+    rule #eventsPageCursor( MATCHED, LIMIT, _ ) => #lastEventId( #takeJSONs( LIMIT, MATCHED ) ) [owise]
+
+    syntax String ::= #ledgerCursor( Int ) [function]
+ // -------------------------------------------------
+    rule #ledgerCursor( L ) => #padLeft( Int2String( L <<Int 32 ), 19 ) +String "-" +String #padLeft( "0", 10 )
+```
+
+###############################################################################
+# Event capture
+
+The upstream soroban semantics implement the `contract_event` host function ("x"/"1") as a
+no-op that drops the topics and data. This rule shadows it (priority 40, ahead of the
+upstream rule's default 50): it resolves the topics vector and the data value from the host
+objects and appends one JSON record per event to `events_staged.jsonl` in the io-dir —
+mirroring how the tracer appends to the trace file — before yielding the same `Void` result
+as upstream. The Python server deletes the staging file before each transaction runs and,
+after a successful `sendTransaction`, converts the staged records into the finished
+`events/events_<ledger>.json` that `getEvents` serves (base64 SCVal XDR and strkey ids are
+XDR work that K cannot do).
+
+```k
+    rule [node-contract-event]:
+        <instrs> hostCall ( "x" , "1" , [ i64  i64  .ValTypes ] -> [ i64  .ValTypes ] )
+              => #stageEvent(HostVal(TOPICS), HostVal(DATA))
+              ~> toSmall(Void)
+                 ...
+        </instrs>
+        <locals>
+            0 |-> <i64> TOPICS
+            1 |-> <i64> DATA
+        </locals>
+      [priority(40)]
+
+    syntax InternalInstr ::= #stageEvent( HostVal, HostVal )   [symbol(stageEvent)]
+ // -------------------------------------------------------------------------------
+    rule [stageEvent]:
+        <instrs> #stageEvent(TOPICS, DATA)
+              => #appendFile( "events_staged.jsonl",
+                     JSON2String({
+                         "contractId" : #bytesHex(ADDR),
+                         "topics"     : [ #topicsJSONs(HostVal2ScVal(TOPICS, OBJS, RELS)) ],
+                         "data"       : #eventScValJSON(HostVal2ScVal(DATA, OBJS, RELS))
+                     }) +String "\n" )
+                 ...
+        </instrs>
+        <callee> Contract(ADDR) </callee>
+        <hostObjects> OBJS </hostObjects>
+        <relativeObjects> RELS </relativeObjects>
+```
+
+`#eventScValJSON` serialises a resolved `ScVal` in the same `{"type": ..., "value": ...}` scheme
+that `#decodeArg` consumes (see `scval.py`), extended with `vec`, `string`, and `void`.
+Values with no JSON representation here (maps, errors, 256-bit ints) become `null`; the
+Python side skips such events with a warning rather than fabricating XDR for them.
+
+```k
+    syntax JSONs ::= #topicsJSONs( ScVal ) [function, total]
+ // --------------------------------------------------------
+    rule #topicsJSONs( ScVec(L) ) => #eventScValsJSONs(L)
+    rule #topicsJSONs( _ )        => .JSONs [owise]
+
+    syntax JSONs ::= #eventScValsJSONs( List ) [function, total]
+ // -------------------------------------------------------
+    rule #eventScValsJSONs( .List )                 => .JSONs
+    rule #eventScValsJSONs( ListItem(V:ScVal) L )   => ( #eventScValJSON(V), #eventScValsJSONs(L) )
+    rule #eventScValsJSONs( ListItem(_) L )         => ( null, #eventScValsJSONs(L) ) [owise]
+
+    syntax JSON ::= #eventScValJSON( ScVal ) [function, total]
+ // -----------------------------------------------------
+    rule #eventScValJSON( SCBool(B) )   => { "type" : "bool"  , "value" : B }
+    rule #eventScValJSON( Void )        => { "type" : "void" }
+    rule #eventScValJSON( U32(I) )      => { "type" : "u32"   , "value" : I }
+    rule #eventScValJSON( I32(I) )      => { "type" : "i32"   , "value" : I }
+    rule #eventScValJSON( U64(I) )      => { "type" : "u64"   , "value" : I }
+    rule #eventScValJSON( I64(I) )      => { "type" : "i64"   , "value" : I }
+    rule #eventScValJSON( U128(I) )     => { "type" : "u128"  , "value" : I }
+    rule #eventScValJSON( I128(I) )     => { "type" : "i128"  , "value" : I }
+    rule #eventScValJSON( Symbol(S) )   => { "type" : "symbol", "value" : S }
+    rule #eventScValJSON( ScString(S) ) => { "type" : "string", "value" : S }
+    rule #eventScValJSON( ScBytes(B) )  => { "type" : "bytes" , "value" : #bytesHex(B) }
+    rule #eventScValJSON( ScAddress(Account(B)) )  => { "type" : "address", "addrType" : "account" , "value" : #bytesHex(B) }
+    rule #eventScValJSON( ScAddress(Contract(B)) ) => { "type" : "address", "addrType" : "contract", "value" : #bytesHex(B) }
+    rule #eventScValJSON( ScVec(L) )    => { "type" : "vec"   , "value" : [ #eventScValsJSONs(L) ] }
+    rule #eventScValJSON( _ )           => null [owise]
+
+    syntax String ::= #bytesHex( Bytes ) [function, total]
+ // ------------------------------------------------------
+    rule #bytesHex( B ) => #padLeft( Base2String( Bytes2Int(B, BE, Unsigned), 16 ), 2 *Int lengthBytes(B) )
+
+    syntax String ::= #padLeft( String, Int ) [function, total]
+ // -----------------------------------------------------------
+    rule #padLeft( S, W ) => #padLeft( "0" +String S, W ) requires lengthString(S) <Int W
+    rule #padLeft( S, W ) => S requires lengthString(S) >=Int W
 
 endmodule
 ```
