@@ -40,8 +40,8 @@ insert-handleRequestFile → handleRequestFile
          ▼
 #dispatchMethod(method, request)        ← routes on the "method" field
          │
-         ├─ getHealth / getNetwork / getLatestLedger / getTransaction /
-         │  getTransactions / getLedgers / traceTransaction → #respond(...)
+         ├─ getHealth / getNetwork / getLatestLedger / getVersionInfo / getFeeStats
+         │    / getTransaction / getTransactions / getLedgers / traceTransaction → #respond(...)
          │
          └─ sendTransaction → #runTx → run steps
                 → #finalizeTx → record receipt + bump ledger → #respond(...)
@@ -63,6 +63,8 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 - `getHealth` → `{ "status": "healthy", "latestLedger": N, "latestLedgerCloseTime": <now>, "oldestLedger": 0, "oldestLedgerCloseTime": "0", "ledgerRetentionWindow": N+1 }` (everything since genesis is retained)
 - `getNetwork` → `{ "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic; `friendbotUrl` is omitted — no friendbot)
 - `getLatestLedger` → reads `metadata.json` and returns `{ "id": #ledgerId(seq), "protocolVersion": ..., "sequence": <latest_ledger> }`; `#ledgerId` derives a deterministic per-ledger 64-hex id from the sequence (the semantics have no hash hooks, so it is a fixed odd-constant multiply mod 2^256, which is injective)
+- `getVersionInfo` → echoes the version fields the server put into the envelope (`version`, `commitHash`, `buildTimestamp`, `captiveCoreVersion` — package metadata lives on the Python side); `protocolVersion` is a JSON number
+- `getFeeStats` → constant `#feeDistribution` objects (komet-node has no fee market) for `sorobanInclusionFee`/`inclusionFee`, plus a live `latestLedger` number from `metadata.json`; all distribution fields except `ledgerCount` are decimal strings, matching real stellar-rpc's Go `,string` encoding
 - `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the ledger-range fields (`latestLedger`/`latestLedgerCloseTime`/`oldestLedger`/`oldestLedgerCloseTime`), or `{ "status": "NOT_FOUND", ... }` (with the same ledger-range fields) when the file is absent
 - `getTransactions` / `getLedgers` → walk the per-ledger index files `ledgers/ledger_<seq>.json` from the envelope's `startSeq` up to the latest ledger, taking at most `limit` records (`#txInfos` / `#ledgerInfos`), and format the history page (`#txHistoryPage` / `#ledgerHistoryPage`). Parameter validation and cursor resolution happen in the server; the response `cursor` (`#pageCursor`) names the page's last record when the page is full — a TOID for transactions, the plain sequence for ledgers — and is empty otherwise. Serialization matches real stellar-rpc, including its quirks: per-transaction `createdAt` is a JSON number (unlike singular `getTransaction`), per-ledger `ledgerCloseTime` is a decimal string, and empty `resultXdr`/`resultMetaXdr` stubs are omitted (`#optXdrEntry`)
 
@@ -95,7 +97,7 @@ The trace is not part of the receipt — the executing steps already appended it
 
 ### traceTransaction
 
-`traceTransaction` is a read-only lookup. It takes a `hash` (the same parameter `getTransaction` takes) and responds with the contents of `traces/trace_<hash>.jsonl`, or `null` when no trace file exists for that hash. Because tracing is always on, every `sendTransaction` writes this file.
+`traceTransaction` is a komet-specific extension, not part of the Stellar RPC specification (see [server.md](server.md#tracetransaction-komet-specific-extension)). It is a read-only lookup: it takes a `hash` (the same parameter `getTransaction` takes) and responds with the contents of `traces/trace_<hash>.jsonl`, or `null` when no trace file exists for that hash. Because tracing is always on, every `sendTransaction` writes this file.
 
 ### Two ways steps are delivered
 

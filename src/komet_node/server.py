@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.metadata
 import json
 import logging
 import re
@@ -33,9 +34,23 @@ _DEFAULT_PAGE_LIMIT: Final = 50
 # getTransactions cursors are TOID-style: (ledger sequence << 32) | (application order << 12).
 _TOID_LEDGER_SHIFT: Final = 32
 
+# getVersionInfo fields. komet-node is a Python package, not a Go binary, so there is no
+# commit hash or build timestamp baked in at compile time; report all-zeros / epoch
+# placeholders with the correct spec types instead. The "Captive Core" of komet-node is the
+# komet package (the K semantics of Soroban that execute the transactions).
+_VERSION: Final = importlib.metadata.version('komet-node')
+_COMMIT_HASH: Final = '0' * 40
+_BUILD_TIMESTAMP: Final = '1970-01-01T00:00:00'
+_CAPTIVE_CORE_VERSION: Final = f'komet {importlib.metadata.version("komet")} (K semantics of Soroban)'
+
 # Only sendTransaction executes a transaction. traceTransaction is a read-only lookup of the
 # trace stored on a previously executed transaction's receipt (see _read_only_envelope).
 _TX_METHODS: Final = ('sendTransaction',)
+
+# Methods whose spec accepts an optional `xdrFormat` param (protocols/rpc:
+# GetTransactionRequest.Format, SendTransactionRequest.Format). komet-node supports only
+# the default 'base64' format; see _check_xdr_format.
+_XDR_FORMAT_METHODS: Final = ('getTransaction', 'sendTransaction')
 
 _log = logging.getLogger('komet_node')
 
@@ -162,33 +177,66 @@ class StellarRpcServer:
     # ------------------------------------------------------------------
 
     def _handle(self, body: bytes) -> bytes:
-        """Parse a raw JSON-RPC body and return the response bytes (the HTTP entry point)."""
+        """Parse a raw JSON-RPC body and return the response bytes (the HTTP entry point).
+
+        An array body is a JSON-RPC 2.0 batch; anything else is a single call. The result
+        may be empty (no response body) when every request was a notification.
+        """
         try:
             req = json.loads(body.decode('utf-8'))
         except (json.JSONDecodeError, UnicodeDecodeError):
             return _error_bytes(None, -32700, 'Parse error')
-        if not isinstance(req, dict):
+        if isinstance(req, list):
+            return self._handle_batch(req)
+        response = self._handle_single(req)
+        return b'' if response is None else response.encode('utf-8')
+
+    def _handle_batch(self, batch: list[Any]) -> bytes:
+        """Answer a JSON-RPC 2.0 batch call: one response per element, in an array.
+
+        Per section 6 of the spec: an empty array is itself a single Invalid Request error;
+        invalid elements each get their own error response; notifications get no response
+        entry, and a batch of only notifications gets no response body at all. Elements run
+        sequentially (the server is single-threaded by design, see serve()).
+        """
+        if not batch:
             return _error_bytes(None, -32600, 'Invalid Request')
+        responses = [response for element in batch if (response := self._handle_single(element)) is not None]
+        if not responses:
+            return b''
+        return ('[' + ','.join(responses) + ']').encode('utf-8')
+
+    def _handle_single(self, req: Any) -> str | None:
+        """Validate one JSON-RPC request frame and dispatch it.
+
+        Returns the response as a JSON string, or ``None`` for a notification — a valid
+        request frame without an ``id`` member, which per JSON-RPC 2.0 is executed but
+        never answered, not even with an error.
+        """
+        if not isinstance(req, dict):
+            return _error_str(None, -32600, 'Invalid Request')
         request_id = req.get('id')
 
         # Validate the JSON-RPC frame before dispatch (JSON-RPC 2.0):
         #   - wrong/missing protocol version or a non-string method => Invalid Request
         #   - params, if present, must be a structured (object) value => else Invalid params
         if req.get('jsonrpc') != '2.0' or not isinstance(req.get('method'), str):
-            return _error_bytes(request_id, -32600, 'Invalid Request')
+            return _error_str(request_id, -32600, 'Invalid Request')
         params = req.get('params')
         if params is None:
             params = {}
-        elif not isinstance(params, dict):
-            return _error_bytes(request_id, -32602, 'Invalid params')
 
-        try:
-            return self.handle_rpc(req['method'], params, request_id).encode('utf-8')
-        except Exception:
-            # An unexpected error must never take down the server thread, but it must not
-            # vanish silently either — log the traceback before returning Internal error.
-            traceback.print_exc()
-            return _error_bytes(request_id, -32603, 'Internal error')
+        if not isinstance(params, dict):
+            response = _error_str(request_id, -32602, 'Invalid params')
+        else:
+            try:
+                response = self.handle_rpc(req['method'], params, request_id)
+            except Exception:
+                # An unexpected error must never take down the server thread, but it must
+                # not vanish silently either — log the traceback, return Internal error.
+                traceback.print_exc()
+                response = _error_str(request_id, -32603, 'Internal error')
+        return None if 'id' not in req else response
 
     def handle_rpc(self, method: str | None, params: dict[str, Any], request_id: Any = None) -> str:
         """Dispatch a single JSON-RPC call and return the response envelope as a JSON string.
@@ -198,6 +246,13 @@ class StellarRpcServer:
         now = str(int(time.time()))
         _log.info('request: %s (id=%r)', method, request_id)
         self._archive_request(method, params, request_id)
+
+        # Reject an unsupported xdrFormat up front, before the request does anything —
+        # in particular before a sendTransaction executes and commits state.
+        if method in _XDR_FORMAT_METHODS:
+            format_error = _check_xdr_format(params, request_id)
+            if format_error is not None:
+                return format_error
 
         if method in _TX_METHODS:
             transaction = params.get('transaction')
@@ -255,6 +310,19 @@ class StellarRpcServer:
             return {**base, 'passphrase': self.encoder.network_passphrase, 'protocolVersion': _PROTOCOL_VERSION}
         if method == 'getLatestLedger':
             return {**base, 'protocolVersion': _PROTOCOL_VERSION}
+        if method == 'getVersionInfo':
+            # protocolVersion is a JSON number here (a Go uint32 in stellar-rpc), unlike the
+            # string the older methods still emit.
+            return {
+                **base,
+                'version': _VERSION,
+                'commitHash': _COMMIT_HASH,
+                'buildTimestamp': _BUILD_TIMESTAMP,
+                'captiveCoreVersion': _CAPTIVE_CORE_VERSION,
+                'protocolVersion': int(_PROTOCOL_VERSION),
+            }
+        if method == 'getFeeStats':
+            return base
         if method in ('getTransaction', 'traceTransaction'):
             tx_hash = params.get('hash')
             if not isinstance(tx_hash, str):
@@ -448,6 +516,22 @@ def _configure_logging() -> None:
     handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(message)s'))
     _log.addHandler(handler)
     _log.setLevel(logging.INFO)
+
+
+def _check_xdr_format(params: dict[str, Any], request_id: Any) -> str | None:
+    """Validate the optional ``xdrFormat`` param; ``None`` means the request may proceed.
+
+    Only ``'base64'`` (the spec default) is supported. The spec's alternative ``'json'``
+    format is not implemented in komet-node, so it gets a dedicated error message; any
+    other value is rejected as invalid. Both cases are Invalid params (-32602), matching
+    real stellar-rpc's handling of a bad format value.
+    """
+    xdr_format = params.get('xdrFormat', 'base64')
+    if xdr_format == 'base64':
+        return None
+    if xdr_format == 'json':
+        return _error_str(request_id, -32602, "Invalid params: xdrFormat 'json' is not supported, use 'base64'")
+    return _error_str(request_id, -32602, "Invalid params: unknown xdrFormat, expected 'base64'")
 
 
 def _error_str(rpc_id: Any, code: int, message: str) -> str:
