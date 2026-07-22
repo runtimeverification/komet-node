@@ -614,19 +614,33 @@ def test_trace_transaction_missing_hash_returns_invalid_params(server: StellarRp
 
 
 def test_trace_transaction_returns_full_instruction_trace_for_foo(server: StellarRpcServer) -> None:
-    """traceTransaction returns the complete, ordered instruction trace of an invocation.
+    """traceTransaction returns the complete, ordered trace of an invocation: a ``callContract``
+    entry frame, the executed WebAssembly instructions, and an ``endWasm`` exit frame.
 
     empty.wat's ``foo()`` body is a single ``i64.const 2`` (the Void return); the three leading
-    records are the contract's global initialisation and the ``block`` is the function frame.
-    This is the exact trace shown in the README, asserted record-for-record so any drift in the
-    format, ordering, or the array-vs-string shape of the result is caught.
+    instruction records are the contract's global initialisation and the ``block`` is the
+    function frame. The instruction records are asserted record-for-record (the exact trace
+    shown in the README) so any drift in format, ordering, or the array-vs-string shape of the
+    result is caught. The entry/exit frames carry per-run contract and account ids, so they are
+    checked structurally rather than by value.
     """
     invoke = _deploy_and_get_invoker(server, EMPTY_CONTRACT_WAT)
     tx_hash = invoke('foo')
 
     trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
 
-    assert trace == [
+    # A callContract entry frame opens the trace: the account calls foo() on the contract with
+    # no arguments at call depth 1.
+    entry = trace[0]
+    assert entry['instr'] == ['callContract']
+    assert entry['function'] == 'foo'
+    assert entry['args'] == []
+    assert entry['depth'] == 1
+    assert entry['from']['addrType'] == 'account'
+    assert entry['to']['addrType'] == 'contract'
+
+    # The executed WebAssembly instructions, exactly as shown in the README.
+    assert trace[1:-1] == [
         {'pos': 3, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}},
         {'pos': 11, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}},
         {'pos': 19, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}},
@@ -634,10 +648,18 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
         {'pos': 3, 'instr': ['const', 'i64', 2], 'stack': [], 'locals': {}},
     ]
 
+    # An endWasm exit frame closes the trace: the call succeeded and returned Void.
+    exit_frame = trace[-1]
+    assert exit_frame['instr'] == ['endWasm']
+    assert exit_frame['success'] is True
+    assert exit_frame['result'] == {'type': 'void'}
+    assert exit_frame['depth'] == 1
+
 
 def test_trace_records_have_expected_structure_and_reflect_arguments(server: StellarRpcServer) -> None:
-    """Each trace record is a ``{pos, instr, stack, locals}`` object, and for a call that takes
-    arguments the decoded arguments are bound as locals while intermediate values build up on the
+    """The trace opens with a ``callContract`` frame that echoes the decoded arguments, and each
+    WebAssembly instruction record is a ``{pos, instr, stack, locals}`` object. For a call that
+    takes arguments the arguments are bound as locals while intermediate values build up on the
     stack — exercising a richer trace than the argument-less ``foo()`` case.
     """
     invoke = _deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
@@ -655,7 +677,22 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
 
     assert isinstance(trace, list)
     assert len(trace) > 0
-    for record in trace:
+
+    # The callContract entry frame echoes the call target and its decoded arguments.
+    entry = trace[0]
+    assert entry['instr'] == ['callContract']
+    assert entry['function'] == 'test_integers'
+    assert entry['args'] == [
+        {'type': 'u32', 'value': 42},
+        {'type': 'i32', 'value': -7},
+        {'type': 'u64', 'value': 100},
+        {'type': 'i64', 'value': -200},
+    ]
+
+    # The instruction records (everything between the call-boundary frames) share one shape.
+    instr_records = [record for record in trace if 'locals' in record]
+    assert instr_records
+    for record in instr_records:
         assert set(record) == {'pos', 'instr', 'stack', 'locals'}
         assert record['pos'] is None or isinstance(record['pos'], int)
         assert isinstance(record['instr'], list) and record['instr']
@@ -667,12 +704,12 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
         assert all(isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) for e in record['locals'].values())
 
     # The four call arguments are bound as locals 0..3 by the time the body runs.
-    locals_seen = {key for record in trace for key in record['locals']}
+    locals_seen = {key for record in instr_records for key in record['locals']}
     assert {'0', '1', '2', '3'} <= locals_seen
     # Intermediate computation puts values on the stack at some point.
-    assert any(record['stack'] for record in trace)
+    assert any(record['stack'] for record in instr_records)
     # The function body returns Void: the final instruction pushes the i64 constant 2.
-    assert trace[-1]['instr'] == ['const', 'i64', 2]
+    assert instr_records[-1]['instr'] == ['const', 'i64', 2]
 
 
 def test_call_tx_with_args(server: StellarRpcServer) -> None:
