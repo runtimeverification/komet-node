@@ -4,8 +4,6 @@
 
 `komet-node` is a local Stellar testnet backed by the K semantics of Soroban. The compiled semantics are a one-shot interpreter (one process per request, no networking, no state between runs), so Python wraps them into a long-running server: it holds the HTTP socket, keeps state on disk between runs, and decodes Stellar XDR, which K cannot. The RPC layer itself — method dispatch, receipt bookkeeping, ledger accounting, status, and response formatting — runs inside the K semantics ([`node.md`](node-semantics.md)).
 
-See `src/komet_node/demo.py` for an end-to-end example: empty state → create account → upload wasm → deploy contract → call `foo()`, with each step's K configuration pretty-printed.
-
 ---
 
 ## Module map
@@ -36,5 +34,7 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 ## Known gaps
 
 - `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
+- `sendTransaction`'s `errorResultXdr` is always a generic `txMALFORMED` result (no per-cause codes such as `txBAD_SEQ` — sequence numbers, fees, and signatures are not modelled), and `diagnosticEventsXdr` is never populated (both fields are optional in the spec). `TRY_AGAIN_LATER` is never returned by design: it signals mempool backpressure, which cannot arise in a synchronous node without a mempool.
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
 - `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
+- Receipts are not a stable format: older io-dirs store `ledger`/`createdAt` with pre-spec types and lack `applicationOrder`/`feeBump`. Resume only io-dirs written by the same version, or start fresh.

@@ -11,10 +11,9 @@ from pyk.konvert import kast_to_kore
 from pyk.kore.parser import KoreParser
 from pyk.kore.prelude import SORT_K_ITEM, inj, int_dv, str_dv, top_cell_initializer
 from pyk.kore.syntax import App, SortApp
-from pyk.ktool.krun import KRunOutput, _krun
 from pyk.utils import check_file_path, run_process_2
 
-from .utils import simbolik_definition, temp_working_directory
+from .utils import simbolik_definition
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -174,24 +173,6 @@ class NodeInterpreter:
         """
         steps_kore = kast_to_kore(self.definition.kdefinition, steps_of(steps), KSort('Steps'))
         return _set_cell(pattern, _PROGRAM_CELL, steps_kore)
-
-    def pretty_print(self, kore_str: str) -> str:
-        """Pretty-print a KORE configuration string using the K definition."""
-        with temp_working_directory() as root:
-            kore_file = root / 'input.kore'
-            kore_file.write_text(kore_str)
-            res = _krun(
-                input_file=kore_file,
-                definition_dir=self.definition.path,
-                parser='cat',
-                term=True,
-                output=KRunOutput.PRETTY,
-                check=False,
-                depth=0,
-            )
-            if res.returncode:
-                raise NodeInterpreterError('Failed to pretty-print kore', res)
-            return res.stdout
 
 
 class NodeInterpreterError(RuntimeError):

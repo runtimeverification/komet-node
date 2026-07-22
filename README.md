@@ -130,26 +130,68 @@ curl -s http://localhost:8000 -H 'Content-Type: application/json' \
   "jsonrpc": "2.0",
   "id": 1,
   "result": [
+    {
+      "pos": null, "instr": ["callContract"],
+      "from": {"type": "address", "addrType": "account",  "value": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"},
+      "to":   {"type": "address", "addrType": "contract", "value": "6a20fec1a9081773a5f23ce370f925f236346e510438ddd6d40f6b2711c134e0"},
+      "function": "foo", "args":[], "depth":1, "storage":[]
+    },
     {"pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
     {"pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
     {"pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
     {"pos": null, "instr": ["block"],                 "stack": [], "locals": {}},
-    {"pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}}
+    {"pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}},
+    {"pos": null, "instr": ["endWasm"], "success":true, "depth":1, "result": {"type": "void"}}
   ]
 }
 ```
 
-Each trace record captures the VM state at instruction entry: `pos` is the instruction's byte offset in the binary (`null` for synthetic instructions), `instr` is the instruction and its operands, and `stack`/`locals` are the value stack and locals as `[type, value]` pairs. See [docs/interpreter.md](docs/interpreter.md) for the full trace format.
+A trace can contain five kinds of records:
+ 
+- `callContract`
+- Wasm instruction records
+- `hostCall`
+- `contractData`
+- `endWasm`
 
-#### Walk through a contract lifecycle
-
-The bundled demo deploys and invokes a Soroban contract end-to-end (create account → upload wasm → deploy → invoke):
-
-```bash
-uv run python -m komet_node.demo src/tests/integration/data/wasm/empty.wat
+The example above only has three of these: `callContract`, instruction records, and `endWasm`. `foo()` doesn't touch storage or call any host functions, so no `contractData` or `hostCall` records show up.
+ 
+Here's what each record type carries:
+ 
+- `callContract`: logged for each contract call in the transaction, including contract-to-contract calls. Records the caller, the callee, the function name, the arguments, the call depth, and the callee's storage before the call runs.
+- Instruction records: logged at each WebAssembly instruction's entry. `pos` is the instruction's byte offset in the binary (`null` for synthetic instructions), `instr` is the instruction and its operands, and `stack`/`locals` are the value stack and locals as `[type, value]` pairs.
+- `hostCall`: logged when the contract calls a host function. `instr` gives `["hostCall", moduleId, functionId]`, identifying which host function ran. `locals` holds the function's arguments, indexed by position. Host calls don't use the stack, so `stack` is absent.
+  Here's a `hostCall` record for a call to `put_contract_data`, module id `l`, function id `_`:
+```jsonc
+  {
+    "pos": null,
+    "instr": ["hostCall", "l", "_"],
+    "locals": {"2": ["i64",0], "1": ["i64",530242871224172548], "0": ["i64",45954062]}
+  }
 ```
+ 
+- `contractData`: logged for storage updates. Gives the contract and the storage type (`instance`, `persistent`, or `temporary`). A `put` carries the key and value as its two args; a `del` carries only the key.
+  Here's a `contractData` record for a `put`, followed by a `del` on the same key:
+```jsonc
+  {
+    "pos": null,
+    "instr": ["contractData", "put", "temporary"],
+    "contract": {"type": "address", "addrType": "contract", "value": "746573742d7363"},
+    "args": [{"type": "symbol", "value": "foo"}, {"type": "u32", "value": 123456789}]
+  }
+  {
+    "pos": null,
+    "instr": ["contractData", "del", "temporary"],
+    "contract": {"type": "address", "addrType": "contract", "value": "746573742d7363"},
+    "args": [{"type": "symbol", "value": "foo"}]
+  }
+```
+ 
+- `endWasm`: logged once at the end of a call. Records whether the call succeeded, its depth, and its result.
 
-This produces `state.kore` plus `state_<n>_<step>.pretty` files under `./out`, letting you inspect exactly how the ledger state evolves at each step. (Requires `wat2wasm` from [`wabt`](https://github.com/WebAssembly/wabt) on your `PATH`.)
+
+
+See [docs/interpreter.md](docs/interpreter.md) for the full trace format.
 
 ---
 
