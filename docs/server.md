@@ -185,10 +185,12 @@ Failures are reported in the result body, matching real stellar-rpc; only an und
 
 `traceTransaction` is **not part of the Stellar RPC specification** — it exists only on komet-node, and clients must not expect it from real Stellar RPC endpoints. It keeps its plain name rather than a vendor-prefixed one (`komet_traceTransaction`): the official spec has no method of that name and none is announced, so there is no collision to avoid, and renaming would break every existing client for no gain. If stellar-rpc ever claims the name, the method will be renamed with a prefix.
 
-`traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored on that transaction's receipt. The result is the trace itself: a JSONL string with one record per executed WebAssembly instruction, or `null` when no transaction with that hash exists.
+`traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored for that transaction. The result is a JSON array with one record per executed WebAssembly instruction (empty when the transaction ran no instructions), or `null` when no transaction with that hash exists.
 
 ```json
-"<jsonl string>"
+[
+  {"pos": 3, "instr": ["const", "i32", 1048576], "stack": [], "locals": {}}
+]
 ```
 
 ### `getTransaction`

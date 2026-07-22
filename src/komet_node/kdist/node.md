@@ -527,8 +527,17 @@ the spec-mandated `resultXdr`/`resultMetaXdr` base64 XDR fields (K cannot constr
 
 Retrieve the execution trace of a previously submitted transaction, looked up by `hash` (the
 same parameter `getTransaction` takes). The trace was written to `traces/trace_<hash>.jsonl`
-by `sendTransaction`. Responds with the trace file's contents, or `null` when no trace file
-exists for that hash.
+by `sendTransaction`. The file is JSONL (one JSON record per executed instruction), and each
+line is already valid JSON produced by the semantics — so rather than decoding every record
+into a `JSON` term and re-encoding the whole array (a full round-trip whose cost scales with
+the trace, which can be very large), we build the result array by *string concatenation*:
+join the trusted lines with commas and wrap them in `[` … `]`. Responds with that array —
+empty when the transaction ran no instructions — or `null` when no trace file exists for that
+hash.
+
+Because the trace body is spliced in as raw text, `#respondTrace` writes the JSON-RPC
+envelope directly (mirroring `#respond`) instead of building a `JSON` term for `JSON2String`:
+only the small `id` value is serialized through the encoder.
 
 ```k
     rule <k> #dispatchMethod( "traceTransaction", REQ )
@@ -536,10 +545,56 @@ exists for that hash.
              ...
          </k>
 
-    rule <k> #respondTrace( ID, HASH ) => #respond( ID, {#readFile( #traceFile( HASH ) )}:>String ) ... </k>
+    rule <k> #respondTrace( ID, HASH )
+          => #writeFile( "response.json",
+                 "{\"jsonrpc\":\"2.0\",\"id\":"
+                   +String JSON2String( ID )
+                   +String ",\"result\":"
+                   +String #traceArray( {#readFile( #traceFile( HASH ) )}:>String )
+                   +String "}" )
+          ~> #remove( "request.json" )
+             ...
+         </k>
+         <exitCode> _ => 0 </exitCode>
       requires #fileExists( #traceFile( HASH ) )
+
     rule <k> #respondTrace( ID, HASH ) => #respond( ID, null ) ... </k>
       requires notBool #fileExists( #traceFile( HASH ) )
+```
+
+`#traceArray` wraps the JSONL trace text in array brackets; `#traceElems` joins the
+newline-delimited records with commas without touching their contents. Empty segments (a
+leading/blank line, or the empty tail after the final record's trailing newline) are skipped
+via `#maybeComma`, which prefixes a separator only when a following record actually exists —
+so a trailing newline never yields a dangling comma, and an empty file yields `[]`.
+
+```k
+    syntax String ::= #traceArray( String )  [function, symbol(traceArray)]
+                    | #traceElems( String )  [function, symbol(traceElems)]
+                    | #maybeComma( String )  [function, symbol(maybeComma)]
+ // -----------------------------------------------------------------------
+    rule #traceArray( S ) => "[" +String #traceElems( S ) +String "]"
+
+    rule #traceElems( "" ) => ""
+
+    // No more newlines: the whole remaining string is the final record.
+    rule #traceElems( S ) => S
+      requires S =/=String "" andBool findString( S, "\n", 0 ) <Int 0
+
+    // Split off the first line and recurse; a comma is added only if the tail is non-empty.
+    rule #traceElems( S )
+      => substrString( S, 0, findString( S, "\n", 0 ) )
+         +String #maybeComma( #traceElems( substrString( S, findString( S, "\n", 0 ) +Int 1, lengthString( S ) ) ) )
+      requires findString( S, "\n", 0 ) >Int 0
+
+    // Empty leading line (the string starts with a newline): drop it and recurse.
+    rule #traceElems( S )
+      => #traceElems( substrString( S, 1, lengthString( S ) ) )
+      requires findString( S, "\n", 0 ) ==Int 0
+
+    rule #maybeComma( "" ) => ""
+    rule #maybeComma( S )  => "," +String S
+      requires S =/=String ""
 ```
 
 ## simulateTransaction
