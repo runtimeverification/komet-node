@@ -57,16 +57,16 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 
 ## Dispatch and the read-only methods
 
-`#dispatch` reads the `method` field and routes to a per-method rule. The read-only methods answer directly from constants and the bookkeeping files:
+`#dispatch` reads the `method` field and routes to a per-method rule. The read-only methods answer directly from constants and the bookkeeping files. Response shapes follow real stellar-rpc's serialization: ledger sequences and `protocolVersion` are JSON numbers; close-time fields are int64-as-string (JSON strings holding a decimal integer).
 
-- `getHealth` → `{ "status": "healthy" }`
-- `getNetwork` → `{ "friendbotUrl": null, "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic)
-- `getLatestLedger` → reads `metadata.json` and returns `{ "id": <64 zeros>, "protocolVersion": ..., "sequence": <latest_ledger> }`
+- `getHealth` → `{ "status": "healthy", "latestLedger": N, "latestLedgerCloseTime": <now>, "oldestLedger": 0, "oldestLedgerCloseTime": "0", "ledgerRetentionWindow": N+1 }` (everything since genesis is retained)
+- `getNetwork` → `{ "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic; `friendbotUrl` is omitted — no friendbot)
+- `getLatestLedger` → reads `metadata.json` and returns `{ "id": #ledgerId(seq), "protocolVersion": ..., "sequence": <latest_ledger> }`; `#ledgerId` derives a deterministic per-ledger 64-hex id from the sequence (the semantics have no hash hooks, so it is a fixed odd-constant multiply mod 2^256, which is injective)
 - `getVersionInfo` → echoes the version fields the server put into the envelope (`version`, `commitHash`, `buildTimestamp`, `captiveCoreVersion` — package metadata lives on the Python side); `protocolVersion` is a JSON number
 - `getFeeStats` → constant `#feeDistribution` objects (komet-node has no fee market) for `sorobanInclusionFee`/`inclusionFee`, plus a live `latestLedger` number from `metadata.json`; all distribution fields except `ledgerCount` are decimal strings, matching real stellar-rpc's Go `,string` encoding
-- `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the current `latestLedger`/`latestLedgerCloseTime`, or `{ "status": "NOT_FOUND", ... }` when the file is absent
+- `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the ledger-range fields (`latestLedger`/`latestLedgerCloseTime`/`oldestLedger`/`oldestLedgerCloseTime`), or `{ "status": "NOT_FOUND", ... }` (with the same ledger-range fields) when the file is absent
 
-`#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0.
+`#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0. `#respondError(ID, CODE, MSG)` is its error counterpart, writing `{jsonrpc, id, error: {code, message}}` instead; the unknown-method fallback uses it to answer `-32601 Method not found` (a safety net — the Python server filters unknown methods before they reach K).
 
 ---
 
@@ -86,8 +86,10 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 
 1. writes `metadata.json` with `latest_ledger + 1`,
 2. writes the receipt to `receipts/receipt_<hash>.json`:
-   `{ status: "SUCCESS", ledger, createdAt, envelopeXdr, resultXdr: "", resultMetaXdr: "" }`,
+   `{ status: "SUCCESS", applicationOrder: 1, feeBump: false, envelopeXdr, resultXdr: "", resultMetaXdr: "", ledger, createdAt }`,
 3. responds with `{hash, status: "PENDING", latestLedger, latestLedgerCloseTime}`.
+
+A `sendTransaction` whose hash already has a receipt never reaches `#runTx`: dispatch answers `{hash, status: "DUPLICATE", latestLedger, latestLedgerCloseTime}` directly, without executing anything or advancing the ledger. (For wasm uploads the Python server also suppresses the `<program>` injection on duplicates, since those steps would run before dispatch.)
 
 The trace is not part of the receipt — the executing steps already appended it to `traces/trace_<hash>.jsonl`. Reaching `#finalizeTx` means the steps completed without getting stuck, so the status is `SUCCESS`. A failed transaction gets stuck before this point, `response.json` is never written, and the Python server records the `FAILED` receipt instead.
 

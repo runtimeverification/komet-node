@@ -9,7 +9,7 @@
     # `k` package directly (replacing the imperative `kup install k`); its
     # nixpkgs is intentionally NOT followed, so the k-framework binary caches
     # are hit instead of rebuilding K against our nixpkgs.
-    k-framework.url = "github:runtimeverification/k/v7.1.319";
+    k-framework.url = "github:runtimeverification/k/v7.1.323";
     # Use the same uv2nix as k-framework so we inherit the pyproject-nix version
     # that fixes the missing 'riscv64' attribute in pep600.nix (pep599.manyLinuxTargetMachines
     # lookup now uses `or tagArch` as a safe default for unknown architectures).
