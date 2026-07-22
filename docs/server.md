@@ -123,6 +123,22 @@ The node retains every ledger since genesis, so `oldestLedger` is always 0 and t
 { "id": "1715609f7c74...", "protocolVersion": 22, "sequence": 4 }
 ```
 
+### `getVersionInfo`
+
+`getVersionInfo` reports the komet-node package version as the RPC server version and the komet package (the K semantics of Soroban executing the transactions) as the "Captive Core". komet-node is a Python package, so no commit hash or build timestamp is baked in at build time — those fields are all-zeros / epoch placeholders with the spec-correct types. `protocolVersion` is a JSON number.
+
+```json
+{ "version": "0.1.0", "commitHash": "0000...0000", "buildTimestamp": "1970-01-01T00:00:00", "captiveCoreVersion": "komet 0.1.79 (K semantics of Soroban)", "protocolVersion": 22 }
+```
+
+### `getFeeStats`
+
+`getFeeStats` returns constant fee distributions: komet-node has no fee market, so every statistic is the network minimum inclusion fee of 100 stroops over an empty sample (`transactionCount: "0"`, `ledgerCount: 0`). Matching real stellar-rpc, every distribution field except `ledgerCount` is a JSON string holding a decimal number; `latestLedger` is a JSON number read live from `metadata.json`.
+
+```json
+{ "sorobanInclusionFee": { "max": "100", "min": "100", "mode": "100", "p10": "100", ..., "p99": "100", "transactionCount": "0", "ledgerCount": 0 }, "inclusionFee": { ... }, "latestLedger": 4 }
+```
+
 ### `sendTransaction`
 
 `sendTransaction` submits a base64-encoded XDR transaction envelope.
