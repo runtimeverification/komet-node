@@ -521,6 +521,207 @@ exists for that hash.
 ```
 
 ###############################################################################
+## getTransactions / getLedgers
+
+The history methods are served from the per-ledger index files `ledgers/ledger_<seq>.json`
+that the Python server writes whenever a transaction closes a ledger. Each file carries the
+ledger's `sequence`, the `txHash` of the transaction that closed it, its `closedAt` unix
+time, and the ledger-header artifacts (`hash`, `headerXdr`, `metadataXdr`) — the latter are
+XDR, which only Python can construct. Parameter validation (limit range, `startLedger`
+bounds, `cursor`/`startLedger` exclusivity, resolving the cursor) also happens in the
+server, because it needs the JSON-RPC error path; the envelope arrives here with a
+validated `startSeq` (first ledger sequence to serve) and `limit`, and these rules only
+collect the records and format the response.
+
+Serialization notes, matching real stellar-rpc (the Go protocol structs win over the
+OpenRPC doc):
+  - ledger sequences and both top-level close-time fields are JSON numbers, and the
+    close-time keys differ between the methods (`latestLedgerCloseTimestamp` here,
+    `latestLedgerCloseTime` on getLedgers) — an upstream quirk, kept as is;
+  - per-transaction `createdAt` is a JSON number, unlike the singular getTransaction;
+  - per-ledger `ledgerCloseTime` is a string holding a decimal number (Go `,string`);
+  - `resultXdr`/`resultMetaXdr` are `omitempty`: omitted while receipts carry empty stubs;
+  - `cursor` names the page's last record when the page is full (a TOID for transactions:
+    `ledger << 32 | applicationOrder << 12`), and is empty otherwise.
+
+```k
+    rule <k> #dispatchMethod( "getTransactions", REQ )
+          => #respond( #getJSON( "id", REQ ), #getTransactionsResult(
+                 #getInt( "startSeq", REQ ),
+                 #getInt( "limit", REQ ),
+                 #getInt( "latest_ledger", #readJSONFile( "metadata.json" ) )
+             ))
+             ...
+         </k>
+
+    rule <k> #dispatchMethod( "getLedgers", REQ )
+          => #respond( #getJSON( "id", REQ ), #getLedgersResult(
+                 #getInt( "startSeq", REQ ),
+                 #getInt( "limit", REQ ),
+                 #getInt( "latest_ledger", #readJSONFile( "metadata.json" ) )
+             ))
+             ...
+         </k>
+
+    syntax JSON ::= #getTransactionsResult( Int, Int, Int ) [function, symbol(getTransactionsResult)]
+                  | #txHistoryPage( JSONs, Int, Int )       [function, symbol(txHistoryPage)]
+ // -------------------------------------------------------------------------------------------------
+    rule #getTransactionsResult( START, LIMIT, LL ) => #txHistoryPage( #txInfos( START, LIMIT, LL ), LIMIT, LL )
+
+    rule #txHistoryPage( TXS, LIMIT, LL ) => {
+            "transactions"               : [ TXS ],
+            "latestLedger"               : LL,
+            "latestLedgerCloseTimestamp" : #ledgerCloseTimeOf( LL ),
+            "oldestLedger"               : 0,
+            "oldestLedgerCloseTimestamp" : 0,
+            "cursor"                     : #pageCursor( TXS, LIMIT, "ledger", 4294967296, 4096 )
+        }
+
+    syntax JSON ::= #getLedgersResult( Int, Int, Int )    [function, symbol(getLedgersResult)]
+                  | #ledgerHistoryPage( JSONs, Int, Int ) [function, symbol(ledgerHistoryPage)]
+ // -------------------------------------------------------------------------------------------
+    rule #getLedgersResult( START, LIMIT, LL ) => #ledgerHistoryPage( #ledgerInfos( START, LIMIT, LL ), LIMIT, LL )
+
+    rule #ledgerHistoryPage( LS, LIMIT, LL ) => {
+            "ledgers"               : [ LS ],
+            "latestLedger"          : LL,
+            "latestLedgerCloseTime" : #ledgerCloseTimeOf( LL ),
+            "oldestLedger"          : 0,
+            "oldestLedgerCloseTime" : 0,
+            "cursor"                : #pageCursor( LS, LIMIT, "sequence", 1, 0 )
+        }
+```
+
+Both collectors walk the ledger sequence upwards from `startSeq` to the latest ledger,
+taking at most `limit` records. Ledgers without an index file are skipped: the genesis
+ledger 0 never has one, and neither do ledgers closed by io-dirs predating the index.
+Failed transactions never closed a ledger, so they do not appear in the history.
+
+```k
+    syntax JSONs ::= #txInfos( Int, Int, Int ) [function, symbol(txInfos)]
+ // ----------------------------------------------------------------------
+    rule #txInfos( _, LIMIT, _ )    => .JSONs requires LIMIT <=Int 0
+    rule #txInfos( SEQ, LIMIT, LL ) => .JSONs requires LIMIT >Int 0 andBool SEQ >Int LL
+    rule #txInfos( SEQ, LIMIT, LL ) => #txInfos( SEQ +Int 1, LIMIT, LL )
+      requires LIMIT >Int 0 andBool SEQ <=Int LL andBool notBool #fileExists( #ledgerFile( SEQ ) )
+    rule #txInfos( SEQ, LIMIT, LL )
+      => ( #txInfoOf( SEQ, #getString( "txHash", #readJSONFile( #ledgerFile( SEQ ) ) ) )
+         , #txInfos( SEQ +Int 1, LIMIT -Int 1, LL ) )
+      requires LIMIT >Int 0 andBool SEQ <=Int LL andBool #fileExists( #ledgerFile( SEQ ) )
+
+    syntax JSONs ::= #ledgerInfos( Int, Int, Int ) [function, symbol(ledgerInfos)]
+ // ------------------------------------------------------------------------------
+    rule #ledgerInfos( _, LIMIT, _ )    => .JSONs requires LIMIT <=Int 0
+    rule #ledgerInfos( SEQ, LIMIT, LL ) => .JSONs requires LIMIT >Int 0 andBool SEQ >Int LL
+    rule #ledgerInfos( SEQ, LIMIT, LL ) => #ledgerInfos( SEQ +Int 1, LIMIT, LL )
+      requires LIMIT >Int 0 andBool SEQ <=Int LL andBool notBool #fileExists( #ledgerFile( SEQ ) )
+    rule #ledgerInfos( SEQ, LIMIT, LL )
+      => ( #ledgerInfoOf( #readJSONFile( #ledgerFile( SEQ ) ) )
+         , #ledgerInfos( SEQ +Int 1, LIMIT -Int 1, LL ) )
+      requires LIMIT >Int 0 andBool SEQ <=Int LL andBool #fileExists( #ledgerFile( SEQ ) )
+```
+
+One transaction record, in the field set and order of the Go `TransactionInfo` struct.
+The receipt provides the status, the envelope, and the creation time; the ledger sequence
+comes from the index. Each ledger holds exactly one transaction on this node, so
+`applicationOrder` is always 1, and fee-bump envelopes are not supported, so `feeBump` is
+always false.
+
+```k
+    syntax JSON ::= #txInfoOf( Int, String )         [function, symbol(txInfoOf)]
+                  | #txInfoFrom( Int, String, JSON ) [function, symbol(txInfoFrom)]
+ // -------------------------------------------------------------------------------
+    rule #txInfoOf( SEQ, HASH ) => #txInfoFrom( SEQ, HASH, #readJSONFile( #receiptFile( HASH ) ) )
+
+    rule #txInfoFrom( SEQ, HASH, RCPT ) => { #concatJSONs(
+            ( "status"           : #getJSON( "status", RCPT ),
+              "txHash"           : HASH,
+              "applicationOrder" : 1,
+              "feeBump"          : false,
+              "envelopeXdr"      : #getJSON( "envelopeXdr", RCPT ),
+              .JSONs ),
+            #concatJSONs(
+                #optXdrEntry( "resultXdr", #getJSON( "resultXdr", RCPT, "" ) ),
+                #concatJSONs(
+                    #optXdrEntry( "resultMetaXdr", #getJSON( "resultMetaXdr", RCPT, "" ) ),
+                    ( "ledger"    : SEQ,
+                      "createdAt" : #asInt( #getJSON( "createdAt", RCPT ) ),
+                      .JSONs )
+                )
+            )
+        )}
+
+    // An entry for an optional (`omitempty`) XDR field: omitted when the stored value is
+    // an empty stub or the receipt predates the field.
+    syntax JSONs ::= #optXdrEntry( JSONKey, JSON ) [function, symbol(optXdrEntry)]
+ // ------------------------------------------------------------------------------
+    rule #optXdrEntry( _, ""   ) => .JSONs
+    rule #optXdrEntry( _, null ) => .JSONs
+    rule #optXdrEntry( KEY, V  ) => ( KEY : V, .JSONs ) [owise]
+
+    // One ledger record, straight from the index file.
+    syntax JSON ::= #ledgerInfoOf( JSON ) [function, symbol(ledgerInfoOf)]
+ // ----------------------------------------------------------------------
+    rule #ledgerInfoOf( L ) => {
+            "hash"            : #getJSON( "hash", L ),
+            "sequence"        : #asInt( #getJSON( "sequence", L ) ),
+            "ledgerCloseTime" : Int2String( #asInt( #getJSON( "closedAt", L ) ) ),
+            "headerXdr"       : #getJSON( "headerXdr", L ),
+            "metadataXdr"     : #getJSON( "metadataXdr", L )
+        }
+```
+
+Shared helpers for the history methods.
+
+```k
+    syntax String ::= #ledgerFile( Int ) [function, symbol(ledgerFile)]
+ // -------------------------------------------------------------------
+    rule #ledgerFile( SEQ ) => "ledgers/ledger_" +String Int2String(SEQ) +String ".json"
+
+    syntax JSON ::= #readJSONFile( String ) [function, symbol(readJSONFile)]
+ // ------------------------------------------------------------------------
+    rule #readJSONFile( FILE ) => String2JSON( {#readFile( FILE )}:>String )
+
+    // Coerce a JSON number-or-decimal-string to Int (receipts store some ints as strings).
+    syntax Int ::= #asInt( JSON ) [function, symbol(asInt)]
+ // -------------------------------------------------------
+    rule #asInt( I:Int )    => I
+    rule #asInt( S:String ) => String2Int( S )
+
+    // The close time recorded for a ledger, or 0 when it has no index file (genesis).
+    syntax Int ::= #ledgerCloseTimeOf( Int ) [function, symbol(ledgerCloseTimeOf)]
+ // ------------------------------------------------------------------------------
+    rule #ledgerCloseTimeOf( SEQ ) => #asInt( #getJSON( "closedAt", #readJSONFile( #ledgerFile( SEQ ) ) ) )
+      requires #fileExists( #ledgerFile( SEQ ) )
+    rule #ledgerCloseTimeOf( SEQ ) => 0
+      requires notBool #fileExists( #ledgerFile( SEQ ) )
+
+    // The paging token to return: the position of the page's last record when the page is
+    // full (more records may follow), the empty string otherwise. The position is the value
+    // of KEY in the last record, scaled as POS *Int MULT +Int OFFSET — the TOID encoding
+    // for getTransactions (MULT 2^32, OFFSET 1 << 12), the plain sequence for getLedgers
+    // (MULT 1, OFFSET 0). The server resolves cursors back to a start sequence.
+    syntax JSON ::= #pageCursor( JSONs, Int, JSONKey, Int, Int ) [function, symbol(pageCursor)]
+ // -------------------------------------------------------------------------------------------
+    rule #pageCursor( RECORDS, LIMIT, KEY, MULT, OFFSET )
+      => Int2String( #lastIntIn( KEY, RECORDS ) *Int MULT +Int OFFSET )
+      requires #lengthJSONs( RECORDS ) ==Int LIMIT
+    rule #pageCursor( RECORDS, LIMIT, _, _, _ ) => ""
+      requires #lengthJSONs( RECORDS ) =/=Int LIMIT
+
+    syntax Int ::= #lengthJSONs( JSONs ) [function, symbol(lengthJSONs)]
+ // --------------------------------------------------------------------
+    rule #lengthJSONs( .JSONs )      => 0
+    rule #lengthJSONs( ( _, REST ) ) => 1 +Int #lengthJSONs( REST )
+
+    // The value of KEY in the last object of a non-empty list, as an Int.
+    syntax Int ::= #lastIntIn( JSONKey, JSONs ) [function, symbol(lastIntIn)]
+ // -------------------------------------------------------------------------
+    rule #lastIntIn( KEY, ( J:JSON, .JSONs ) )             => #getInt( KEY, J )
+    rule #lastIntIn( KEY, ( _:JSON, J:JSON, REST:JSONs ) ) => #lastIntIn( KEY, ( J, REST ) )
+```
+
+###############################################################################
 # Step decoding
 
 Each step of a transaction is decoded from JSON into a kasmer `Step`. Key order is

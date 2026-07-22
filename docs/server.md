@@ -14,6 +14,7 @@ class StellarRpcServer:
     state_file:  Path                # io_dir / 'state.kore'
     receipts_dir: Path               # io_dir / 'receipts'  — receipt_<hash>.json per transaction
     traces_dir:   Path               # io_dir / 'traces'    — trace_<hash>.jsonl per transaction
+    ledgers_dir:  Path               # io_dir / 'ledgers'   — ledger_<seq>.json per closed ledger
     requests_dir: Path               # io_dir / 'requests'  — request_<n>.json archive
 ```
 
@@ -42,7 +43,7 @@ server = StellarRpcServer(io_dir=Path('out'))
 server.handle_rpc('sendTransaction', {'transaction': xdr})
 ```
 
-For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `traceTransaction`) it builds a small envelope and runs it. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the one exception is the failure fallback (below). Each call is logged to stderr.
+For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `getTransactions`, `getLedgers`, `traceTransaction`) it builds a small envelope and runs it. For the history methods (`getTransactions`, `getLedgers`) the server also validates the pagination parameters — limit range, `startLedger` bounds, `cursor`/`startLedger` exclusivity — and resolves the cursor to the first ledger sequence to serve, because the JSON-RPC parameter-error path lives here. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the exceptions are the failure fallback (below) and the per-ledger XDR artifacts (`_record_closed_ledger`), which K cannot construct. Each call is logged to stderr.
 
 ---
 
@@ -65,7 +66,7 @@ At construction the server prepares the *io dir*, where `state.kore` lives at `i
 - **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}`.
 - **`state.kore` present** — it is used as-is, and `metadata.json` is seeded only if missing. This lets you resume a previous session (ledger counter and stored receipts included) or start against a pre-built state.
 
-In both cases the server creates the `receipts/`, `traces/`, and `requests/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
+In both cases the server creates the `receipts/`, `traces/`, `ledgers/`, and `requests/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
 
 Once the socket is bound, `serve` logs three lines to stderr: whether it is starting from a fresh state (an empty io-dir) or resuming an existing one (with the latest ledger), the io-dir path, and the listening address. Instruction tracing is always on, so every transaction the semantics run produces a trace. (Tracing only produces records for contract invocations.)
 
@@ -85,6 +86,8 @@ per successful transaction:
             write receipts/receipt_<hash>.json, bump latest_ledger in metadata.json,
             and write response.json
           → NodeInterpreter persists the new state.kore
+          → the server writes ledgers/ledger_<seq>.json (the ledger→tx index entry,
+            with the ledger-header XDR artifacts)
 
 per failed (stuck) transaction:
           → no response.json is produced; state.kore and metadata.json are left unchanged
@@ -189,6 +192,42 @@ The ledger-range fields (`latestLedger` through `oldestLedgerCloseTime`) are pre
 
 Receipts are an internal format, not a stable one: receipts written by older komet-node versions stored `ledger` as a string and lack `applicationOrder`/`feeBump`, and `getTransaction` returns stored receipts verbatim. Start from a fresh io-dir after upgrading rather than resuming one with old receipts.
 
+### `getTransactions`
+
+`getTransactions` returns the transactions in a ledger range, in chain order. Params: `startLedger` (number; mutually exclusive with a cursor), `pagination` `{cursor, limit}` (limit 1–200, default 50), and `xdrFormat` (`base64` only; `json` is rejected with `-32602`). The records are joined from the per-ledger index files (`ledgers/ledger_<seq>.json`) and the stored receipts. Failed transactions never close a ledger, so they do not appear in the history.
+
+```json
+{
+  "transactions": [
+    { "status": "SUCCESS", "txHash": "<64-char hex>", "applicationOrder": 1, "feeBump": false,
+      "envelopeXdr": "<base64 XDR>", "ledger": 5, "createdAt": 1716000000 }
+  ],
+  "latestLedger": 5, "latestLedgerCloseTimestamp": 1716000000,
+  "oldestLedger": 0, "oldestLedgerCloseTimestamp": 0,
+  "cursor": ""
+}
+```
+
+Serialization follows real stellar-rpc: ledger sequences and the top-level close times are JSON numbers, and per-transaction `createdAt` is a number too (unlike the singular `getTransaction`, where it is a string — an upstream quirk). `resultXdr`/`resultMetaXdr` are omitted while the receipts carry empty stubs. Each ledger holds exactly one transaction on this node, so `applicationOrder` is always `1`. The `cursor` is a TOID-style stringified integer (`ledger << 32 | applicationOrder << 12`) naming the page's last transaction when the page is full, and empty otherwise; resume by passing it as `pagination.cursor` (without `startLedger`).
+
+### `getLedgers`
+
+`getLedgers` returns the closed ledgers in a range and takes the same parameters as `getTransactions`. Each record comes straight from the ledger's index file; `headerXdr` (a `LedgerHeaderHistoryEntry`) and `metadataXdr` (a `LedgerCloseMeta`) are built by the server when the ledger closes, since K cannot construct XDR, and the ledger `hash` is the SHA-256 of the header XDR — unique per ledger and chained through `previousLedgerHash`.
+
+```json
+{
+  "ledgers": [
+    { "hash": "<64-char hex>", "sequence": 5, "ledgerCloseTime": "1716000000",
+      "headerXdr": "<base64 XDR>", "metadataXdr": "<base64 XDR>" }
+  ],
+  "latestLedger": 5, "latestLedgerCloseTime": 1716000000,
+  "oldestLedger": 0, "oldestLedgerCloseTime": 0,
+  "cursor": ""
+}
+```
+
+Per-ledger `ledgerCloseTime` is a *string* holding a decimal number (matching real stellar-rpc's Go `,string` encoding), while the top-level close times are numbers. The `cursor` is the last returned ledger sequence, stringified, under the same full-page rule as `getTransactions`.
+
 ---
 
 ## Failure fallback
@@ -207,4 +246,4 @@ komet-node [--host HOST] [--port PORT] [--io-dir DIR]
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port |
-| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `receipts/`, `traces/`, `requests/`) |
+| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `receipts/`, `traces/`, `ledgers/`, `requests/`) |

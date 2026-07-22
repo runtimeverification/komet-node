@@ -22,7 +22,7 @@ State lives in the io dir as `state.kore` (KORE world state) and `metadata.json`
 
 ## Tests (`src/tests/integration/`)
 
-- `test_server.py` drives the running HTTP server end-to-end. It exercises the read-only methods, `sendTransaction` + `getTransaction`, ledger increments, the full lifecycle (create → upload wasm → deploy → invoke), and the `traceTransaction` flows. `test_call_tx_with_args` deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` arguments, exercising the `scval_to_json` / `#decodeArg` pipeline.
+- `test_server.py` drives the running HTTP server end-to-end. It exercises the read-only methods, `sendTransaction` + `getTransaction`, the history methods (`getTransactions`/`getLedgers` response shapes, pagination, and parameter validation against the official spec and the Go protocol structs), ledger increments, the full lifecycle (create → upload wasm → deploy → invoke), and the `traceTransaction` flows. `test_call_tx_with_args` deploys `args.wat` and calls functions with `bool`, `u32`, `i32`, `u64`, `i64`, `u128`, `i128`, and `symbol` arguments, exercising the `scval_to_json` / `#decodeArg` pipeline.
 - `test_integration.py` and `test_unit.py` hold small sanity checks.
 
 Run with `make test` (requires `make kdist-build` first).
@@ -36,7 +36,8 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 - `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
 - `sendTransaction`'s `errorResultXdr` is always a generic `txMALFORMED` result (no per-cause codes such as `txBAD_SEQ` — sequence numbers, fees, and signatures are not modelled), and `diagnosticEventsXdr` is never populated (both fields are optional in the spec). `TRY_AGAIN_LATER` is never returned by design: it signals mempool backpressure, which cannot arise in a synchronous node without a mempool.
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
-- The `xdrFormat` parameter is accepted on `getTransaction` and `sendTransaction`, but only the default `'base64'` is supported; `'json'` is rejected with `-32602`.
-- `simulateTransaction`, `getEvents`, `getLedgerEntries`, `getTransactions`, `getLedgers`, and TTL/footprint operations are not implemented.
+- The `xdrFormat` parameter is accepted on `getTransaction`, `sendTransaction`, `getTransactions`, and `getLedgers`, but only the default `'base64'` is supported; `'json'` is rejected with `-32602`.
+- `simulateTransaction`, `getEvents`, `getLedgerEntries`, and TTL/footprint operations are not implemented.
 - `getFeeStats` reports constant distributions (there is no fee market); only its `latestLedger` is live.
+- `getTransactions` / `getLedgers` serve only ledgers with an index file under `ledgers/`; io-dirs created before the ledger index existed resume fine, but their earlier ledgers do not appear in the history.
 - Receipts are not a stable format: older io-dirs store `ledger`/`createdAt` with pre-spec types and lack `applicationOrder`/`feeBump`. Resume only io-dirs written by the same version, or start fresh.
