@@ -17,6 +17,9 @@ The semantics communicate with the Python process through files in the working d
 | `metadata.json` | K ↔ K | `{"latest_ledger": N}` — the ledger counter |
 | `receipts/receipt_<hash>.json` | K → Python | one stored receipt per transaction, keyed by tx hash |
 | `traces/trace_<hash>.jsonl` | K → Python | one execution trace per transaction (per-instruction records), keyed by tx hash |
+| `ledgers/ledger_<seq>.json` | Python → K | one record per closed ledger (`sequence`, `txHash`, `closedAt`, and the ledger-header XDR artifacts), written by the server and read back to serve `getTransactions`/`getLedgers` |
+| `events_staged.jsonl` | K → Python | the contract events of the transaction in flight, one JSON record per `contract_event` call |
+| `events/events_<ledger>.json` | Python → K | one finished JSON array of Event objects per ledger, served by `getEvents` |
 
 ---
 
@@ -39,7 +42,8 @@ insert-handleRequestFile → handleRequestFile
          ▼
 #dispatchMethod(method, request)        ← routes on the "method" field
          │
-         ├─ getHealth / getNetwork / getLatestLedger / getTransaction / traceTransaction → #respond(...)
+         ├─ getHealth / getNetwork / getLatestLedger / getVersionInfo / getFeeStats
+         │    / getTransaction / getTransactions / getLedgers / getLedgerEntries / getEvents / traceTransaction → #respond(...)
          │
          └─ sendTransaction → #runTx → run steps
                 → #finalizeTx → record receipt + bump ledger → #respond(...)
@@ -61,7 +65,12 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 - `getHealth` → `{ "status": "healthy", "latestLedger": N, "latestLedgerCloseTime": <now>, "oldestLedger": 0, "oldestLedgerCloseTime": "0", "ledgerRetentionWindow": N+1 }` (everything since genesis is retained)
 - `getNetwork` → `{ "passphrase": ..., "protocolVersion": ... }` (passphrase/version come from the request, keeping the semantics network-agnostic; `friendbotUrl` is omitted — no friendbot)
 - `getLatestLedger` → reads `metadata.json` and returns `{ "id": #ledgerId(seq), "protocolVersion": ..., "sequence": <latest_ledger> }`; `#ledgerId` derives a deterministic per-ledger 64-hex id from the sequence (the semantics have no hash hooks, so it is a fixed odd-constant multiply mod 2^256, which is injective)
+- `getVersionInfo` → echoes the version fields the server put into the envelope (`version`, `commitHash`, `buildTimestamp`, `captiveCoreVersion` — package metadata lives on the Python side); `protocolVersion` is a JSON number
+- `getFeeStats` → constant `#feeDistribution` objects (komet-node has no fee market) for `sorobanInclusionFee`/`inclusionFee`, plus a live `latestLedger` number from `metadata.json`; all distribution fields except `ledgerCount` are decimal strings, matching real stellar-rpc's Go `,string` encoding
 - `getTransaction` → reads the hash's `receipts/receipt_<hash>.json` file; returns the stored receipt merged with the ledger-range fields (`latestLedger`/`latestLedgerCloseTime`/`oldestLedger`/`oldestLedgerCloseTime`), or `{ "status": "NOT_FOUND", ... }` (with the same ledger-range fields) when the file is absent
+- `getTransactions` / `getLedgers` → walk the per-ledger index files `ledgers/ledger_<seq>.json` from the envelope's `startSeq` up to the latest ledger, taking at most `limit` records (`#txInfos` / `#ledgerInfos`), and format the history page (`#txHistoryPage` / `#ledgerHistoryPage`). Parameter validation and cursor resolution happen in the server; the response `cursor` (`#pageCursor`) names the page's last record when the page is full — a TOID for transactions, the plain sequence for ledgers — and is empty otherwise. Serialization matches real stellar-rpc, including its quirks: per-transaction `createdAt` is a JSON number (unlike singular `getTransaction`), per-ledger `ledgerCloseTime` is a decimal string, and empty `resultXdr`/`resultMetaXdr` stubs are omitted (`#optXdrEntry`)
+- `getLedgerEntries` → looks each *key descriptor* of the request up in the world-state cells (`<accounts>`, `<contracts>`, `<contractData>`, `<contractCodes>`) and responds with `{ "entries": [...], "latestLedger": <int> }`. The server decodes the base64 `LedgerKey` XDR into the descriptors beforehand and re-encodes the found entries as `LedgerEntryData` XDR afterwards (`ledger_entries.py`) — the entries in K's response are an intermediate JSON shape (per-kind payloads such as `balance`, `wasmHash`, or an ScVal value serialised by `#scVal2JSON`, the inverse of `#decodeArg`). Keys that match nothing are skipped via an `[owise]` rule — per the spec they are not an error
+- `getEvents` → scans the `events/events_<ledger>.json` files of the requested window, applies the request's filters (type, contract ids, topic matchers with `*`/`**`), and paginates; returns `{ "latestLedger": ..., "events": [...], "cursor": ... }`. The events themselves were captured during `sendTransaction`: a rule in `node.md` shadows the upstream no-op `contract_event` host function, resolves the topics/data host objects, and stages them in `events_staged.jsonl`; the Python server then produces the finished per-ledger files (base64 SCVal XDR and strkey ids are XDR work K cannot do). A `startLedger` beyond the chain tip is answered with `#respondError` (JSON-RPC `-32600`)
 
 `#respond(ID, RESULT)` is the shared terminal: it writes the JSON-RPC envelope to `response.json`, removes `request.json`, and sets the exit code to 0. `#respondError(ID, CODE, MSG)` is its error counterpart, writing `{jsonrpc, id, error: {code, message}}` instead; the unknown-method fallback uses it to answer `-32601 Method not found` (a safety net — the Python server filters unknown methods before they reach K).
 
@@ -83,16 +92,20 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 
 1. writes `metadata.json` with `latest_ledger + 1`,
 2. writes the receipt to `receipts/receipt_<hash>.json`:
-   `{ status: "SUCCESS", applicationOrder: 1, feeBump: false, envelopeXdr, resultXdr: "", resultMetaXdr: "", ledger, createdAt }`,
+   `{ status: "SUCCESS", applicationOrder: 1, feeBump: false, envelopeXdr, ledger, createdAt, returnValue }` — `returnValue` is
+   the contract call's return `ScVal`, JSON-encoded by `#scValToJSON` (or `null` when the
+   transaction made no contract call), read off the `<hostStack>` before the host is reset,
 3. responds with `{hash, status: "PENDING", latestLedger, latestLedgerCloseTime}`.
 
-A `sendTransaction` whose hash already has a receipt never reaches `#runTx`: dispatch answers `{hash, status: "DUPLICATE", latestLedger, latestLedgerCloseTime}` directly, without executing anything or advancing the ledger. (For wasm uploads the Python server also suppresses the `<program>` injection on duplicates, since those steps would run before dispatch.)
+The internal `returnValue` field never reaches an RPC client: the Python server immediately rewrites it into the spec-mandated `resultXdr`/`resultMetaXdr` base64 XDR fields (`_attach_result_xdr` in `server.py`), because K cannot construct XDR. To keep the return value observable here, `uncheckedCallTx` (unlike komet's `callTx`) does not `#resetHost` after the call; `#recordAndRespond` serialises the stack top and resets the host instead.
+
+A `sendTransaction` whose hash already has a receipt never reaches `#runTx`: dispatch answers `{hash, status: "DUPLICATE", latestLedger, latestLedgerCloseTime}` directly, without executing anything or advancing the ledger. (For wasm uploads the Python server also suppresses the `<program>` injection on duplicates, since those steps would run before dispatch.) The Python `_attach_result_xdr` rewrite is skipped for duplicates, so a resubmission never disturbs the stored receipt.
 
 The trace is not part of the receipt — the executing steps already appended it to `traces/trace_<hash>.jsonl`. Reaching `#finalizeTx` means the steps completed without getting stuck, so the status is `SUCCESS`. A failed transaction gets stuck before this point, `response.json` is never written, and the Python server records the `FAILED` receipt instead.
 
 ### traceTransaction
 
-`traceTransaction` is a read-only lookup. It takes a `hash` (the same parameter `getTransaction` takes) and responds with the contents of `traces/trace_<hash>.jsonl` parsed into a JSON array (one record per executed instruction), or `null` when no trace file exists for that hash. Because tracing is always on, every `sendTransaction` writes this file.
+`traceTransaction` is a komet-specific extension, not part of the Stellar RPC specification (see [server.md](server.md#tracetransaction-komet-specific-extension)). It is a read-only lookup: it takes a `hash` (the same parameter `getTransaction` takes) and responds with the contents of `traces/trace_<hash>.jsonl` parsed into a JSON array (one record per executed instruction), or `null` when no trace file exists for that hash. Because tracing is always on, every `sendTransaction` writes this file.
 
 ### Two ways steps are delivered
 
@@ -107,7 +120,8 @@ The trace is not part of the receipt — the executing steps already appended it
 
 - `#getJSON(key, obj[, default])`, `#getString(key, obj)`, `#getInt(key, obj)` — read a field
 - `#concatJSONs(a, b)` — append object entries (used to merge `latestLedger` fields into a stored receipt)
-- `#receiptFile(hash)`, `#traceFile(hash)` — build the per-transaction file paths (`receipts/receipt_<hash>.json`, `traces/trace_<hash>.jsonl`)
+- `#receiptFile(hash)`, `#traceFile(hash)`, `#ledgerFile(seq)` — build the per-item file paths (`receipts/receipt_<hash>.json`, `traces/trace_<hash>.jsonl`, `ledgers/ledger_<seq>.json`)
+- `#readJSONFile(path)`, `#asInt(json)`, `#lengthJSONs(list)`, `#lastIntIn(key, list)` — small conveniences for the history methods
 
 These complement the **order-sensitive** step decoders below.
 
@@ -142,6 +156,10 @@ rule HexBytes("") => .Bytes
 rule HexBytes(S)  => Int2Bytes(lengthString(S) /Int 2, String2Base(S, 16), BE)
   requires lengthString(S) >Int 0
 ```
+
+### `Bytes2Hex(Bytes) → String`
+
+The inverse direction is K's built-in `Bytes2Hex` (hook `BYTES.bytes2hex`): it encodes `Bytes` as a lowercase, zero-padded hex string. The `getLedgerEntries` rules use it to report hashes, addresses, and `ScBytes` values to the server.
 
 ### `string2WasmToken(String) → WasmStringToken`
 
