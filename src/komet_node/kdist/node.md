@@ -50,11 +50,14 @@ module NODE
                    | #runTx( JSON )
                    | #finalizeTx( JSON )
                    | #recordAndRespond( JSON, Int )
-                   | #respondTx( JSON, Int )
+                   | #respondTx( JSON, String, Int )
                    | #enableTrace( String )
                    | #getTxResult( String, String, JSON, Int )
                    | #respondTrace( JSON, String )
                    | #respond( JSON, JSON )
+                   | #respondError( JSON, Int, String )
+                   | #respondHealth( JSON, String, Int )
+                   | #respondLatestLedger( JSON, Int, Int )
 
     syntax Step ::= setLedgerSequence(Int)    [symbol(setLedgerSequence)]
  // ----------------------------------------------------------------------
@@ -158,7 +161,9 @@ bookkeeping.
 
 #dispatch reads the `method` field of the request envelope and routes to a per-method
 rule. `#respond(ID, RESULT)` writes the JSON-RPC envelope to `response.json`, removes
-`request.json`, and marks the run successful (exit code 0).
+`request.json`, and marks the run successful (exit code 0). `#respondError(ID, CODE, MSG)`
+is its error-response counterpart: it writes a JSON-RPC error envelope (with an `error`
+member instead of `result`, per JSON-RPC 2.0) and otherwise behaves the same.
 
 ```k
     rule <k> #dispatch( REQ ) => #dispatchMethod( #getString( "method", REQ ), REQ ) ... </k>
@@ -173,41 +178,118 @@ rule. `#respond(ID, RESULT)` writes the JSON-RPC envelope to `response.json`, re
              ...
          </k>
          <exitCode> _ => 0 </exitCode>
+
+    rule <k> #respondError( ID, CODE, MSG )
+          => #writeFile( "response.json", JSON2String({
+                 "jsonrpc" : "2.0",
+                 "id"      : ID,
+                 "error"   : { "code" : CODE, "message" : MSG }
+             }))
+          ~> #remove( "request.json" )
+             ...
+         </k>
+         <exitCode> _ => 0 </exitCode>
 ```
 
 ###############################################################################
 ## Read-only methods
 
+The response shapes follow real stellar-rpc's serialization: ledger sequence numbers,
+`protocolVersion`, and `ledgerRetentionWindow` are JSON numbers, while close-time fields
+are int64s that Go serializes with `,string` — JSON strings holding a decimal integer.
+`friendbotUrl` is an `omitempty` field and this node runs no friendbot, so it is omitted
+entirely (not `null`).
+
+This node retains every ledger since genesis, so `getHealth` reports `oldestLedger` 0 and a
+retention window covering all ledgers so far. Close times are not recorded per ledger: the
+latest close time is approximated by the request time (`now`, as everywhere else in this
+module) and the oldest by the epoch (`"0"`).
+
 ```k
     rule <k> #dispatchMethod( "getHealth", REQ )
-          => #respond( #getJSON( "id", REQ ), { "status" : "healthy" } )
+          => #respondHealth(
+                 #getJSON( "id", REQ ),
+                 #getString( "now", REQ ),
+                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) )
+             )
+             ...
+         </k>
+
+    rule <k> #respondHealth( ID, NOW, LL )
+          => #respond( ID, {
+                 "status"                : "healthy",
+                 "latestLedger"          : LL,
+                 "latestLedgerCloseTime" : NOW,
+                 "oldestLedger"          : 0,
+                 "oldestLedgerCloseTime" : "0",
+                 "ledgerRetentionWindow" : LL +Int 1
+             })
              ...
          </k>
 
     rule <k> #dispatchMethod( "getNetwork", REQ )
           => #respond( #getJSON( "id", REQ ), {
-                 "friendbotUrl"    : null,
                  "passphrase"      : #getString( "passphrase", REQ ),
-                 "protocolVersion" : #getString( "protocolVersion", REQ )
+                 "protocolVersion" : #getInt( "protocolVersion", REQ )
              })
              ...
          </k>
 
     rule <k> #dispatchMethod( "getLatestLedger", REQ )
-          => #respond( #getJSON( "id", REQ ), {
-                 "id"              : "0000000000000000000000000000000000000000000000000000000000000000",
-                 "protocolVersion" : #getString( "protocolVersion", REQ ),
-                 "sequence"        : #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) )
+          => #respondLatestLedger(
+                 #getJSON( "id", REQ ),
+                 #getInt( "protocolVersion", REQ ),
+                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) )
+             )
+             ...
+         </k>
+
+    rule <k> #respondLatestLedger( ID, PV, SEQ )
+          => #respond( ID, {
+                 "id"              : #ledgerId( SEQ ),
+                 "protocolVersion" : PV,
+                 "sequence"        : SEQ
              })
              ...
          </k>
 ```
 
+`#ledgerId` derives the ledger's `id` (the hash of the ledger header on a real chain) from
+its sequence number. This node has no ledger headers to hash — and the semantics have no
+hash hooks — so the id is a deterministic stand-in: the sequence (offset by one so ledger 0
+is not the all-zeros hash) multiplied by a fixed odd 256-bit constant, mod 2^256, printed as
+64 lowercase hex characters. Multiplication by an odd constant is injective mod a power of
+two, so every ledger gets a distinct id. The constant is ⌊2^256/φ⌋ rounded to odd
+(0x9e3779b97f4a7c15... — the golden-ratio constant, chosen only to spread the bits).
+
+```k
+    syntax String ::= #ledgerId( Int ) [function, total, symbol(ledgerId)]
+ // ----------------------------------------------------------------------
+    rule #ledgerId( SEQ )
+      => #padLeftZeros(
+             Base2String(
+                 ((SEQ +Int 1) *Int 71563446777022297856526126342750658392501306254664949883333486863006233104021)
+                     modInt (2 ^Int 256),
+                 16
+             ),
+             64
+         )
+
+    syntax String ::= #padLeftZeros( String, Int ) [function, total, symbol(padLeftZeros)]
+ // --------------------------------------------------------------------------------------
+    rule #padLeftZeros( S, N ) => S requires lengthString(S) >=Int N
+    rule #padLeftZeros( S, N ) => #padLeftZeros( "0" +String S, N ) requires lengthString(S) <Int N
+```
+
 ## getTransaction
 
 Look up the stored receipt by hash in its `receipts/receipt_<hash>.json` file. If the file
-exists, return its contents merged with the current `latestLedger`/`latestLedgerCloseTime`;
-otherwise return `NOT_FOUND`.
+exists, return its contents merged with the ledger-range fields; otherwise return
+`NOT_FOUND`. The ledger range (`latestLedger`/`latestLedgerCloseTime`/`oldestLedger`/
+`oldestLedgerCloseTime`) is required on every `getTransaction` response, whatever the
+status. Ledger sequences are JSON numbers; the close times use the int64-as-string
+encoding (see the read-only methods above) — the oldest ledger is always 0 on this node
+and its close time is not recorded, so the constant `"0"` stands in.
 
 ```k
     rule <k> #dispatchMethod( "getTransaction", REQ )
@@ -223,8 +305,10 @@ otherwise return `NOT_FOUND`.
     rule <k> #getTxResult( HASH, NOW, ID, LL )
           => #respond( ID, { #concatJSONs(
                  #recordOf( String2JSON( {#readFile( #receiptFile( HASH ) )}:>String ) ),
-                 ( "latestLedger"          : Int2String( LL ) ,
+                 ( "latestLedger"          : LL ,
                    "latestLedgerCloseTime" : NOW ,
+                   "oldestLedger"          : 0 ,
+                   "oldestLedgerCloseTime" : "0" ,
                    .JSONs )
              )})
              ...
@@ -234,8 +318,10 @@ otherwise return `NOT_FOUND`.
     rule <k> #getTxResult( HASH, NOW, ID, LL )
           => #respond( ID, {
                  "status"                : "NOT_FOUND",
-                 "latestLedger"          : Int2String( LL ),
-                 "latestLedgerCloseTime" : NOW
+                 "latestLedger"          : LL,
+                 "latestLedgerCloseTime" : NOW,
+                 "oldestLedger"          : 0,
+                 "oldestLedgerCloseTime" : "0"
              })
              ...
          </k>
@@ -255,15 +341,34 @@ with `PENDING`. Instruction tracing is always on: the executing steps append to 
 transaction's own `traces/trace_<hash>.jsonl` file, which `traceTransaction` (below) later
 retrieves by hash. The receipt itself does not carry the trace.
 
+A transaction whose hash already has a receipt is a duplicate submission: it is answered
+with status `DUPLICATE` and is **not** re-executed — the ledger does not advance and the
+stored receipt is left untouched. (On the wasm-upload path the Python server suppresses the
+`<program>` injection for duplicates, so nothing runs before dispatch either; see
+server.py.)
+
 The steps come either from the `steps` array of the request envelope (the common path) or
 from the `<program>` cell (the wasm-upload path, where they were pre-injected and have
 already run by the time we get here, leaving `steps` empty).
 
 ```k
     rule <k> #dispatchMethod( "sendTransaction", REQ ) => #runTx( REQ ) ... </k>
+      requires notBool #fileExists( #receiptFile( #getString( "txHash", REQ ) ) )
 
-    // Unknown method — respond with a null result.
-    rule <k> #dispatchMethod( _, REQ ) => #respond( #getJSON( "id", REQ ), null ) ... </k> [owise]
+    rule <k> #dispatchMethod( "sendTransaction", REQ )
+          => #respondTx( REQ, "DUPLICATE",
+                 #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ) )
+             ...
+         </k>
+      requires #fileExists( #receiptFile( #getString( "txHash", REQ ) ) )
+
+    // Unknown method — the JSON-RPC "Method not found" error. (The Python server filters
+    // unknown methods before they reach the semantics, so this is a safety net for
+    // envelopes injected directly.)
+    rule <k> #dispatchMethod( _, REQ )
+          => #respondError( #getJSON( "id", REQ ), -32601, "Method not found" )
+             ...
+         </k> [owise]
 
     rule <k> #runTx( REQ )
           => #enableTrace( #traceFile( #getString( "txHash", REQ ) ) )
@@ -291,9 +396,16 @@ After the steps run, record the receipt, write the new ledger counter, and respo
 was already written to its own file during execution, so we only reset `<ioDir>`. Reaching
 this point means the steps completed without getting stuck, so the status is `SUCCESS`.
 
-The receipt carries the contract call's return value (if the transaction made one): after
-`uncheckedCallTx` runs, the call's result `ScVal` is still sitting on the `<hostStack>` (see
-below), so we serialise it into the receipt's internal `returnValue` field and only then
+The receipt holds the per-transaction half of a `getTransaction` response, with the
+serialization getTransaction requires: `ledger` is a JSON number, `createdAt` an
+int64-as-string. Every ledger on this node contains exactly one transaction, so
+`applicationOrder` is always 1, and fee-bump envelopes are not supported, so `feeBump` is
+always false. (The Python failure fallback in server.py writes a `FAILED` receipt with the
+same field set — keep the two in sync.)
+
+The receipt also carries the contract call's return value (if the transaction made one):
+after `uncheckedCallTx` runs, the call's result `ScVal` is still sitting on the `<hostStack>`
+(see below), so we serialise it into the receipt's internal `returnValue` field and only then
 reset the host. The Python server immediately rewrites that field into the spec-mandated
 `resultXdr`/`resultMetaXdr` base64 XDR fields (K cannot construct XDR), so `returnValue`
 never reaches an RPC client.
@@ -313,7 +425,7 @@ never reaches an RPC client.
           ~> #writeFile( #receiptFile( #getString( "txHash", REQ ) ),
                  JSON2String( #txReceipt( REQ, L +Int 1, #returnValueJSON( STACK ) ) ) )
           ~> #resetHost
-          ~> #respondTx( REQ, L +Int 1 )
+          ~> #respondTx( REQ, "PENDING", L +Int 1 )
              ...
          </k>
          <hostStack> STACK </hostStack>
@@ -321,11 +433,13 @@ never reaches an RPC client.
     syntax JSON ::= #txReceipt( JSON, Int, JSON ) [function, symbol(txReceipt)]
  // ---------------------------------------------------------------------------
     rule #txReceipt( REQ, NEWL, RETVAL ) => {
-            "status"        : "SUCCESS",
-            "ledger"        : Int2String( NEWL ),
-            "createdAt"     : #getString( "now", REQ ),
-            "envelopeXdr"   : #getString( "envelopeXdr", REQ ),
-            "returnValue"   : RETVAL
+            "status"           : "SUCCESS",
+            "applicationOrder" : 1,
+            "feeBump"          : false,
+            "envelopeXdr"      : #getString( "envelopeXdr", REQ ),
+            "ledger"           : NEWL,
+            "createdAt"        : #getString( "now", REQ ),
+            "returnValue"      : RETVAL
         }
 
     // The return value of the transaction's contract call: the ScVal left on top of the
@@ -335,11 +449,11 @@ never reaches an RPC client.
     rule #returnValueJSON( VAL:ScVal : _ ) => #scValToJSON( VAL )
     rule #returnValueJSON( _ )             => null                 [owise]
 
-    rule <k> #respondTx( REQ, NEWL )
+    rule <k> #respondTx( REQ, STATUS, LL )
           => #respond( #getJSON( "id", REQ ), {
                  "hash"                  : #getString( "txHash", REQ ),
-                 "status"                : "PENDING",
-                 "latestLedger"          : Int2String( NEWL ),
+                 "status"                : STATUS,
+                 "latestLedger"          : LL,
                  "latestLedgerCloseTime" : #getString( "now", REQ )
              })
              ...
