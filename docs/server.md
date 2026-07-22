@@ -19,6 +19,20 @@ class StellarRpcServer:
 
 The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `BaseHTTPRequestHandler` reads each POST body and calls `_handle`, which parses the JSON-RPC frame and delegates to `handle_rpc`.
 
+### JSON-RPC framing
+
+The server implements the JSON-RPC 2.0 framing rules, including batch calls:
+
+- A single request object gets a single response object.
+- An **array** body is a batch: each element is validated and dispatched on its own, and the response is an array with one entry per answered element (matched by `id`; invalid elements each get an Invalid Request error with `id: null`). Batch elements run sequentially — the server is single-threaded by design, so a batch is equivalent to sending its elements one at a time. An empty array is answered with a single Invalid Request error object, per the spec.
+- A request without an `id` member is a **notification**: it is executed but never answered, not even with an error. A batch of only notifications (or a single notification) produces an empty response body.
+
+Framing happens entirely in Python (`_handle` / `_handle_batch` / `_handle_single`); the K semantics see one request envelope per invocation regardless of how requests were framed on the wire.
+
+### The `xdrFormat` parameter
+
+`getTransaction` and `sendTransaction` accept the spec's optional `xdrFormat` parameter. Only `'base64'`, the spec default, is supported: XDR fields in responses are always base64 strings. The alternative `'json'` format (XDR rendered as JSON objects) is not implemented and is rejected with error `-32602` and a message saying so; any other value is rejected with `-32602` as well. The check runs before anything else, so a `sendTransaction` with a bad `xdrFormat` is rejected without executing the transaction.
+
 ### `handle_rpc(method, params, request_id) -> str`
 
 `handle_rpc` is the dispatch entry point; it returns the JSON-RPC response envelope as a string. You can call it **without** the HTTP layer, which is convenient for scripts and tests:
@@ -83,7 +97,7 @@ Because these artifacts live on disk, the server can be stopped and restarted wi
 
 ## RPC methods
 
-All methods are answered by the K semantics and follow the [Stellar RPC specification](https://developers.stellar.org/docs/data/apis/rpc/methods), including its serialization quirks: ledger sequence numbers and `protocolVersion` are JSON numbers, while close-time fields (`latestLedgerCloseTime`, `oldestLedgerCloseTime`, `createdAt`) are int64s serialized as JSON strings holding a decimal integer, matching what real stellar-rpc emits.
+All methods are answered by the K semantics and follow the [Stellar RPC specification](https://developers.stellar.org/docs/data/apis/rpc/methods) — except `traceTransaction`, which is a komet-specific extension (see below) — including its serialization quirks: ledger sequence numbers and `protocolVersion` are JSON numbers, while close-time fields (`latestLedgerCloseTime`, `oldestLedgerCloseTime`, `createdAt`) are int64s serialized as JSON strings holding a decimal integer, matching what real stellar-rpc emits.
 
 ### `getHealth`
 
@@ -124,7 +138,9 @@ Resubmitting a transaction whose hash already has a receipt returns status `DUPL
 
 A transaction that decodes as XDR but cannot be processed (e.g. it contains an operation the semantics do not support) is rejected at admission time with status `ERROR` and an `errorResultXdr` carrying a `txMALFORMED` `TransactionResult` — mirroring how real stellar-rpc reports core's admission rejections. Such a transaction never reaches the ledger: no receipt is stored (`getTransaction` stays `NOT_FOUND`) and the ledger does not advance. Undecodable XDR remains a plain `-32602 Invalid params` error, as in real stellar-rpc. `TRY_AGAIN_LATER` is never returned: it signals mempool backpressure, and komet-node executes synchronously without a mempool, so the condition it reports cannot arise.
 
-### `traceTransaction`
+### `traceTransaction` (komet-specific extension)
+
+`traceTransaction` is **not part of the Stellar RPC specification** — it exists only on komet-node, and clients must not expect it from real Stellar RPC endpoints. It keeps its plain name rather than a vendor-prefixed one (`komet_traceTransaction`): the official spec has no method of that name and none is announced, so there is no collision to avoid, and renaming would break every existing client for no gain. If stellar-rpc ever claims the name, the method will be renamed with a prefix.
 
 `traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored on that transaction's receipt. The result is the trace itself: a JSONL string with one record per executed WebAssembly instruction, or `null` when no transaction with that hash exists.
 

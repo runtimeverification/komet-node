@@ -49,14 +49,18 @@ def _rpc(port: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
     return _post(port, body)
 
 
-def _post(port: int, body: bytes) -> dict[str, Any]:
+def _post(port: int, body: bytes) -> Any:
+    return json.loads(_post_raw(port, body))
+
+
+def _post_raw(port: int, body: bytes) -> bytes:
     req = urllib.request.Request(
         f'http://localhost:{port}',
         data=body,
         headers={'Content-Type': 'application/json'},
     )
     with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+        return resp.read()
 
 
 # Spec-shape helpers. The official serialization rules come from the Go structs in
@@ -280,7 +284,7 @@ def test_malformed_body_returns_parse_error(server: StellarRpcServer) -> None:
 
 
 def test_non_object_frame_returns_invalid_request(server: StellarRpcServer) -> None:
-    result = _post(server.port(), b'[1, 2, 3]')
+    result = _post(server.port(), b'"just a string"')
     assert result['error']['code'] == -32600
 
 
@@ -723,3 +727,166 @@ def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
 
     # All four transactions, including the non-Void invocation, advanced the ledger.
     assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 4
+
+
+# ----------------------------------------------------------------------
+# xdrFormat parameter (getTransaction / sendTransaction)
+#
+# Real stellar-rpc accepts an optional `xdrFormat` param on both methods
+# (protocols/rpc: GetTransactionRequest.Format, SendTransactionRequest.Format)
+# and rejects invalid values with InvalidParams (-32602). komet-node supports
+# only 'base64' (the default); 'json' is rejected with a clear -32602 error.
+# ----------------------------------------------------------------------
+
+
+def test_xdr_format_base64_behaves_as_default(server: StellarRpcServer) -> None:
+    """xdrFormat 'base64' is the explicit spelling of the default on both methods."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    send_result = _rpc(
+        server.port(),
+        'sendTransaction',
+        {'transaction': _create_account_xdr(keypair, account), 'xdrFormat': 'base64'},
+    )
+    assert send_result['result']['status'] == 'PENDING'
+    tx_hash = send_result['result']['hash']
+
+    get_result = _rpc(server.port(), 'getTransaction', {'hash': tx_hash, 'xdrFormat': 'base64'})
+    assert get_result['result']['status'] == 'SUCCESS'
+
+
+def test_get_transaction_xdr_format_json_returns_invalid_params(server: StellarRpcServer) -> None:
+    """komet-node does not support the JSON XDR format: reject with a clear -32602 error."""
+    result = _rpc(server.port(), 'getTransaction', {'hash': '0' * 64, 'xdrFormat': 'json'})
+    assert result['error']['code'] == -32602
+    assert 'json' in result['error']['message'].lower()
+
+
+def test_get_transaction_xdr_format_invalid_value_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'getTransaction', {'hash': '0' * 64, 'xdrFormat': 'yaml'})
+    assert result['error']['code'] == -32602
+
+
+def test_get_transaction_xdr_format_non_string_returns_invalid_params(server: StellarRpcServer) -> None:
+    result = _rpc(server.port(), 'getTransaction', {'hash': '0' * 64, 'xdrFormat': 42})
+    assert result['error']['code'] == -32602
+
+
+def test_send_transaction_xdr_format_json_returns_invalid_params_without_executing(server: StellarRpcServer) -> None:
+    """An unsupported xdrFormat is rejected before the transaction runs: no state change."""
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    result = _rpc(
+        server.port(),
+        'sendTransaction',
+        {'transaction': _create_account_xdr(keypair, account), 'xdrFormat': 'json'},
+    )
+    assert result['error']['code'] == -32602
+    assert 'json' in result['error']['message'].lower()
+
+    # The transaction must not have executed: no receipt written, ledger not advanced.
+    assert list((server.io_dir / 'receipts').iterdir()) == []
+    assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 0
+
+
+def test_send_transaction_xdr_format_invalid_value_returns_invalid_params(server: StellarRpcServer) -> None:
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    result = _rpc(
+        server.port(),
+        'sendTransaction',
+        {'transaction': _create_account_xdr(keypair, account), 'xdrFormat': 'yaml'},
+    )
+    assert result['error']['code'] == -32602
+    assert list((server.io_dir / 'receipts').iterdir()) == []
+
+
+# ----------------------------------------------------------------------
+# JSON-RPC 2.0 batch requests
+#
+# Per JSON-RPC 2.0 section 6: an array of request objects yields an array of
+# response objects (matched by id, order not significant); an empty array is a
+# single Invalid Request error; invalid batch elements each yield an Invalid
+# Request error with id null; notifications (no id) get no response, and a
+# batch of only notifications yields no response body at all.
+# ----------------------------------------------------------------------
+
+
+def _batch(port: int, requests: list[dict[str, Any]]) -> Any:
+    return _post(port, json.dumps(requests).encode())
+
+
+def test_batch_request_returns_array_of_responses(server: StellarRpcServer) -> None:
+    responses = _batch(
+        server.port(),
+        [
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'getHealth', 'params': {}},
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'getLatestLedger', 'params': {}},
+        ],
+    )
+    assert isinstance(responses, list)
+    assert len(responses) == 2
+    by_id = {response['id']: response for response in responses}
+    assert set(by_id) == {1, 2}
+    for response in responses:
+        assert response['jsonrpc'] == '2.0'
+    assert by_id[1]['result']['status'] == 'healthy'
+    assert by_id[2]['result']['sequence'] == 0
+
+
+def test_empty_batch_returns_single_invalid_request(server: StellarRpcServer) -> None:
+    """An empty array is not a valid batch: one Invalid Request error object, not an array."""
+    result = _post(server.port(), b'[]')
+    assert isinstance(result, dict)
+    assert result['error']['code'] == -32600
+    assert result['id'] is None
+
+
+def test_batch_of_invalid_elements_returns_error_per_element(server: StellarRpcServer) -> None:
+    """rpc call with an invalid batch: one Invalid Request response per element, id null."""
+    responses = _post(server.port(), b'[1, 2, 3]')
+    assert isinstance(responses, list)
+    assert len(responses) == 3
+    for response in responses:
+        assert response['jsonrpc'] == '2.0'
+        assert response['error']['code'] == -32600
+        assert response['id'] is None
+
+
+def test_batch_mixed_valid_and_invalid_elements(server: StellarRpcServer) -> None:
+    responses = _batch(
+        server.port(),
+        [
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'getHealth', 'params': {}},
+            {'foo': 'boo'},
+            {'jsonrpc': '2.0', 'id': 2, 'method': 'noSuchMethod', 'params': {}},
+        ],
+    )
+    assert isinstance(responses, list)
+    assert len(responses) == 3
+    by_id = {response['id']: response for response in responses}
+    assert by_id[1]['result']['status'] == 'healthy'
+    assert by_id[None]['error']['code'] == -32600
+    assert by_id[2]['error']['code'] == -32601
+
+
+def test_batch_notification_gets_no_response(server: StellarRpcServer) -> None:
+    """A request without an id is a notification: it is executed but not answered."""
+    responses = _batch(
+        server.port(),
+        [
+            {'jsonrpc': '2.0', 'id': 1, 'method': 'getHealth', 'params': {}},
+            {'jsonrpc': '2.0', 'method': 'getHealth', 'params': {}},  # notification
+        ],
+    )
+    assert isinstance(responses, list)
+    assert len(responses) == 1
+    assert responses[0]['id'] == 1
+    assert responses[0]['result']['status'] == 'healthy'
+
+
+def test_batch_of_only_notifications_returns_nothing(server: StellarRpcServer) -> None:
+    """If every batch element is a notification, the server must not return an empty array."""
+    body = json.dumps([{'jsonrpc': '2.0', 'method': 'getHealth', 'params': {}}]).encode()
+    raw = _post_raw(server.port(), body)
+    assert raw.strip() == b''

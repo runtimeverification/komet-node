@@ -92,7 +92,7 @@ The trace is not part of the receipt — the executing steps already appended it
 
 ### traceTransaction
 
-`traceTransaction` is a read-only lookup. It takes a `hash` (the same parameter `getTransaction` takes) and responds with the contents of `traces/trace_<hash>.jsonl`, or `null` when no trace file exists for that hash. Because tracing is always on, every `sendTransaction` writes this file.
+`traceTransaction` is a komet-specific extension, not part of the Stellar RPC specification (see [server.md](server.md#tracetransaction-komet-specific-extension)). It is a read-only lookup: it takes a `hash` (the same parameter `getTransaction` takes) and responds with the contents of `traces/trace_<hash>.jsonl`, or `null` when no trace file exists for that hash. Because tracing is always on, every `sendTransaction` writes this file.
 
 ### Two ways steps are delivered
 
