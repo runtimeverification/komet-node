@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.10, <4"
 resolution-markers = [
     "python_full_version >= '3.11'",
@@ -703,7 +703,7 @@ wheels = [
 
 [[package]]
 name = "kframework"
-version = "7.1.319"
+version = "7.1.323"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "coloredlogs" },
@@ -722,15 +722,15 @@ dependencies = [
     { name = "tomli-w" },
     { name = "xdg-base-dirs" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b6/9f/4f483cd6ac148795fdefc314f113740056c4fa272a7bf2c5470b4c5ac7ba/kframework-7.1.319.tar.gz", hash = "sha256:a5c3299661ae11d4463c1a8ba49e0f941428b30f0247c0f3005f36d3d7bbf271", size = 244504, upload-time = "2026-04-27T13:56:07.565Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/2a/d9/a88f051a023540ea9bbab889183bb87e01869c4ebf6565de32bd5b93b439/kframework-7.1.323.tar.gz", hash = "sha256:29f1ef525a29ba2a1410614ce05c4526e6e44b977232ca107f50ff2750d4e149", size = 245892, upload-time = "2026-05-12T14:44:19.937Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/a2/d9/49627f3a9eafc143087382a8e892d29bb81186ae1ebb8e667d15ac937537/kframework-7.1.319-py3-none-any.whl", hash = "sha256:5441f7a2ac6633afa1491f4817f6dc3631b9f74e2017632ca9586b7c544e1642", size = 296077, upload-time = "2026-04-27T13:56:05.99Z" },
+    { url = "https://files.pythonhosted.org/packages/e7/db/d555255f53fdb36ffdcdfb303529f07e939018ddb58a4392eb13f19dbe4d/kframework-7.1.323-py3-none-any.whl", hash = "sha256:d0b23ccf44babb5e3ac735e00242d0a41435864ec66012d761cf6718aee53413", size = 297459, upload-time = "2026-05-12T14:44:18.443Z" },
 ]
 
 [[package]]
 name = "komet"
-version = "0.1.79"
-source = { git = "https://github.com/runtimeverification/komet.git?rev=v0.1.79#cad37497d502a38f11a523f3edca0554b60c2268" }
+version = "0.1.84"
+source = { git = "https://github.com/runtimeverification/komet.git?rev=v0.1.85#089b3aa59bcb685764a4579f7077ca1c2add8168" }
 dependencies = [
     { name = "pykwasm" },
     { name = "tomli" },
@@ -769,8 +769,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "kframework", specifier = ">=7.1.318,<7.1.321" },
-    { name = "komet", git = "https://github.com/runtimeverification/komet.git?rev=v0.1.79" },
+    { name = "kframework", specifier = ">=7.1.323,<7.1.324" },
+    { name = "komet", git = "https://github.com/runtimeverification/komet.git?rev=v0.1.85" },
     { name = "stellar-sdk", specifier = ">=13.2.1" },
 ]
 
@@ -1218,8 +1218,8 @@ wheels = [
 
 [[package]]
 name = "py-wasm"
-version = "0.3.0"
-source = { git = "https://github.com/runtimeverification/py-wasm.git?rev=0.3.0#07677b120f40b86d5b7839e2dde42889967dcfce" }
+version = "0.3.1"
+source = { git = "https://github.com/runtimeverification/py-wasm.git?rev=0.3.1#19f5a32b227c3f05cb49a604af65dfb7cc1ff083" }
 dependencies = [
     { name = "cytoolz", marker = "implementation_name == 'cpython'" },
     { name = "mypy-extensions" },
@@ -1405,8 +1405,8 @@ wheels = [
 
 [[package]]
 name = "pykwasm"
-version = "0.1.150"
-source = { git = "https://github.com/runtimeverification/wasm-semantics.git?subdirectory=pykwasm&rev=v0.1.150#5ce9140c07a468c5616f9501b9a8ef1a57896fcc" }
+version = "0.1.155"
+source = { git = "https://github.com/runtimeverification/wasm-semantics.git?subdirectory=pykwasm&rev=v0.1.155#bd5cbe7bfb3aafbeb4740884fed905394b542320" }
 dependencies = [
     { name = "kframework" },
     { name = "py-wasm" },
