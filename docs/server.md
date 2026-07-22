@@ -14,7 +14,9 @@ class StellarRpcServer:
     state_file:  Path                # io_dir / 'state.kore'
     receipts_dir: Path               # io_dir / 'receipts'  — receipt_<hash>.json per transaction
     traces_dir:   Path               # io_dir / 'traces'    — trace_<hash>.jsonl per transaction
+    ledgers_dir:  Path               # io_dir / 'ledgers'   — ledger_<seq>.json per closed ledger
     requests_dir: Path               # io_dir / 'requests'  — request_<n>.json archive
+    events_dir:   Path               # io_dir / 'events'    — events_<ledger>.json per ledger
 ```
 
 The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `BaseHTTPRequestHandler` reads each POST body and calls `_handle`, which parses the JSON-RPC frame and delegates to `handle_rpc`.
@@ -42,7 +44,7 @@ server = StellarRpcServer(io_dir=Path('out'))
 server.handle_rpc('sendTransaction', {'transaction': xdr})
 ```
 
-For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `traceTransaction`) it builds a small envelope and runs it. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the one exception is the failure fallback (below). Each call is logged to stderr.
+For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for `simulateTransaction` it builds the envelope with `encoder.build_simulate_request` and runs it without committing; for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `getTransactions`, `getLedgers`, `getLedgerEntries`, `getEvents`, `traceTransaction`) it builds a small envelope and runs it. For the history methods (`getTransactions`, `getLedgers`) and `getEvents` the server also validates the request parameters — pagination limits, ledger-window bounds, cursor format and exclusivity, filter/topic counts — because the JSON-RPC parameter-error path lives here. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the exceptions are the failure fallback (below), the per-ledger XDR artifacts (`_record_closed_ledger`), the finished per-ledger event files (`_finalize_events`), and the XDR fields of the `simulateTransaction` response, which K cannot construct or serialize. Each call is logged to stderr.
 
 ---
 
@@ -65,7 +67,7 @@ At construction the server prepares the *io dir*, where `state.kore` lives at `i
 - **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}`.
 - **`state.kore` present** — it is used as-is, and `metadata.json` is seeded only if missing. This lets you resume a previous session (ledger counter and stored receipts included) or start against a pre-built state.
 
-In both cases the server creates the `receipts/`, `traces/`, and `requests/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
+In both cases the server creates the `receipts/`, `traces/`, `ledgers/`, `requests/`, `wasms/`, and `events/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
 
 Once the socket is bound, `serve` logs three lines to stderr: whether it is starting from a fresh state (an empty io-dir) or resuming an existing one (with the latest ledger), the io-dir path, and the listening address. Instruction tracing is always on, so every transaction the semantics run produces a trace. (Tracing only produces records for contract invocations.)
 
@@ -78,13 +80,15 @@ Once the socket is bound, `serve` logs three lines to stderr: whether it is star
 ```
 startup (state.kore absent):
           → empty_config() → state.kore ; metadata.json {latest_ledger:0}
-          → create receipts/ traces/ requests/
+          → create receipts/ traces/ requests/ wasms/
 
 per successful transaction:
           → the semantics run the steps (trace → traces/trace_<hash>.jsonl),
             write receipts/receipt_<hash>.json, bump latest_ledger in metadata.json,
             and write response.json
           → NodeInterpreter persists the new state.kore
+          → the server writes ledgers/ledger_<seq>.json (the ledger→tx index entry,
+            with the ledger-header XDR artifacts)
 
 per failed (stuck) transaction:
           → no response.json is produced; state.kore and metadata.json are left unchanged
@@ -154,14 +158,39 @@ Resubmitting a transaction whose hash already has a receipt returns status `DUPL
 
 A transaction that decodes as XDR but cannot be processed (e.g. it contains an operation the semantics do not support) is rejected at admission time with status `ERROR` and an `errorResultXdr` carrying a `txMALFORMED` `TransactionResult` — mirroring how real stellar-rpc reports core's admission rejections. Such a transaction never reaches the ledger: no receipt is stored (`getTransaction` stays `NOT_FOUND`) and the ledger does not advance. Undecodable XDR remains a plain `-32602 Invalid params` error, as in real stellar-rpc. `TRY_AGAIN_LATER` is never returned: it signals mempool backpressure, and komet-node executes synchronously without a mempool, so the condition it reports cannot arise.
 
+### `simulateTransaction`
+
+`simulateTransaction` takes a base64-encoded XDR transaction envelope (which may be unsigned) containing exactly one `InvokeHostFunction` operation and executes it as a dry run: the invocation runs against the current world state, but nothing is committed — no receipt, no trace, no ledger bump, and the resulting configuration is discarded (`interpreter.run(..., commit=False)`).
+
+**Response** (success):
+```json
+{
+  "latestLedger": 4,
+  "minResourceFee": "100000",
+  "results": [ { "xdr": "<base64 SCVal XDR>", "auth": [] } ],
+  "transactionData": "<base64 SorobanTransactionData XDR>"
+}
+```
+
+`results[0].xdr` is the host function's return value. The K semantics report it as a JSON-encoded ScVal (see the simulateTransaction section of `node.md`), and the server serializes it to SCVal XDR (`scval_from_json` in `scval.py`) — K has no XDR encoder and no base64 hook, so this is the one read path where Python builds part of the response content. `minResourceFee` is a synthetic constant and `transactionData` an empty-footprint, all-zero-resources placeholder, because the semantics do not meter resources. `auth` is always empty (authorization recording is not implemented).
+
+**Response** (failure — the invocation trapped, the target contract does not exist, the transaction is not a single `InvokeHostFunction`, or the host function is an upload/deploy, which cannot be simulated yet):
+```json
+{ "error": "<reason>", "latestLedger": 4 }
+```
+
+Failures are reported in the result body, matching real stellar-rpc; only an undecodable `transaction` parameter is a JSON-RPC error (`-32602`). A failed simulation likewise commits nothing. The optional `events`, `restorePreamble`, and `stateChanges` response fields and the `resourceConfig`/`authMode`/`xdrFormat` parameters are not supported.
+
 ### `traceTransaction` (komet-specific extension)
 
 `traceTransaction` is **not part of the Stellar RPC specification** — it exists only on komet-node, and clients must not expect it from real Stellar RPC endpoints. It keeps its plain name rather than a vendor-prefixed one (`komet_traceTransaction`): the official spec has no method of that name and none is announced, so there is no collision to avoid, and renaming would break every existing client for no gain. If stellar-rpc ever claims the name, the method will be renamed with a prefix.
 
-`traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored on that transaction's receipt. The result is the trace itself: a JSONL string with one record per executed WebAssembly instruction, or `null` when no transaction with that hash exists.
+`traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored for that transaction. The result is a JSON array with one record per executed WebAssembly instruction (empty when the transaction ran no instructions), or `null` when no transaction with that hash exists.
 
 ```json
-"<jsonl string>"
+[
+  {"pos": 3, "instr": ["const", "i32", 1048576], "stack": [], "locals": {}}
+]
 ```
 
 ### `getTransaction`
@@ -178,22 +207,101 @@ A transaction that decodes as XDR but cannot be processed (e.g. it contains an o
 ```json
 {
   "status": "SUCCESS", "applicationOrder": 1, "feeBump": false,
-  "envelopeXdr": "<base64 XDR>", "resultXdr": "", "resultMetaXdr": "",
+  "envelopeXdr": "<base64 XDR>", "resultXdr": "<base64 XDR>", "resultMetaXdr": "<base64 XDR>",
   "ledger": 5, "createdAt": "1716000000",
   "latestLedger": 5, "latestLedgerCloseTime": "1716000000",
   "oldestLedger": 0, "oldestLedgerCloseTime": "0"
 }
 ```
 
-The ledger-range fields (`latestLedger` through `oldestLedgerCloseTime`) are present on every response, `NOT_FOUND` included. Every ledger contains exactly one transaction, so `applicationOrder` is always 1; fee-bump envelopes are not supported, so `feeBump` is always false. `resultXdr` and `resultMetaXdr` are currently empty stubs. The receipt carries no trace — use `traceTransaction` with the same hash to fetch it.
+The ledger-range fields (`latestLedger` through `oldestLedgerCloseTime`) are present on every response, `NOT_FOUND` included. Every ledger contains exactly one transaction, so `applicationOrder` is always 1; fee-bump envelopes are not supported, so `feeBump` is always false. `resultXdr` is a base64 `TransactionResult` (code `txSUCCESS` or `txFAILED`) and `resultMetaXdr` a base64 `TransactionMeta` v3; when the transaction invoked a contract, its return value is reported as `sorobanMeta.returnValue` inside the meta. Both are synthesised by the server (`result_xdr.py`) from the envelope and the return value the semantics recorded in the receipt — see [node-semantics.md](node-semantics.md). Fees and ledger-entry change sets in these structs are zero/empty (komet-node does not track them). `resultMetaXdr` is omitted on `FAILED` receipts — a failed run rolls back and produces no meta. The receipt carries no trace — use `traceTransaction` with the same hash to fetch it.
 
 Receipts are an internal format, not a stable one: receipts written by older komet-node versions stored `ledger` as a string and lack `applicationOrder`/`feeBump`, and `getTransaction` returns stored receipts verbatim. Start from a fresh io-dir after upgrading rather than resuming one with old receipts.
+
+### `getTransactions`
+
+`getTransactions` returns the transactions in a ledger range, in chain order. Params: `startLedger` (number; mutually exclusive with a cursor), `pagination` `{cursor, limit}` (limit 1–200, default 50), and `xdrFormat` (`base64` only; `json` is rejected with `-32602`). The records are joined from the per-ledger index files (`ledgers/ledger_<seq>.json`) and the stored receipts. Failed transactions never close a ledger, so they do not appear in the history.
+
+```json
+{
+  "transactions": [
+    { "status": "SUCCESS", "txHash": "<64-char hex>", "applicationOrder": 1, "feeBump": false,
+      "envelopeXdr": "<base64 XDR>", "ledger": 5, "createdAt": 1716000000 }
+  ],
+  "latestLedger": 5, "latestLedgerCloseTimestamp": 1716000000,
+  "oldestLedger": 0, "oldestLedgerCloseTimestamp": 0,
+  "cursor": ""
+}
+```
+
+Serialization follows real stellar-rpc: ledger sequences and the top-level close times are JSON numbers, and per-transaction `createdAt` is a number too (unlike the singular `getTransaction`, where it is a string — an upstream quirk). `resultXdr`/`resultMetaXdr` are populated from the stored receipt (real base64 XDR for a contract invocation) and omitted only when a receipt carries none. Each ledger holds exactly one transaction on this node, so `applicationOrder` is always `1`. The `cursor` is a TOID-style stringified integer (`ledger << 32 | applicationOrder << 12`) naming the page's last transaction when the page is full, and empty otherwise; resume by passing it as `pagination.cursor` (without `startLedger`).
+
+### `getLedgers`
+
+`getLedgers` returns the closed ledgers in a range and takes the same parameters as `getTransactions`. Each record comes straight from the ledger's index file; `headerXdr` (a `LedgerHeaderHistoryEntry`) and `metadataXdr` (a `LedgerCloseMeta`) are built by the server when the ledger closes, since K cannot construct XDR, and the ledger `hash` is the SHA-256 of the header XDR — unique per ledger and chained through `previousLedgerHash`.
+
+```json
+{
+  "ledgers": [
+    { "hash": "<64-char hex>", "sequence": 5, "ledgerCloseTime": "1716000000",
+      "headerXdr": "<base64 XDR>", "metadataXdr": "<base64 XDR>" }
+  ],
+  "latestLedger": 5, "latestLedgerCloseTime": 1716000000,
+  "oldestLedger": 0, "oldestLedgerCloseTime": 0,
+  "cursor": ""
+}
+```
+
+Per-ledger `ledgerCloseTime` is a *string* holding a decimal number (matching real stellar-rpc's Go `,string` encoding), while the top-level close times are numbers. The `cursor` is the last returned ledger sequence, stringified, under the same full-page rule as `getTransactions`.
+
+### `getLedgerEntries`
+
+`getLedgerEntries` takes `keys` (an array of up to 200 base64-encoded `LedgerKey` XDR strings; required) and an optional `xdrFormat` (only `"base64"` is supported — `"json"` is rejected with `-32602`). It returns the entries found for the supported key types — `ACCOUNT`, `CONTRACT_DATA` (both the contract-instance entry and persistent/temporary storage), and `CONTRACT_CODE` — the ones the K world state tracks. Keys that do not resolve (unknown, or of an untracked type) are not an error; they are simply absent from `entries`.
+
+**Response** (`latestLedger` and `lastModifiedLedgerSeq` are JSON numbers; `liveUntilLedgerSeq` appears only on Soroban entries):
+```json
+{
+  "entries": [
+    { "key": "<base64 LedgerKey>", "xdr": "<base64 LedgerEntryData>",
+      "lastModifiedLedgerSeq": 4, "liveUntilLedgerSeq": 4095 }
+  ],
+  "latestLedger": 4
+}
+```
+
+This is the one method whose response the server post-processes: the semantics look the keys up in the K state and answer with intermediate JSON entries, and `ledger_entries.py` re-encodes them as `LedgerEntryData` XDR (K cannot produce XDR). Because the K state keeps uploaded wasm parsed, the server stores the raw bytes under `wasms/<hash>.wasm` at upload time and reattaches them to `CONTRACT_CODE` entries. The semantics do not track per-entry modification ledgers, so `lastModifiedLedgerSeq` reports the current ledger; `ACCOUNT` entries carry the real balance but synthesised constants for the remaining required fields (sequence number 0, master weight 1, no signers).
+
+### `getEvents`
+
+`getEvents` returns the contract events emitted in a ledger window — `startLedger` (inclusive) to `endLedger` (exclusive) — optionally narrowed by up to five filters (`type`, `contractIds`, `topics` with `*`/`**` wildcards) and paginated with `pagination.cursor` / `pagination.limit` (default 100). A cursor replaces `startLedger`/`endLedger` and resumes strictly after the last returned event.
+
+Events are captured during `sendTransaction`: the semantics intercept the `contract_event` host function and stage each event's topics and data, and after a successful run the server converts the staged records into one finished `events/events_<ledger>.json` per ledger (`_finalize_events` — the base64 SCVal XDR, strkey, and TOID encodings are XDR work K cannot do). The K `getEvents` rules scan, filter, and paginate those files. Parameter validation lives in `_get_events_envelope`; `xdrFormat: "json"` is not supported and is rejected with `-32602`.
+
+**Response**:
+```json
+{
+  "latestLedger": 4,
+  "events": [
+    {
+      "type": "contract", "ledger": 4, "ledgerClosedAt": "2024-05-18T04:00:00Z",
+      "contractId": "C...", "id": "0000000017179873280-0000000000",
+      "inSuccessfulContractCall": true, "txHash": "<64-char hex>",
+      "topic": ["<base64 SCVal XDR>"], "value": "<base64 SCVal XDR>"
+    }
+  ],
+  "cursor": "0000000021474836480-0000000000"
+}
+```
+
+`system` events are never emitted (the semantics have no source of them), and events carrying values with no staging representation (maps, errors, 256-bit ints) are dropped with a warning rather than served with fabricated XDR.
 
 ---
 
 ## Failure fallback
 
-A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. Only `sendTransaction` executes a transaction, so it is the only method that reaches this path. The server then synthesises the response in Python: it writes a `FAILED` `receipts/receipt_<hash>.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING`. This is the only response content the server builds itself.
+A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. For `sendTransaction` the server then synthesises the response in Python: it writes a `FAILED` `receipts/receipt_<hash>.json` (so a later `getTransaction` finds it) with a `txFAILED` `resultXdr` and no `resultMetaXdr`, without bumping the ledger, and returns `PENDING`. `ledger` on a `FAILED` receipt pins the latest ledger at failure time (the chain does not advance) and `createdAt` the submission time, with the same encoding as on `SUCCESS` receipts. A stuck `simulateTransaction` run is answered with a result-level `{error, latestLedger}` and leaves no artifacts behind.
+
+On the success path the server also post-processes the receipt the semantics wrote: `_attach_result_xdr` replaces the receipt's internal `returnValue` field (a JSON-encoded SCVal, or `null`) with the spec-mandated `resultXdr`/`resultMetaXdr` base64 XDR, which K cannot construct (skipped for a duplicate resubmission, whose receipt is already final). These are the only response contents the server builds itself.
 
 ---
 
@@ -207,4 +315,4 @@ komet-node [--host HOST] [--port PORT] [--io-dir DIR]
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port |
-| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `receipts/`, `traces/`, `requests/`) |
+| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `receipts/`, `traces/`, `ledgers/`, `requests/`, `wasms/`) |
