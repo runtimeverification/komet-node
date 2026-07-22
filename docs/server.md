@@ -1,22 +1,48 @@
 # `server.py` — `StellarRpcServer`
 
-`StellarRpcServer` is the outermost layer of komet-node. 
-It exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC, handling incoming requests and owning the request/response lifecycle.
-It translates incoming requests into calls to `NodeInterpreter` and manages the shared state file. 
+`StellarRpcServer` exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC. Its job is to make the K semantics usable as a server. The compiled semantics are a one-shot interpreter — one process invocation per request, with no networking and no memory between runs — and `StellarRpcServer` is the long-running process wrapped around them: it keeps the HTTP socket open and the state files on disk, decodes the XDR envelope (via `TransactionEncoder`), runs each request through the semantics (via `NodeInterpreter`), and returns whatever `response.json` the semantics produced. All RPC dispatch, receipt bookkeeping, ledger accounting, and response formatting happen in K — the server holds none of that state itself.
 
 ---
 
 ## Class structure
 
-```
-StellarRpcServer(JsonRpcServer)   ← pyk.rpc.rpc.JsonRpcServer
-    interpreter: NodeInterpreter
-    state_file:  Path             ← state.kore on disk
-    ledger_seq:  int              ← incremented per committed transaction
-    _transactions: dict           ← in-memory tx results, keyed by hash
+```python
+class StellarRpcServer:
+    interpreter: NodeInterpreter     # the K runner
+    encoder:     TransactionEncoder  # the XDR → request-envelope decoder
+    io_dir:      Path                # directory holding every artifact
+    state_file:  Path                # io_dir / 'state.kore'
+    receipts_dir: Path               # io_dir / 'receipts'  — receipt_<hash>.json per transaction
+    traces_dir:   Path               # io_dir / 'traces'    — trace_<hash>.jsonl per transaction
+    requests_dir: Path               # io_dir / 'requests'  — request_<n>.json archive
 ```
 
-The server extends pyk's `JsonRpcServer`, which handles HTTP, JSON-RPC framing, and method dispatch. Each Stellar RPC method is registered with `register_method(name, fn)`.
+The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `BaseHTTPRequestHandler` reads each POST body and calls `_handle`, which parses the JSON-RPC frame and delegates to `handle_rpc`.
+
+### JSON-RPC framing
+
+The server implements the JSON-RPC 2.0 framing rules, including batch calls:
+
+- A single request object gets a single response object.
+- An **array** body is a batch: each element is validated and dispatched on its own, and the response is an array with one entry per answered element (matched by `id`; invalid elements each get an Invalid Request error with `id: null`). Batch elements run sequentially — the server is single-threaded by design, so a batch is equivalent to sending its elements one at a time. An empty array is answered with a single Invalid Request error object, per the spec.
+- A request without an `id` member is a **notification**: it is executed but never answered, not even with an error. A batch of only notifications (or a single notification) produces an empty response body.
+
+Framing happens entirely in Python (`_handle` / `_handle_batch` / `_handle_single`); the K semantics see one request envelope per invocation regardless of how requests were framed on the wire.
+
+### The `xdrFormat` parameter
+
+`getTransaction` and `sendTransaction` accept the spec's optional `xdrFormat` parameter. Only `'base64'`, the spec default, is supported: XDR fields in responses are always base64 strings. The alternative `'json'` format (XDR rendered as JSON objects) is not implemented and is rejected with error `-32602` and a message saying so; any other value is rejected with `-32602` as well. The check runs before anything else, so a `sendTransaction` with a bad `xdrFormat` is rejected without executing the transaction.
+
+### `handle_rpc(method, params, request_id) -> str`
+
+`handle_rpc` is the dispatch entry point; it returns the JSON-RPC response envelope as a string. You can call it **without** the HTTP layer, which is convenient for scripts and tests:
+
+```python
+server = StellarRpcServer(io_dir=Path('out'))
+server.handle_rpc('sendTransaction', {'transaction': xdr})
+```
+
+For `sendTransaction` it builds the request envelope with `encoder.build_tx_request` and runs it with `interpreter.run` (skipping the `<program>` wasm injection when the hash already has a receipt, so a duplicate is not re-executed — the semantics answer `DUPLICATE`); for the read-only methods (`getHealth`, `getNetwork`, `getLatestLedger`, `getTransaction`, `traceTransaction`) it builds a small envelope and runs it. In every case the *content* of the response is produced by the semantics (`node.md`), not by Python — the one exception is the failure fallback (below). Each call is logged to stderr.
 
 ---
 
@@ -26,153 +52,159 @@ The server extends pyk's `JsonRpcServer`, which handles HTTP, JSON-RPC framing, 
 server = StellarRpcServer(
     host='localhost',
     port=8000,
-    state_file=Path('state.kore'),
+    io_dir=Path('out'),  # omit for a fresh temporary directory
     network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
-    trace=False,
 )
 server.serve()
 ```
 
-At construction time, the server checks whether `state_file` exists:
+`io_dir` defaults to `None`, in which case the server creates a fresh temporary directory (`tempfile.mkdtemp`) and runs against that — a throwaway chain that starts empty on every launch and leaves the working directory untouched. Pass an explicit `io_dir` to keep the state in a known place.
 
-- **File does not exist**: `interpreter.empty_config()` is called to produce the initial idle K configuration — a blank-slate blockchain state with no accounts, contracts, or storage — and written to disk.
-- **File exists**: it is used as-is. This allows you to start the server against any pre-built state, for example a state snapshotted from mainnet and converted to KORE format, to debug a transaction against realistic data.
+At construction the server prepares the *io dir*, where `state.kore` lives at `io_dir / 'state.kore'`:
 
-The `trace` flag controls whether instruction-level execution traces are generated. When `True`, the initial `state.kore` is produced with `<ioDir>trace.jsonl</ioDir>` baked in, enabling the tracing K rules for all subsequent transactions. See [interpreter.md](interpreter.md) for details.
+- **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}`.
+- **`state.kore` present** — it is used as-is, and `metadata.json` is seeded only if missing. This lets you resume a previous session (ledger counter and stored receipts included) or start against a pre-built state.
+
+In both cases the server creates the `receipts/`, `traces/`, and `requests/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
+
+Once the socket is bound, `serve` logs three lines to stderr: whether it is starting from a fresh state (an empty io-dir) or resuming an existing one (with the latest ledger), the io-dir path, and the listening address. Instruction tracing is always on, so every transaction the semantics run produces a trace. (Tracing only produces records for contract invocations.)
 
 ---
 
-## State file lifecycle
+## State lifecycle
 
-`state.kore` is the single file representing the entire blockchain state. It is a serialized K configuration (KORE format) containing all accounts, contract code, contract storage, and ledger metadata.
+`state.kore` and `metadata.json` hold the persistent chain state; per-transaction receipts and traces live under `receipts/` and `traces/`; the server and semantics also exchange a few transient files per request. See [architecture.md](architecture.md#the-io-dir) for the complete io-dir layout.
 
 ```
-startup:  if state.kore does not exist
-          → server calls interpreter.empty_config()
-          → writes the initial empty K configuration to state.kore
+startup (state.kore absent):
+          → empty_config() → state.kore ; metadata.json {latest_ledger:0}
+          → create receipts/ traces/ requests/
 
 per successful transaction:
-          → NodeInterpreter reads state.kore (krun input) and translates transaction steps
-          → krun executes the transaction steps
-          → krun outputs the updated configuration to stdout
-          → server overwrites state.kore with the new configuration
-          → ledger_seq incremented
+          → the semantics run the steps (trace → traces/trace_<hash>.jsonl),
+            write receipts/receipt_<hash>.json, bump latest_ledger in metadata.json,
+            and write response.json
+          → NodeInterpreter persists the new state.kore
 
-per failed transaction:
-          → state.kore is NOT updated (state rolls back implicitly)
-          → ledger_seq is NOT incremented
+per failed (stuck) transaction:
+          → no response.json is produced; state.kore and metadata.json are left unchanged
+          → the server writes a FAILED receipts/receipt_<hash>.json (see below)
 ```
 
-Because `state.kore` lives on disk, the server can be stopped and restarted between transactions without losing state. To start fresh, delete `state.kore`. To resume from a checkpoint, provide a pre-built kore file via `--state-file`.
+Because these artifacts live on disk, the server can be stopped and restarted without losing the world state, the ledger counter, or the stored receipts.
 
 ---
 
 ## RPC methods
 
-All methods follow the [Stellar RPC specification](https://developers.stellar.org/docs/data/apis/rpc/methods).
+All methods are answered by the K semantics and follow the [Stellar RPC specification](https://developers.stellar.org/docs/data/apis/rpc/methods) — except `traceTransaction`, which is a komet-specific extension (see below) — including its serialization quirks: ledger sequence numbers and `protocolVersion` are JSON numbers, while close-time fields (`latestLedgerCloseTime`, `oldestLedgerCloseTime`, `createdAt`) are int64s serialized as JSON strings holding a decimal integer, matching what real stellar-rpc emits.
 
 ### `getHealth`
 
-Returns `{"status": "healthy"}`. Used by clients to check server liveness.
+```json
+{ "status": "healthy", "latestLedger": 4, "latestLedgerCloseTime": "1716000000", "oldestLedger": 0, "oldestLedgerCloseTime": "0", "ledgerRetentionWindow": 5 }
+```
+
+The node retains every ledger since genesis, so `oldestLedger` is always 0 and the retention window covers all ledgers so far. Per-ledger close times are not recorded: the latest close time is approximated by the request time and the oldest by the epoch.
 
 ### `getNetwork`
 
-Returns the network passphrase and protocol version. Clients use this to verify they are connected to the expected network.
-
 ```json
-{
-  "friendbotUrl": null,
-  "passphrase": "Test SDF Network ; September 2015",
-  "protocolVersion": "22"
-}
+{ "passphrase": "Test SDF Network ; September 2015", "protocolVersion": 22 }
 ```
+
+`friendbotUrl` is omitted (not `null`) because the node runs no friendbot — matching real stellar-rpc's `omitempty` serialization.
 
 ### `getLatestLedger`
 
-Returns the current ledger sequence number. This increments by 1 for each successfully committed transaction.
+`getLatestLedger` returns the current ledger sequence (the `latest_ledger` from `metadata.json`), which increments by 1 per successfully committed transaction. The `id` is a deterministic per-ledger stand-in for the ledger-header hash, derived from the sequence (see `#ledgerId` in [node-semantics.md](node-semantics.md)).
 
 ```json
-{
-  "id": "0000...0000",
-  "protocolVersion": "22",
-  "sequence": 4
-}
+{ "id": "1715609f7c74...", "protocolVersion": 22, "sequence": 4 }
+```
+
+### `getVersionInfo`
+
+`getVersionInfo` reports the komet-node package version as the RPC server version and the komet package (the K semantics of Soroban executing the transactions) as the "Captive Core". komet-node is a Python package, so no commit hash or build timestamp is baked in at build time — those fields are all-zeros / epoch placeholders with the spec-correct types. `protocolVersion` is a JSON number.
+
+```json
+{ "version": "0.1.0", "commitHash": "0000...0000", "buildTimestamp": "1970-01-01T00:00:00", "captiveCoreVersion": "komet 0.1.79 (K semantics of Soroban)", "protocolVersion": 22 }
+```
+
+### `getFeeStats`
+
+`getFeeStats` returns constant fee distributions: komet-node has no fee market, so every statistic is the network minimum inclusion fee of 100 stroops over an empty sample (`transactionCount: "0"`, `ledgerCount: 0`). Matching real stellar-rpc, every distribution field except `ledgerCount` is a JSON string holding a decimal number; `latestLedger` is a JSON number read live from `metadata.json`.
+
+```json
+{ "sorobanInclusionFee": { "max": "100", "min": "100", "mode": "100", "p10": "100", ..., "p99": "100", "transactionCount": "0", "ledgerCount": 0 }, "inclusionFee": { ... }, "latestLedger": 4 }
 ```
 
 ### `sendTransaction`
 
-The main entry point for submitting transactions. Accepts a base64-encoded XDR transaction envelope.
+`sendTransaction` submits a base64-encoded XDR transaction envelope.
 
-**Execution model**: The Stellar RPC API was designed for a real Stellar validator, where transactions enter a mempool and are only executed after a ledger close (which takes a few seconds). The API contract therefore requires `sendTransaction` to always return `PENDING`, with clients expected to poll `getTransaction` for the final outcome.
-
-In komet-node there is no mempool or ledger close. krun executes the transaction immediately, inside the `sendTransaction` call itself. By the time the method returns, the result is already known and stored internally — but we still return `PENDING` to stay compatible with Stellar clients that expect the two-step pattern.
-
-**Flow**:
-1. Decode the XDR envelope via `TransactionEnvelope.from_xdr`
-2. Compute `tx_hash = envelope.hash_hex()`
-3. Call `interpreter.run_transaction(state_file, envelope.transaction)`
-4. On success: overwrite `state.kore`, increment `ledger_seq`, store `SUCCESS` result
-5. On `NodeInterpreterError`: store `FAILED` result (state unchanged)
-6. Return `{hash, status: "PENDING", latestLedger, latestLedgerCloseTime}`
+**Execution model**: real Stellar RPC was designed around a mempool and ledger close, so the API requires `sendTransaction` to return `PENDING` and have clients poll `getTransaction`. komet-node has no mempool — the semantics execute the transaction immediately — but it still returns `PENDING` to stay compatible with the two-step pattern.
 
 **Response**:
 ```json
-{
-  "hash": "<64-char hex>",
-  "status": "PENDING",
-  "latestLedger": "5",
-  "latestLedgerCloseTime": "1716000000"
-}
+{ "hash": "<64-char hex>", "status": "PENDING", "latestLedger": 5, "latestLedgerCloseTime": "1716000000" }
+```
+
+Resubmitting a transaction whose hash already has a receipt returns status `DUPLICATE` without re-executing it: the ledger does not advance and the stored receipt is untouched.
+
+A transaction that decodes as XDR but cannot be processed (e.g. it contains an operation the semantics do not support) is rejected at admission time with status `ERROR` and an `errorResultXdr` carrying a `txMALFORMED` `TransactionResult` — mirroring how real stellar-rpc reports core's admission rejections. Such a transaction never reaches the ledger: no receipt is stored (`getTransaction` stays `NOT_FOUND`) and the ledger does not advance. Undecodable XDR remains a plain `-32602 Invalid params` error, as in real stellar-rpc. `TRY_AGAIN_LATER` is never returned: it signals mempool backpressure, and komet-node executes synchronously without a mempool, so the condition it reports cannot arise.
+
+### `traceTransaction` (komet-specific extension)
+
+`traceTransaction` is **not part of the Stellar RPC specification** — it exists only on komet-node, and clients must not expect it from real Stellar RPC endpoints. It keeps its plain name rather than a vendor-prefixed one (`komet_traceTransaction`): the official spec has no method of that name and none is announced, so there is no collision to avoid, and renaming would break every existing client for no gain. If stellar-rpc ever claims the name, the method will be renamed with a prefix.
+
+`traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored on that transaction's receipt. The result is the trace itself: a JSONL string with one record per executed WebAssembly instruction, or `null` when no transaction with that hash exists.
+
+```json
+"<jsonl string>"
 ```
 
 ### `getTransaction`
 
-Returns the stored result for a previously submitted transaction.
-
-**Statuses**:
+`getTransaction` reads the hash's `receipts/receipt_<hash>.json` file. The `hash` parameter must be a 64-character hex string; anything else is rejected with `-32602 Invalid params` (this and `traceTransaction` share the validation).
 
 | Status | Meaning |
 |---|---|
-| `NOT_FOUND` | Hash not in `_transactions` (never submitted, or server restarted) |
+| `NOT_FOUND` | No `receipts/receipt_<hash>.json` for that hash |
 | `SUCCESS` | Transaction executed successfully |
-| `FAILED` | Transaction was submitted but krun returned an error |
+| `FAILED` | Transaction was submitted but got stuck in the semantics |
 
 **`SUCCESS` response**:
 ```json
 {
-  "status": "SUCCESS",
-  "ledger": "5",
-  "createdAt": "1716000000",
-  "envelopeXdr": "<base64 XDR>",
-  "resultXdr": "",
-  "resultMetaXdr": "",
-  "trace": "<jsonl string or null>",
-  "latestLedger": "5",
-  "latestLedgerCloseTime": "1716000000"
+  "status": "SUCCESS", "applicationOrder": 1, "feeBump": false,
+  "envelopeXdr": "<base64 XDR>", "resultXdr": "", "resultMetaXdr": "",
+  "ledger": 5, "createdAt": "1716000000",
+  "latestLedger": 5, "latestLedgerCloseTime": "1716000000",
+  "oldestLedger": 0, "oldestLedgerCloseTime": "0"
 }
 ```
 
-The `trace` field is `null` unless the server was started with `--trace`. When tracing is enabled, it contains newline-separated JSON records, one per executed WebAssembly instruction. See [interpreter.md](interpreter.md) for the trace format.
+The ledger-range fields (`latestLedger` through `oldestLedgerCloseTime`) are present on every response, `NOT_FOUND` included. Every ledger contains exactly one transaction, so `applicationOrder` is always 1; fee-bump envelopes are not supported, so `feeBump` is always false. `resultXdr` and `resultMetaXdr` are currently empty stubs. The receipt carries no trace — use `traceTransaction` with the same hash to fetch it.
 
-Note: `resultXdr` and `resultMetaXdr` are currently empty stubs. Contract return values are not yet surfaced.
+Receipts are an internal format, not a stable one: receipts written by older komet-node versions stored `ledger` as a string and lack `applicationOrder`/`feeBump`, and `getTransaction` returns stored receipts verbatim. Start from a fresh io-dir after upgrading rather than resuming one with old receipts.
 
 ---
 
-## Transaction storage
+## Failure fallback
 
-`_transactions` is an in-memory dict keyed by transaction hash. It is not persisted to disk, so results are lost on server restart. Only the blockchain state (`state.kore`) survives restarts.
+A failed transaction leaves the semantics stuck without writing `response.json`, so `interpreter.run` returns `None`. Only `sendTransaction` executes a transaction, so it is the only method that reaches this path. The server then synthesises the response in Python: it writes a `FAILED` `receipts/receipt_<hash>.json` (so a later `getTransaction` finds it), without bumping the ledger, and returns `PENDING`. This is the only response content the server builds itself.
 
 ---
 
 ## CLI
 
 ```
-komet-node [--host HOST] [--port PORT] [--state-file PATH] [--trace]
+komet-node [--host HOST] [--port PORT] [--io-dir DIR]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--host` | `localhost` | Bind address |
 | `--port` | `8000` | Port |
-| `--state-file` | `state.kore` | Path to the persistent state file |
-| `--trace` | off | Enable instruction-level execution tracing |
+| `--io-dir` | a fresh temp dir | Directory holding every artifact (`state.kore`, `metadata.json`, `receipts/`, `traces/`, `requests/`) |
