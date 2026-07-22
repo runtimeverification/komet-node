@@ -739,23 +739,15 @@ def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
 # ----------------------------------------------------------------------
 
 
-def _create_account_xdr() -> str:
-    """A freshly signed CreateAccount transaction envelope, base64 XDR."""
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
-    envelope = (
-        TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-        .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
-        .set_timeout(30)
-        .build()
-    )
-    envelope.sign(keypair)
-    return envelope.to_xdr()
-
-
 def test_xdr_format_base64_behaves_as_default(server: StellarRpcServer) -> None:
     """xdrFormat 'base64' is the explicit spelling of the default on both methods."""
-    send_result = _rpc(server.port(), 'sendTransaction', {'transaction': _create_account_xdr(), 'xdrFormat': 'base64'})
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    send_result = _rpc(
+        server.port(),
+        'sendTransaction',
+        {'transaction': _create_account_xdr(keypair, account), 'xdrFormat': 'base64'},
+    )
     assert send_result['result']['status'] == 'PENDING'
     tx_hash = send_result['result']['hash']
 
@@ -782,7 +774,13 @@ def test_get_transaction_xdr_format_non_string_returns_invalid_params(server: St
 
 def test_send_transaction_xdr_format_json_returns_invalid_params_without_executing(server: StellarRpcServer) -> None:
     """An unsupported xdrFormat is rejected before the transaction runs: no state change."""
-    result = _rpc(server.port(), 'sendTransaction', {'transaction': _create_account_xdr(), 'xdrFormat': 'json'})
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    result = _rpc(
+        server.port(),
+        'sendTransaction',
+        {'transaction': _create_account_xdr(keypair, account), 'xdrFormat': 'json'},
+    )
     assert result['error']['code'] == -32602
     assert 'json' in result['error']['message'].lower()
 
@@ -792,7 +790,13 @@ def test_send_transaction_xdr_format_json_returns_invalid_params_without_executi
 
 
 def test_send_transaction_xdr_format_invalid_value_returns_invalid_params(server: StellarRpcServer) -> None:
-    result = _rpc(server.port(), 'sendTransaction', {'transaction': _create_account_xdr(), 'xdrFormat': 'yaml'})
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+    result = _rpc(
+        server.port(),
+        'sendTransaction',
+        {'transaction': _create_account_xdr(keypair, account), 'xdrFormat': 'yaml'},
+    )
     assert result['error']['code'] == -32602
     assert list((server.io_dir / 'receipts').iterdir()) == []
 
