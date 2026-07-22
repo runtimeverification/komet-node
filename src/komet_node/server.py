@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sys
 import tempfile
 import time
@@ -10,16 +11,20 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from stellar_sdk import Network, xdr
+from stellar_sdk import Network, TransactionEnvelope, xdr
 
 from komet_node.interpreter import NodeInterpreter
 from komet_node.scval import json_to_scval
-from komet_node.transaction import SimulationRejected, TransactionEncoder
+from komet_node.transaction import SimulationRejected, TransactionEncoder, malformed_tx_result_xdr
 
 if TYPE_CHECKING:
     from http.server import HTTPServer as HTTPServerType
 
-_PROTOCOL_VERSION: Final = '22'
+_PROTOCOL_VERSION: Final = 22
+
+# Transaction hashes are 64 lowercase hex characters (the spec's Hash schema:
+# ^[a-f\d]{64}$). Anything else is rejected as Invalid params before reaching K.
+_TX_HASH_RE: Final = re.compile(r'[0-9a-f]{64}')
 
 # Synthetic minimum resource fee (in stroops) reported by simulateTransaction. The K
 # semantics do not meter resources, so any plausible constant is as honest as another;
@@ -217,14 +222,27 @@ class StellarRpcServer:
             transaction = params.get('transaction')
             if not isinstance(transaction, str):
                 return _error_str(request_id, -32602, "Invalid params: 'transaction' (XDR string) is required")
+            # Undecodable XDR is a JSON-RPC client error (-32602, as in real stellar-rpc);
+            # a transaction that decodes but cannot be processed (e.g. an unsupported
+            # operation) is instead rejected at admission time with status ERROR below.
+            try:
+                parsed = TransactionEnvelope.from_xdr(transaction, self.encoder.network_passphrase)
+            except Exception:
+                traceback.print_exc()
+                return _error_str(request_id, -32602, 'Invalid params: could not decode transaction XDR')
             try:
                 envelope, program_steps = self.encoder.build_tx_request(method, request_id, transaction, now)
             except Exception:
-                # build_tx_request both decodes XDR and validates it (e.g. rejecting
-                # sub-stroop amounts); either is a client error. Log the detail, but keep
-                # the client-facing message neutral rather than leaking internal exceptions.
+                # Log the detail, but keep the client-facing response neutral rather than
+                # leaking internal exceptions.
                 traceback.print_exc()
-                return _error_str(request_id, -32602, 'Invalid params: could not process transaction')
+                return json.dumps(self._error_status_response(request_id, parsed.hash_hex(), now))
+            # A hash that already has a receipt is a duplicate submission: the semantics
+            # answer DUPLICATE without running the steps (see node.md). Steps injected into
+            # the <program> cell (wasm uploads) would execute *before* dispatch, though, so
+            # they must not be injected for a duplicate.
+            if (self.receipts_dir / f'receipt_{envelope["txHash"]}.json').exists():
+                program_steps = None
             response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
             if response is None:
                 return json.dumps(self._failure_response(request_id, envelope, now))
@@ -262,6 +280,8 @@ class StellarRpcServer:
             tx_hash = params.get('hash')
             if not isinstance(tx_hash, str):
                 return _error_str(request_id, -32602, "Invalid params: 'hash' (string) is required")
+            if _TX_HASH_RE.fullmatch(tx_hash) is None:
+                return _error_str(request_id, -32602, "Invalid params: 'hash' must be a 64-character hex string")
             return {**base, 'hash': tx_hash}
         return None
 
@@ -333,6 +353,24 @@ class StellarRpcServer:
         (self.requests_dir / f'request_{self._request_count}.json').write_text(json.dumps(archive))
         self._request_count += 1
 
+    def _error_status_response(self, rpc_id: Any, tx_hash: str, now: str) -> dict[str, Any]:
+        """Synthesise the sendTransaction response for a transaction rejected at admission.
+
+        Mirrors real stellar-rpc: a transaction that decodes as XDR but cannot be processed
+        gets status ``ERROR`` with a ``txMALFORMED`` ``errorResultXdr``. It never reaches
+        the ledger, so no receipt is stored (``getTransaction`` stays ``NOT_FOUND``) and the
+        ledger does not advance.
+        """
+        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
+        result = {
+            'hash': tx_hash,
+            'status': 'ERROR',
+            'errorResultXdr': malformed_tx_result_xdr(),
+            'latestLedger': metadata.get('latest_ledger', 0),
+            'latestLedgerCloseTime': now,
+        }
+        return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+
     def _failure_response(self, rpc_id: Any, envelope: dict[str, Any], now: str) -> dict[str, Any]:
         """Synthesise the sendTransaction response for a transaction that got stuck (failed).
 
@@ -345,22 +383,25 @@ class StellarRpcServer:
         tx_hash = envelope['txHash']
 
         # This FAILED receipt mirrors the SUCCESS receipt the semantics build in
-        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule. Like the
-        # success path, the receipt carries no trace — any trace lives in its own file.
+        # `#txReceipt` (kdist/node.md): keep the field set in sync with that rule (ledger a
+        # JSON number, createdAt an int64-as-string). Like the success path, the receipt
+        # carries no trace — any trace lives in its own file.
         receipt = {
             'status': 'FAILED',
-            'ledger': str(ledger),
-            'createdAt': now,
+            'applicationOrder': 1,
+            'feeBump': False,
             'envelopeXdr': envelope['envelopeXdr'],
             'resultXdr': '',
             'resultMetaXdr': '',
+            'ledger': ledger,
+            'createdAt': now,
         }
         (self.receipts_dir / f'receipt_{tx_hash}.json').write_text(json.dumps(receipt))
 
         result = {
             'hash': tx_hash,
             'status': 'PENDING',
-            'latestLedger': str(ledger),
+            'latestLedger': ledger,
             'latestLedgerCloseTime': now,
         }
         return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
