@@ -35,6 +35,8 @@ The tests do not yet cover `bytes` / `address` SCVal arguments or `SCVec` / `SCM
 ## Known gaps
 
 - `resultXdr` / `resultMetaXdr` are empty stubs (contract return values not surfaced).
+- `sendTransaction`'s `errorResultXdr` is always a generic `txMALFORMED` result (no per-cause codes such as `txBAD_SEQ` — sequence numbers, fees, and signatures are not modelled), and `diagnosticEventsXdr` is never populated (both fields are optional in the spec). `TRY_AGAIN_LATER` is never returned by design: it signals mempool backpressure, which cannot arise in a synchronous node without a mempool.
 - `SCVec` / `SCMap` contract arguments are not yet encoded.
 - `simulateTransaction`, `getLedgerEntries`, `getFeeStats`, and TTL/footprint operations are not implemented.
 - `getEvents` serves contract events only: `system` events are never emitted (the semantics have no source of them), and events whose topics/data have no staging representation (maps, errors, 256-bit ints) are dropped with a warning. `xdrFormat: "json"` is rejected.
+- Receipts are not a stable format: older io-dirs store `ledger`/`createdAt` with pre-spec types and lack `applicationOrder`/`feeBump`. Resume only io-dirs written by the same version, or start fresh.
