@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from stellar_sdk.xdr.sc_address import SCAddress as XDRSCAddress
     from stellar_sdk.xdr.sc_val import SCVal
 
+_UINT64_MASK = (1 << 64) - 1
+
 
 def scval_to_json(scval: SCVal) -> dict:
     """Encode a Stellar XDR SCVal as a JSON-serialisable dict for the node request envelope.
@@ -82,65 +84,83 @@ def scval_to_json(scval: SCVal) -> dict:
             raise NotImplementedError(f'Unsupported SCVal type for JSON encoding: {scval.type}')
 
 
-def json_to_scval(value: dict) -> stellar_xdr.SCVal:
-    """Decode the JSON encoding of an ScVal produced by K (``#scValJSON`` in ``node.md``)
-    into a Stellar XDR SCVal.
+def scval_from_json(value: dict) -> SCVal:
+    """Decode the JSON ScVal encoding emitted by the semantics back into an XDR SCVal.
 
-    This is the K-to-Python direction (contract *return values*, e.g. from
-    ``simulateTransaction``), the inverse of :func:`scval_to_json` — keep the two and the
-    ``#scValJSON`` rules in sync.
+    Inverse of :func:`scval_to_json`, extended with the value-only types the semantics can
+    hold in contract storage but that never appear as call arguments (``void``, ``string``,
+    ``u256``, ``vec``, ``map``) — see ``#scVal2JSON`` in ``node.md``. Raises
+    ``NotImplementedError`` for values with no JSON form (``{"type": "unsupported"}``).
     """
-    match value['type']:
+    match value.get('type'):
         case 'bool':
-            return stellar_xdr.SCVal(SCValType.SCV_BOOL, b=value['value'])
-        case 'void':
-            return stellar_xdr.SCVal(SCValType.SCV_VOID)
-        case 'u32':
-            return stellar_xdr.SCVal(SCValType.SCV_U32, u32=stellar_xdr.Uint32(value['value']))
+            return stellar_xdr.SCVal(type=SCValType.SCV_BOOL, b=bool(value['value']))
         case 'i32':
-            return stellar_xdr.SCVal(SCValType.SCV_I32, i32=stellar_xdr.Int32(value['value']))
-        case 'u64':
-            return stellar_xdr.SCVal(SCValType.SCV_U64, u64=stellar_xdr.Uint64(value['value']))
+            return stellar_xdr.SCVal(type=SCValType.SCV_I32, i32=stellar_xdr.Int32(value['value']))
+        case 'u32':
+            return stellar_xdr.SCVal(type=SCValType.SCV_U32, u32=stellar_xdr.Uint32(value['value']))
         case 'i64':
-            return stellar_xdr.SCVal(SCValType.SCV_I64, i64=stellar_xdr.Int64(value['value']))
-        case 'u128':
-            val = value['value']
-            parts = stellar_xdr.UInt128Parts(
-                hi=stellar_xdr.Uint64(val >> 64), lo=stellar_xdr.Uint64(val & _UINT64_MASK)
-            )
-            return stellar_xdr.SCVal(SCValType.SCV_U128, u128=parts)
+            return stellar_xdr.SCVal(type=SCValType.SCV_I64, i64=stellar_xdr.Int64(value['value']))
+        case 'u64':
+            return stellar_xdr.SCVal(type=SCValType.SCV_U64, u64=stellar_xdr.Uint64(value['value']))
         case 'i128':
             val = value['value']
-            # Arithmetic right shift keeps the sign in hi; lo is the unsigned low word.
-            iparts = stellar_xdr.Int128Parts(hi=stellar_xdr.Int64(val >> 64), lo=stellar_xdr.Uint64(val & _UINT64_MASK))
-            return stellar_xdr.SCVal(SCValType.SCV_I128, i128=iparts)
+            parts = stellar_xdr.Int128Parts(hi=stellar_xdr.Int64(val >> 64), lo=stellar_xdr.Uint64(val & _UINT64_MASK))
+            return stellar_xdr.SCVal(type=SCValType.SCV_I128, i128=parts)
+        case 'u128':
+            val = value['value']
+            parts128 = stellar_xdr.UInt128Parts(
+                hi=stellar_xdr.Uint64(val >> 64), lo=stellar_xdr.Uint64(val & _UINT64_MASK)
+            )
+            return stellar_xdr.SCVal(type=SCValType.SCV_U128, u128=parts128)
+        case 'u256':
+            val = value['value']
+            parts256 = stellar_xdr.UInt256Parts(
+                hi_hi=stellar_xdr.Uint64(val >> 192),
+                hi_lo=stellar_xdr.Uint64((val >> 128) & _UINT64_MASK),
+                lo_hi=stellar_xdr.Uint64((val >> 64) & _UINT64_MASK),
+                lo_lo=stellar_xdr.Uint64(val & _UINT64_MASK),
+            )
+            return stellar_xdr.SCVal(type=SCValType.SCV_U256, u256=parts256)
         case 'symbol':
-            return stellar_xdr.SCVal(SCValType.SCV_SYMBOL, sym=stellar_xdr.SCSymbol(value['value'].encode('ascii')))
+            return stellar_xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=stellar_xdr.SCSymbol(value['value'].encode()))
         case 'string':
-            return stellar_xdr.SCVal(SCValType.SCV_STRING, str=stellar_xdr.SCString(value['value'].encode('utf-8')))
+            return stellar_xdr.SCVal(type=SCValType.SCV_STRING, str=stellar_xdr.SCString(value['value'].encode()))
         case 'bytes':
-            return stellar_xdr.SCVal(SCValType.SCV_BYTES, bytes=stellar_xdr.SCBytes(bytes.fromhex(value['value'])))
+            return stellar_xdr.SCVal(type=SCValType.SCV_BYTES, bytes=stellar_xdr.SCBytes(bytes.fromhex(value['value'])))
+        case 'void':
+            return stellar_xdr.SCVal(type=SCValType.SCV_VOID)
         case 'address':
-            return stellar_xdr.SCVal(SCValType.SCV_ADDRESS, address=_json_to_sc_address(value))
+            raw = bytes.fromhex(value['value'])
+            if value['addrType'] == 'account':
+                address = stellar_xdr.SCAddress(
+                    type=SCAddressType.SC_ADDRESS_TYPE_ACCOUNT,
+                    account_id=stellar_xdr.AccountID(
+                        stellar_xdr.PublicKey(
+                            stellar_xdr.PublicKeyType.PUBLIC_KEY_TYPE_ED25519,
+                            ed25519=stellar_xdr.Uint256(raw),
+                        )
+                    ),
+                )
+            else:
+                address = stellar_xdr.SCAddress(
+                    type=SCAddressType.SC_ADDRESS_TYPE_CONTRACT,
+                    contract_id=stellar_xdr.ContractID(stellar_xdr.Hash(raw)),
+                )
+            return stellar_xdr.SCVal(type=SCValType.SCV_ADDRESS, address=address)
         case 'vec':
-            vec = stellar_xdr.SCVec([json_to_scval(item) for item in value['value']])
-            return stellar_xdr.SCVal(SCValType.SCV_VEC, vec=vec)
-        case other:
-            raise NotImplementedError(f'Unsupported ScVal JSON type: {other}')
-
-
-def _json_to_sc_address(value: dict) -> XDRSCAddress:
-    raw = bytes.fromhex(value['value'])
-    if value['addrType'] == 'account':
-        account_id = stellar_xdr.AccountID(
-            stellar_xdr.PublicKey(stellar_xdr.PublicKeyType.PUBLIC_KEY_TYPE_ED25519, ed25519=stellar_xdr.Uint256(raw))
-        )
-        return stellar_xdr.SCAddress(SCAddressType.SC_ADDRESS_TYPE_ACCOUNT, account_id=account_id)
-    assert value['addrType'] == 'contract'
-    return stellar_xdr.SCAddress(
-        SCAddressType.SC_ADDRESS_TYPE_CONTRACT,
-        contract_id=stellar_xdr.ContractID(stellar_xdr.Hash(raw)),
-    )
+            items = [scval_from_json(item) for item in value['value']]
+            return stellar_xdr.SCVal(type=SCValType.SCV_VEC, vec=stellar_xdr.SCVec(items))
+        case 'map':
+            if not all({'key', 'val'} <= set(pair) for pair in value['value']):
+                raise NotImplementedError(f'Unsupported SCMap entry in JSON encoding: {value!r}')
+            entries = [
+                stellar_xdr.SCMapEntry(key=scval_from_json(pair['key']), val=scval_from_json(pair['val']))
+                for pair in value['value']
+            ]
+            return stellar_xdr.SCVal(type=SCValType.SCV_MAP, map=stellar_xdr.SCMap(entries))
+        case _:
+            raise NotImplementedError(f'Unsupported SCVal JSON encoding: {value!r}')
 
 
 def sc_address_from_xdr(xdr: XDRSCAddress) -> SCAddress:
