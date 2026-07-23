@@ -56,12 +56,16 @@ ENV PATH=/home/vscode/.nix-profile/bin:/home/vscode/.npm-global/bin:$PATH
 #                           so those live in flake.nix's devShell, not here.
 #   - nodejs_22           → host for the Claude Code CLI (run as `claude` from
 #                           anywhere, so it stays globally on PATH, not in the shell)
+#   - gh                  → GitHub CLI for PRs/issues/auth; global so it's usable
+#                           from anywhere. Auth is persisted across rebuilds via a
+#                           named volume on ~/.config/gh (see devcontainer.json).
 RUN . /home/vscode/.nix-profile/etc/profile.d/nix.sh \
     && nix registry add nixpkgs github:NixOS/nixpkgs/nixos-25.05 \
     && nix profile install \
         nixpkgs#direnv \
         nixpkgs#nix-direnv \
-        nixpkgs#nodejs_22
+        nixpkgs#nodejs_22 \
+        nixpkgs#gh
 
 # Claude Code CLI — installed to a per-user prefix so root isn't required.
 RUN . /home/vscode/.nix-profile/etc/profile.d/nix.sh \
