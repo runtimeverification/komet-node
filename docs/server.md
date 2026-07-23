@@ -1,6 +1,8 @@
 # `server.py` — `StellarRpcServer`
 
-`StellarRpcServer` exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC. Its job is to make the K semantics usable as a server. The compiled semantics are a one-shot interpreter — one process invocation per request, with no networking and no memory between runs — and `StellarRpcServer` is the long-running process wrapped around them: it keeps the HTTP socket open and the state files on disk, decodes the XDR envelope (via `TransactionEncoder`), runs each request through the semantics (via `NodeInterpreter`), and returns whatever `response.json` the semantics produced. All RPC dispatch, receipt bookkeeping, ledger accounting, and response formatting happen in K — the server holds none of that state itself.
+`StellarRpcServer` exposes the [Stellar RPC API](https://developers.stellar.org/docs/data/apis/rpc) over HTTP/JSON-RPC. Its job is to make the K semantics usable as a server. The compiled semantics are a one-shot interpreter — one process invocation per request, with no networking and no memory between runs — and `StellarRpcServer` is the long-running process wrapped around them: it keeps the HTTP socket open, decodes the XDR envelope, runs each request through the semantics, and returns whatever `response.json` the semantics produced. All RPC dispatch, receipt bookkeeping, ledger accounting, and response formatting happen in K — the server holds none of that state itself.
+
+The server depends on three collaborators through the protocols in `interfaces.py` rather than on their concrete classes: an `Encoder` (the XDR → request-envelope decoder, `TransactionEncoder`), an `Interpreter` (the K runner, `NodeInterpreter`), and a `Store` (the io-dir reader/writer, `ChainStore`). A composition root wires the concrete classes together — see `build_server` in `__main__.py` — so a test can drive the server with fakes.
 
 ---
 
@@ -8,16 +10,14 @@
 
 ```python
 class StellarRpcServer:
-    interpreter: NodeInterpreter     # the K runner
-    encoder:     TransactionEncoder  # the XDR → request-envelope decoder
-    io_dir:      Path                # directory holding every artifact
-    state_file:  Path                # io_dir / 'state.kore'
-    receipts_dir: Path               # io_dir / 'receipts'  — receipt_<hash>.json per transaction
-    traces_dir:   Path               # io_dir / 'traces'    — trace_<hash>.jsonl per transaction
-    ledgers_dir:  Path               # io_dir / 'ledgers'   — ledger_<seq>.json per closed ledger
-    requests_dir: Path               # io_dir / 'requests'  — request_<n>.json archive
-    events_dir:   Path               # io_dir / 'events'    — events_<ledger>.json per ledger
+    interpreter: Interpreter  # the K runner (NodeInterpreter)
+    encoder:     Encoder      # the XDR → request-envelope decoder (TransactionEncoder)
+    store:       Store        # the io-dir reader/writer (ChainStore)
+    io_dir:      Path         # the io-dir root, taken from the store
+    state_file:  Path         # io_dir / 'state.kore', taken from the store
 ```
+
+The per-item artifact directories (`receipts/`, `traces/`, `ledgers/`, `requests/`, `wasms/`, `events/`) belong to the `Store`, which owns the io-dir layout; the server reaches them through the store's methods rather than holding their paths. See [`ChainStore`](../src/komet_node/store.py) for the full layout.
 
 The server is a plain `http.server.HTTPServer` (not pyk's `JsonRpcServer`). A `BaseHTTPRequestHandler` reads each POST body and calls `_handle`, which parses the JSON-RPC frame and delegates to `handle_rpc`.
 
@@ -40,7 +40,7 @@ Framing happens entirely in Python (`_handle` / `_handle_batch` / `_handle_singl
 `handle_rpc` is the dispatch entry point; it returns the JSON-RPC response envelope as a string. You can call it **without** the HTTP layer, which is convenient for scripts and tests:
 
 ```python
-server = StellarRpcServer(io_dir=Path('out'))
+server = build_server(io_dir=Path('out'))
 server.handle_rpc('sendTransaction', {'transaction': xdr})
 ```
 
@@ -51,23 +51,23 @@ For `sendTransaction` it builds the request envelope with `encoder.build_tx_requ
 ## Startup
 
 ```python
-server = StellarRpcServer(
-    host='localhost',
-    port=8000,
+server = build_server(
     io_dir=Path('out'),  # omit for a fresh temporary directory
     network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
+    host='localhost',
+    port=8000,
 )
 server.serve()
 ```
 
-`io_dir` defaults to `None`, in which case the server creates a fresh temporary directory (`tempfile.mkdtemp`) and runs against that — a throwaway chain that starts empty on every launch and leaves the working directory untouched. Pass an explicit `io_dir` to keep the state in a known place.
+`build_server` (in `__main__.py`) is the composition root: it resolves the io-dir, constructs the `NodeInterpreter`, `TransactionEncoder`, and `ChainStore`, and injects them into the server. `io_dir` defaults to `None`, in which case `build_server` creates a fresh temporary directory (`tempfile.mkdtemp`) and runs against that — a throwaway chain that starts empty on every launch and leaves the working directory untouched. Pass an explicit `io_dir` to keep the state in a known place.
 
-At construction the server prepares the *io dir*, where `state.kore` lives at `io_dir / 'state.kore'`:
+At construction the `ChainStore` prepares the *io dir*, where `state.kore` lives at `io_dir / 'state.kore'`:
 
-- **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and writes it; `metadata.json` is seeded with `{"latest_ledger": 0}`.
+- **`state.kore` absent** — `interpreter.empty_config()` produces the initial idle K configuration (a blank-slate state with no accounts, contracts, or storage) and the store writes it; `metadata.json` is seeded with `{"latest_ledger": 0}`.
 - **`state.kore` present** — it is used as-is, and `metadata.json` is seeded only if missing. This lets you resume a previous session (ledger counter and stored receipts included) or start against a pre-built state.
 
-In both cases the server creates the `receipts/`, `traces/`, `ledgers/`, `requests/`, `wasms/`, and `events/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
+In both cases the store creates the `receipts/`, `traces/`, `ledgers/`, `requests/`, `wasms/`, and `events/` directories if they do not already exist, because the K file-system hooks write into them but cannot create them.
 
 Once the socket is bound, `serve` logs three lines to stderr: whether it is starting from a fresh state (an empty io-dir) or resuming an existing one (with the latest ledger), the io-dir path, and the listening address. Instruction tracing is always on, so every transaction the semantics run produces a trace. (Tracing only produces records for contract invocations.)
 
@@ -80,7 +80,7 @@ Once the socket is bound, `serve` logs three lines to stderr: whether it is star
 ```
 startup (state.kore absent):
           → empty_config() → state.kore ; metadata.json {latest_ledger:0}
-          → create receipts/ traces/ requests/ wasms/
+          → create receipts/ traces/ ledgers/ requests/ wasms/ events/
 
 per successful transaction:
           → the semantics run the steps (trace → traces/trace_<hash>.jsonl),
@@ -132,7 +132,7 @@ The node retains every ledger since genesis, so `oldestLedger` is always 0 and t
 `getVersionInfo` reports the komet-node package version as the RPC server version and the komet package (the K semantics of Soroban executing the transactions) as the "Captive Core". komet-node is a Python package, so no commit hash or build timestamp is baked in at build time — those fields are all-zeros / epoch placeholders with the spec-correct types. `protocolVersion` is a JSON number.
 
 ```json
-{ "version": "0.1.0", "commitHash": "0000...0000", "buildTimestamp": "1970-01-01T00:00:00", "captiveCoreVersion": "komet 0.1.79 (K semantics of Soroban)", "protocolVersion": 22 }
+{ "version": "0.1.0", "commitHash": "0000...0000", "buildTimestamp": "1970-01-01T00:00:00", "captiveCoreVersion": "komet 0.1.86 (K semantics of Soroban)", "protocolVersion": 22 }
 ```
 
 ### `getFeeStats`
@@ -189,7 +189,7 @@ Failures are reported in the result body, matching real stellar-rpc; only an und
 
 ```json
 [
-  {"pos": 3, "instr": ["const", "i32", 1048576], "stack": [], "locals": {}}
+  {"pos": 3, "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null}
 ]
 ```
 

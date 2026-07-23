@@ -188,7 +188,7 @@ Tracing is always on. Before running the steps, `#enableTrace` clears the transa
 **Trace format** (one JSON record per line):
 
 ```json
-{"pos": 597, "instr": ["local.get", 0], "stack": [["i64", 4]], "locals": {"0": ["i64", 4]}}
+{"pos": 597, "instr": ["local.get", 0], "stack": [["i64", 4]], "locals": {"0": ["i64", 4]}, "mem": null}
 ```
 
 | Field | Description |
@@ -197,6 +197,9 @@ Tracing is always on. Before running the steps, `#enableTrace` clears the transa
 | `instr` | Instruction name and operands as a JSON array |
 | `stack` | Value stack at instruction entry, as `[type, value]` pairs |
 | `locals` | Local variable bindings, keyed by index, as `[type, value]` pairs |
+| `mem` | Linear memory as a list of `{addr, bytes}` runs, emitted only when memory changed since the previous record and `null` otherwise (reuse the most recent snapshot) |
+
+Instruction records are one of several trace record kinds (`callContract`, `hostCall`, `contractData`, and `endWasm` are the others); see the [Trace a transaction](../README.md#trace-a-transaction) section of the README for all five.
 
 ---
 
