@@ -13,9 +13,11 @@ from pyk.kore.prelude import SORT_K_ITEM, inj, int_dv, str_dv, top_cell_initiali
 from pyk.kore.syntax import App, SortApp
 from pyk.utils import check_file_path, run_process_2
 
+from .errors import NodeInterpreterError
 from .utils import simbolik_definition
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from pathlib import Path
     from typing import Any
 
@@ -122,7 +124,7 @@ class NodeInterpreter:
         self,
         state_file: Path,
         io_dir: Path,
-        request: dict[str, Any],
+        request: Mapping[str, Any],
         program_steps: list[KInner] | None = None,
         *,
         commit: bool = True,
@@ -180,7 +182,3 @@ class NodeInterpreter:
         """
         steps_kore = kast_to_kore(self.definition.kdefinition, steps_of(steps), KSort('Steps'))
         return _set_cell(pattern, _PROGRAM_CELL, steps_kore)
-
-
-class NodeInterpreterError(RuntimeError):
-    pass
