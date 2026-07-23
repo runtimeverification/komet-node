@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from decimal import Decimal
 from io import BytesIO
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypedDict
 
 from komet.kast.syntax import upload_wasm
 from pykwasm.wasm2kast import wasm2kast
@@ -13,7 +13,7 @@ from stellar_sdk.utils import sha256
 
 from komet_node.scval import scval_to_json
 
-from .interpreter import NodeInterpreterError
+from .errors import TransactionEncodingError
 
 if TYPE_CHECKING:
     from pyk.kast.inner import KInner
@@ -21,6 +21,20 @@ if TYPE_CHECKING:
     from stellar_sdk.operation import Operation
 
 _STROOPS_PER_XLM = Decimal('10000000')
+
+# The request envelopes consumed by node.md. The functional TypedDict form is used because the
+# keys are the JSON wire names (some camelCase). `steps` is the JSON-encoded operation list;
+# for a wasm upload it is empty and the steps ride in the <program> cell instead (see
+# build_tx_request). Key *order* also matters to K's JSON matcher — see _encode_operation —
+# which a TypedDict cannot express, only the field names and types.
+TxRequest = TypedDict(
+    'TxRequest',
+    {'method': str, 'id': Any, 'now': str, 'txHash': str, 'envelopeXdr': str, 'steps': list},
+)
+SimulateRequest = TypedDict(
+    'SimulateRequest',
+    {'method': str, 'id': Any, 'now': str, 'steps': list},
+)
 
 
 def malformed_tx_result_xdr() -> str:
@@ -46,7 +60,7 @@ def _xlm_to_stroops(balance: object) -> int:
     """
     stroops = Decimal(str(balance)) * _STROOPS_PER_XLM
     if stroops != stroops.to_integral_value():
-        raise NodeInterpreterError(f'XLM amount has sub-stroop precision: {balance!r}')
+        raise TransactionEncodingError(f'XLM amount has sub-stroop precision: {balance!r}')
     return int(stroops)
 
 
@@ -82,7 +96,7 @@ class TransactionEncoder:
         rpc_id: Any,
         transaction_xdr: str,
         now: str,
-    ) -> tuple[dict[str, Any], list[KInner] | None, dict[str, bytes]]:
+    ) -> tuple[TxRequest, list[KInner] | None, dict[str, bytes]]:
         """
         Decode a transaction XDR envelope into a request envelope for the K semantics.
 
@@ -96,7 +110,7 @@ class TransactionEncoder:
         transaction = envelope.transaction
 
         json_steps = self._encode_steps(transaction)
-        request: dict[str, Any] = {
+        request: TxRequest = {
             'method': method,
             'id': rpc_id,
             'now': now,
@@ -114,7 +128,7 @@ class TransactionEncoder:
         upload_steps, uploaded_wasms = self._upload_steps(transaction)
         return request, upload_steps, uploaded_wasms
 
-    def build_simulate_request(self, rpc_id: Any, transaction_xdr: str, now: str) -> dict[str, Any]:
+    def build_simulate_request(self, rpc_id: Any, transaction_xdr: str, now: str) -> SimulateRequest:
         """
         Decode a transaction XDR envelope into a ``simulateTransaction`` request envelope.
 
@@ -232,13 +246,13 @@ class TransactionEncoder:
     def decode_contract_id(addr: str) -> bytes:
         if addr.startswith('C'):
             return StrKey.decode_contract(addr)
-        raise NodeInterpreterError(f'Invalid strkey prefix. Expected "C" got {addr[0]}')
+        raise TransactionEncodingError(f'Invalid strkey prefix. Expected "C" got {addr[0]}')
 
     @staticmethod
     def decode_account_id(addr: str) -> bytes:
         if addr.startswith('G'):
             return StrKey.decode_ed25519_public_key(addr)
-        raise NodeInterpreterError(f'Invalid strkey prefix. Expected "G" got {addr[0]}')
+        raise TransactionEncodingError(f'Invalid strkey prefix. Expected "G" got {addr[0]}')
 
     def contract_id_from_preimage(self, contract_id_preimage: xdr.ContractIDPreimage) -> bytes:
         network_id_hash = xdr.Hash(hashlib.sha256(self.network_passphrase.encode()).digest())

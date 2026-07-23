@@ -10,11 +10,13 @@
 
 | Module | Role |
 |---|---|
-| [`server.py`](server.md) — `StellarRpcServer` | Long-running HTTP/JSON-RPC server wrapping the one-shot K interpreter; `handle_rpc` dispatch; owns the io-dir files. Holds no ledger or receipt state. |
-| [`transaction.py`](transaction.md) — `TransactionEncoder` | XDR → request envelope + (for wasm uploads) kasmer steps; address/contract-id helpers. |
+| [`server.py`](server.md) — `StellarRpcServer` | Long-running HTTP/JSON-RPC server wrapping the one-shot K interpreter; `handle_rpc` → `_dispatch` routing (bad params raise `RpcError`). Holds no ledger or receipt state; delegates the io-dir to `ChainStore`. |
+| `store.py` — `ChainStore` | Owns the io-dir layout: the sole reader/writer of `state.kore`, `metadata.json`, and the `receipts/` `ledgers/` `events/` `requests/` `wasms/` files. |
+| [`transaction.py`](transaction.md) — `TransactionEncoder` | XDR → request envelope (`TxRequest`/`SimulateRequest`) + (for wasm uploads) kasmer steps; address/contract-id helpers. |
 | [`interpreter.py`](interpreter.md) — `NodeInterpreter` | Runs request envelopes through `llvm_interpret`; persists `state.kore`. No `kast`↔`kore` whole-config conversions. |
 | `scval.py` | XDR `SCVal` ↔ request/response JSON (`scval_to_json`, `scval_from_json`). |
 | `ledger_entries.py` | `getLedgerEntries` XDR translation: base64 `LedgerKey` → key descriptors for the semantics, intermediate entries → base64 `LedgerEntryData`. |
+| `errors.py` | The internal exceptions: `NodeInterpreterError`, `TransactionEncodingError`, and `RpcError` (a JSON-RPC error with its spec code). |
 | [`kdist/node.md`](node-semantics.md) | The K RPC layer: reads `request.json`, dispatches, updates `metadata.json` and the per-transaction `receipts/` files, writes `response.json`. |
 
 State lives in the io dir as `state.kore` (KORE world state) and `metadata.json` (ledger counter), with per-transaction receipts and traces under `receipts/` and `traces/`. See [architecture.md](architecture.md).

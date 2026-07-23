@@ -11,18 +11,21 @@ import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, TypedDict
 
 from stellar_sdk import Network, StrKey, TransactionEnvelope, xdr
 
+from komet_node.errors import RpcError
 from komet_node.interpreter import NodeInterpreter
 from komet_node.ledger import build_ledger_artifacts
 from komet_node.ledger_entries import InvalidParamsError, format_ledger_entries_response, ledger_key_descriptors
 from komet_node.result_xdr import transaction_meta_xdr, transaction_result_xdr
 from komet_node.scval import scval_from_json
+from komet_node.store import ChainStore, EventRecord, LedgerRecord
 from komet_node.transaction import SimulationRejected, TransactionEncoder, malformed_tx_result_xdr
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from http.server import HTTPServer as HTTPServerType
 
 _PROTOCOL_VERSION: Final = 22
@@ -37,10 +40,6 @@ _MAX_PAGE_LIMIT: Final = 200
 _DEFAULT_PAGE_LIMIT: Final = 50
 # getTransactions cursors are TOID-style: (ledger sequence << 32) | (application order << 12).
 _TOID_LEDGER_SHIFT: Final = 32
-
-# Where the K semantics stage the contract events of the currently executing transaction
-# (one JSON record per line, appended by the `contract_event` interception in node.md).
-_EVENTS_STAGING: Final = 'events_staged.jsonl'
 
 # getEvents cursors and event ids are TOID-style: a 19-digit zero-padded TOID, a hyphen,
 # and a 10-digit zero-padded event index (SEP-35).
@@ -99,10 +98,19 @@ _TX_METHODS: Final = ('sendTransaction',)
 
 # Methods whose spec accepts an optional `xdrFormat` param (protocols/rpc:
 # GetTransactionRequest.Format, SendTransactionRequest.Format). komet-node supports only
-# the default 'base64' format; see _check_xdr_format.
+# the default 'base64' format; see _require_supported_xdr_format.
 _XDR_FORMAT_METHODS: Final = ('getTransaction', 'sendTransaction')
 
 _log = logging.getLogger('komet_node')
+
+# The internal simulateTransaction result K emits (node.md): always ``latestLedger``, then
+# either ``error`` (a failed simulation) or ``returnValue`` (a JSON SCVal for a successful
+# one). ``total=False`` — the two outcomes are mutually exclusive.
+SimulateResult = TypedDict(
+    'SimulateResult',
+    {'latestLedger': int, 'error': str, 'returnValue': Any},
+    total=False,
+)
 
 
 class StellarRpcServer:
@@ -114,26 +122,15 @@ class StellarRpcServer:
     persists state to disk, and decodes the Stellar XDR envelope (:class:`TransactionEncoder`)
     that K cannot parse. It then runs the request envelope through the semantics
     (:class:`NodeInterpreter`). All RPC dispatch, receipt bookkeeping, ledger accounting,
-    and response formatting are performed in K (``node.md``). All artifacts — input and
-    output — live in ``io_dir``:
-
-      - ``state.kore``            — the KORE world-state configuration (accounts, contracts, wasm)
-      - ``metadata.json``         — ``{"latest_ledger": N}``
-      - ``receipts/receipt_<hash>.json`` — one stored receipt per transaction
-      - ``traces/trace_<hash>.jsonl``    — one execution trace per transaction
-      - ``ledgers/ledger_<seq>.json``    — one record per closed ledger (tx hash, close
-        time, and the ledger-header XDR artifacts), serving getTransactions/getLedgers
-      - ``requests/request_<n>.json``    — an archive of each incoming JSON-RPC request
-      - ``wasms/<hash>.wasm``            — raw bytes of each uploaded wasm module (the K
-        configuration stores modules parsed, so getLedgerEntries CONTRACT_CODE lookups
-        read the original bytes from here)
-
-    Splitting receipts, traces, ledgers, and requests into per-item files keeps any single
-    file from growing without bound as the chain advances.
+    and response formatting are performed in K (``node.md``). The on-disk artifacts — input
+    and output — belong to the :class:`~komet_node.store.ChainStore`, which owns the io-dir
+    layout; this server holds one and asks it for receipts, ledgers, events, and the ledger
+    counter rather than touching paths itself.
     """
 
     interpreter: NodeInterpreter
     encoder: TransactionEncoder
+    store: ChainStore
     io_dir: Path
     state_file: Path
 
@@ -148,44 +145,16 @@ class StellarRpcServer:
         self._port = port
         self.interpreter = NodeInterpreter()
         self.encoder = TransactionEncoder(network_passphrase)
-        # With no io-dir given, run against a fresh temporary directory: a throwaway chain
-        # that starts empty on every launch and leaves the working directory untouched.
-        self.io_dir = (Path(tempfile.mkdtemp(prefix='komet-node-')) if io_dir is None else io_dir).resolve()
-        self.io_dir.mkdir(parents=True, exist_ok=True)
-        self.state_file = self.io_dir / 'state.kore'
         self._httpd: HTTPServerType | None = None
 
-        self._fresh = not self.state_file.exists()
-        if self._fresh:
-            self.state_file.write_text(self.interpreter.empty_config())
-        metadata_file = self.io_dir / 'metadata.json'
-        if self._fresh or not metadata_file.exists():
-            metadata_file.write_text(json.dumps({'latest_ledger': 0}))
-
-        # Per-transaction receipts and traces, and per-request archives, each go in their own
-        # file under these directories so no single file grows without bound. The K
-        # file-system hooks open files with POSIX open(), which does not create parent
-        # directories, so the directories must exist before the semantics run.
-        self.receipts_dir = self.io_dir / 'receipts'
-        self.traces_dir = self.io_dir / 'traces'
-        self.ledgers_dir = self.io_dir / 'ledgers'
-        self.requests_dir = self.io_dir / 'requests'
-        self.wasms_dir = self.io_dir / 'wasms'
-        # events/ holds one finished JSON array per ledger (events_<ledger>.json), written by
-        # _finalize_events below and read back by the K getEvents rules.
-        self.events_dir = self.io_dir / 'events'
-        for directory in (
-            self.receipts_dir,
-            self.traces_dir,
-            self.ledgers_dir,
-            self.requests_dir,
-            self.wasms_dir,
-            self.events_dir,
-        ):
-            directory.mkdir(exist_ok=True)
-        # Continue the request archive numbering past anything a previous run left behind, so
-        # resuming an io-dir never overwrites its earlier request files.
-        self._request_count = _next_request_index(self.requests_dir)
+        # With no io-dir given, run against a fresh temporary directory: a throwaway chain
+        # that starts empty on every launch and leaves the working directory untouched.
+        self.store = ChainStore(Path(tempfile.mkdtemp(prefix='komet-node-')) if io_dir is None else io_dir)
+        self._fresh = self.store.initialize(self.interpreter.empty_config)
+        # state_file and io_dir are the paths the interpreter subprocess resolves against; kept
+        # as attributes so callers (and tests) can reach the io-dir root directly.
+        self.io_dir = self.store.root
+        self.state_file = self.store.state_file
 
     def serve(self) -> None:
         server = self
@@ -220,7 +189,7 @@ class StellarRpcServer:
         if self._fresh:
             status = 'starting from a fresh state (empty io-dir)'
         else:
-            status = f'resuming existing state (latest ledger {self._latest_ledger()})'
+            status = f'resuming existing state (latest ledger {self.store.latest_ledger()})'
         _log.info('komet-node ready — %s', status)
         _log.info('io-dir: %s', self.io_dir)
         _log.info('listening on http://%s:%d', self.host, self.port())
@@ -308,32 +277,34 @@ class StellarRpcServer:
         """
         now = str(int(time.time()))
         _log.info('request: %s (id=%r)', method, request_id)
-        self._archive_request(method, params, request_id)
+        self.store.archive_request(method, params, request_id)
+        try:
+            return self._dispatch(method, params, request_id, now)
+        except RpcError as err:
+            return _error_str(request_id, err.code, err.message)
 
+    def _dispatch(self, method: str | None, params: dict[str, Any], request_id: Any, now: str) -> str:
+        """Route a validated JSON-RPC call to its handler, returning the response JSON string.
+
+        Client-facing problems (bad params, unknown method, a stuck read-only run) are
+        raised as :class:`RpcError`; :meth:`handle_rpc` turns them into the error envelope.
+        """
         # Reject an unsupported xdrFormat up front, before the request does anything —
         # in particular before a sendTransaction executes and commits state.
         if method in _XDR_FORMAT_METHODS:
-            format_error = _check_xdr_format(params, request_id)
-            if format_error is not None:
-                return format_error
+            _require_supported_xdr_format(params)
 
         if method in _TX_METHODS:
             return self._handle_send_transaction(method, params, request_id, now)
-
         if method == 'simulateTransaction':
             return self._handle_simulate(params, request_id, now)
-
         if method == 'getLedgerEntries':
             return self._get_ledger_entries(params, request_id, now)
 
-        read_only_envelope = self._read_only_envelope(method, params, request_id, now)
-        if isinstance(read_only_envelope, str):  # a pre-formatted JSON-RPC error
-            return read_only_envelope
-        if read_only_envelope is None:
-            return _error_str(request_id, -32601, 'Method not found')
-        response = self.interpreter.run(self.state_file, self.io_dir, read_only_envelope, None)
+        envelope = self._read_only_envelope(method, params, request_id, now)
+        response = self.interpreter.run(self.state_file, self.io_dir, envelope, None)
         if response is None:
-            return _error_str(request_id, -32603, 'Internal error')
+            raise RpcError.internal()
         return response
 
     def _handle_send_transaction(self, method: str, params: dict[str, Any], request_id: Any, now: str) -> str:
@@ -347,12 +318,12 @@ class StellarRpcServer:
         """
         transaction = params.get('transaction')
         if not isinstance(transaction, str):
-            return _error_str(request_id, -32602, "Invalid params: 'transaction' (XDR string) is required")
+            raise RpcError.invalid_params("'transaction' (XDR string) is required")
         try:
             parsed = TransactionEnvelope.from_xdr(transaction, self.encoder.network_passphrase)
         except Exception:
             traceback.print_exc()
-            return _error_str(request_id, -32602, 'Invalid params: could not decode transaction XDR')
+            raise RpcError.invalid_params('could not decode transaction XDR') from None
         try:
             envelope, program_steps, uploaded_wasms = self.encoder.build_tx_request(
                 method, request_id, transaction, now
@@ -366,15 +337,15 @@ class StellarRpcServer:
         # answer DUPLICATE without running the steps (see node.md). Steps injected into
         # the <program> cell (wasm uploads) would execute *before* dispatch, though, so
         # they must not be injected for a duplicate.
-        is_duplicate = (self.receipts_dir / f'receipt_{envelope["txHash"]}.json').exists()
+        is_duplicate = self.store.has_receipt(envelope['txHash'])
         if is_duplicate:
             program_steps = None
         # Stale staged events (e.g. from a previously failed transaction) must not leak
         # into this transaction's event records.
-        (self.io_dir / _EVENTS_STAGING).unlink(missing_ok=True)
+        self.store.clear_staged_events()
         response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
         if response is None:
-            (self.io_dir / _EVENTS_STAGING).unlink(missing_ok=True)
+            self.store.clear_staged_events()
             return self._failure_response(request_id, envelope, now)
         # Rewrite the freshly written SUCCESS receipt's internal `returnValue` into real
         # resultXdr/resultMetaXdr. Skip it for a duplicate: that receipt was already
@@ -389,7 +360,7 @@ class StellarRpcServer:
         # stores modules parsed, and getLedgerEntries CONTRACT_CODE entries must return
         # the original bytes.
         for wasm_hash, wasm in uploaded_wasms.items():
-            (self.wasms_dir / f'{wasm_hash}.wasm').write_bytes(wasm)
+            self.store.write_wasm(wasm_hash, wasm)
         self._record_closed_ledger(envelope, now)
         return response
 
@@ -404,20 +375,20 @@ class StellarRpcServer:
         try:
             descriptors = ledger_key_descriptors(params)
         except InvalidParamsError as err:
-            return _error_str(request_id, -32602, f'Invalid params: {err}')
+            raise RpcError.invalid_params(str(err)) from err
         envelope = {'method': 'getLedgerEntries', 'id': request_id, 'now': now, 'keys': descriptors}
         response = self.interpreter.run(self.state_file, self.io_dir, envelope, None)
         if response is None:
-            return _error_str(request_id, -32603, 'Internal error')
-        return format_ledger_entries_response(response, self.wasms_dir)
+            raise RpcError.internal()
+        return format_ledger_entries_response(response, self.store.wasms_dir)
 
     def _read_only_envelope(
         self, method: str | None, params: dict[str, Any], request_id: Any, now: str
-    ) -> dict[str, Any] | str | None:
+    ) -> dict[str, Any]:
         """Build the request envelope for a read-only method.
 
-        Returns the envelope dict, ``None`` if the method is unknown, or a pre-formatted
-        JSON-RPC error string for a recognised method with invalid params.
+        Returns the envelope dict, or raises :class:`RpcError` — ``method_not_found`` for an
+        unknown method, ``invalid_params`` for a recognised method with bad params.
         """
         base = {'method': method, 'id': request_id, 'now': now}
         if method == 'getHealth':
@@ -442,15 +413,15 @@ class StellarRpcServer:
         if method in ('getTransaction', 'traceTransaction'):
             tx_hash = params.get('hash')
             if not isinstance(tx_hash, str):
-                return _error_str(request_id, -32602, "Invalid params: 'hash' (string) is required")
+                raise RpcError.invalid_params("'hash' (string) is required")
             if _TX_HASH_RE.fullmatch(tx_hash) is None:
-                return _error_str(request_id, -32602, "Invalid params: 'hash' must be a 64-character hex string")
+                raise RpcError.invalid_params("'hash' must be a 64-character hex string")
             return {**base, 'hash': tx_hash}
         if method in ('getTransactions', 'getLedgers'):
-            return self._history_envelope(method, params, request_id, base)
+            return self._history_envelope(method, params, base)
         if method == 'getEvents':
-            return self._get_events_envelope(base, params, request_id)
-        return None
+            return self._get_events_envelope(base, params)
+        raise RpcError.method_not_found()
 
     # ------------------------------------------------------------------
     # simulateTransaction
@@ -468,14 +439,14 @@ class StellarRpcServer:
         """
         transaction = params.get('transaction')
         if not isinstance(transaction, str):
-            return _error_str(request_id, -32602, "Invalid params: 'transaction' (XDR string) is required")
+            raise RpcError.invalid_params("'transaction' (XDR string) is required")
         try:
             envelope = self.encoder.build_simulate_request(request_id, transaction, now)
         except SimulationRejected as err:
             return self._simulate_error_response(request_id, str(err))
         except Exception:
             traceback.print_exc()
-            return _error_str(request_id, -32602, 'Invalid params: could not process transaction')
+            raise RpcError.invalid_params('could not process transaction') from None
 
         response = self.interpreter.run(self.state_file, self.io_dir, envelope, None, commit=False)
         if response is None:
@@ -484,7 +455,7 @@ class StellarRpcServer:
             return self._simulate_error_response(request_id, 'transaction simulation failed')
         return self._simulate_response(request_id, json.loads(response)['result'])
 
-    def _simulate_response(self, rpc_id: Any, k_result: dict[str, Any]) -> str:
+    def _simulate_response(self, rpc_id: Any, k_result: SimulateResult) -> str:
         """Map the internal K simulation result to the spec response shape.
 
         This is the one read path where Python builds response content: the spec requires
@@ -505,41 +476,35 @@ class StellarRpcServer:
 
     def _simulate_error_response(self, rpc_id: Any, message: str) -> str:
         """Build the ``{error, latestLedger}`` result for a simulation that never ran in K."""
-        return _result_str(rpc_id, {'error': message, 'latestLedger': self._latest_ledger()})
+        return _result_str(rpc_id, {'error': message, 'latestLedger': self.store.latest_ledger()})
 
-    def _history_envelope(
-        self, method: str, params: dict[str, Any], request_id: Any, base: dict[str, Any]
-    ) -> dict[str, Any] | str:
+    def _history_envelope(self, method: str, params: dict[str, Any], base: dict[str, Any]) -> dict[str, Any]:
         """Validate getTransactions/getLedgers params and build the request envelope.
 
         Parameter validation lives here rather than in K because it needs the JSON-RPC
         error path and the latest-ledger bound, both of which the server already owns for
         the other methods. The envelope carries the resolved first ledger sequence to
         serve (``startSeq``) and the page ``limit``; the semantics collect the records
-        and format the response.
+        and format the response. Bad params raise :class:`RpcError`.
         """
-
-        def invalid(message: str) -> str:
-            return _error_str(request_id, -32602, f'Invalid params: {message}')
-
         xdr_format_error = _unsupported_xdr_format(params)
         if xdr_format_error is not None:
-            return invalid(xdr_format_error)
+            raise RpcError.invalid_params(xdr_format_error)
 
         pagination = params.get('pagination') or {}
         if not isinstance(pagination, dict):
-            return invalid("'pagination' must be an object")
+            raise RpcError.invalid_params("'pagination' must be an object")
         limit = pagination.get('limit', _DEFAULT_PAGE_LIMIT)
         if not _is_int(limit) or not 1 <= limit <= _MAX_PAGE_LIMIT:
-            return invalid(f"'limit' must be an integer between 1 and {_MAX_PAGE_LIMIT}")
+            raise RpcError.invalid_params(f"'limit' must be an integer between 1 and {_MAX_PAGE_LIMIT}")
 
         cursor = pagination.get('cursor')
         start_ledger = params.get('startLedger')
         if cursor is not None:
             if start_ledger is not None:
-                return invalid("'startLedger' and 'cursor' are mutually exclusive")
+                raise RpcError.invalid_params("'startLedger' and 'cursor' are mutually exclusive")
             if not isinstance(cursor, str) or not cursor.isdigit():
-                return invalid("'cursor' must be a cursor string from a previous response")
+                raise RpcError.invalid_params("'cursor' must be a cursor string from a previous response")
             # The cursor names the last record already returned: a TOID for transactions
             # (ledger << 32 | order << 12; one transaction per ledger here), the plain
             # ledger sequence for ledgers. Either way the next page starts one ledger on.
@@ -551,18 +516,14 @@ class StellarRpcServer:
             if start_ledger is None:
                 start_ledger = 0  # like real stellar-rpc: unset means "from the oldest ledger"
             if not _is_int(start_ledger):
-                return invalid("'startLedger' must be a number")
-            latest_ledger = self._latest_ledger()
+                raise RpcError.invalid_params("'startLedger' must be a number")
+            latest_ledger = self.store.latest_ledger()
             if start_ledger != 0 and not 0 <= start_ledger <= latest_ledger:
-                return invalid(
+                raise RpcError.invalid_params(
                     f"'startLedger' must be between the oldest ledger 0 and the latest ledger {latest_ledger}"
                 )
             start_seq = start_ledger
         return {**base, 'startSeq': start_seq, 'limit': limit}
-
-    def _latest_ledger(self) -> int:
-        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
-        return int(metadata.get('latest_ledger', 0))
 
     def _attach_result_xdr(self, tx_hash: str) -> None:
         """Rewrite a fresh SUCCESS receipt's internal ``returnValue`` into real result XDR.
@@ -573,8 +534,7 @@ class StellarRpcServer:
         ``resultMetaXdr`` (base64 TransactionResult / TransactionMeta), so getTransaction
         can serve the stored receipt as-is.
         """
-        receipt_file = self.receipts_dir / f'receipt_{tx_hash}.json'
-        receipt = json.loads(receipt_file.read_text())
+        receipt = self.store.read_receipt(tx_hash)
         return_value_json = receipt.pop('returnValue', None)
         try:
             return_value = scval_from_json(return_value_json) if return_value_json is not None else None
@@ -586,9 +546,9 @@ class StellarRpcServer:
             # encoder cannot decode): the transaction has already committed, and the stored
             # receipt must never keep the K-internal `returnValue` field. A receipt with
             # `resultXdr` omitted is spec-legal; a leaked internal field is not.
-            receipt_file.write_text(json.dumps(receipt))
+            self.store.write_receipt(tx_hash, receipt)
 
-    def _record_closed_ledger(self, envelope: dict[str, Any], now: str) -> None:
+    def _record_closed_ledger(self, envelope: Mapping[str, Any], now: str) -> None:
         """Materialise ``ledgers/ledger_<seq>.json`` for the ledger a transaction just closed.
 
         The K semantics own the ledger counter and receipts; this per-ledger record
@@ -597,15 +557,13 @@ class StellarRpcServer:
         read to serve getTransactions and getLedgers. Written only on the success path —
         a failed transaction closes no ledger.
         """
-        sequence = self._latest_ledger()  # the semantics bumped it just before responding
-        previous_hash = b'\x00' * 32  # the genesis ledger's hash
-        previous_file = self.ledgers_dir / f'ledger_{sequence - 1}.json'
-        if previous_file.exists():
-            previous_hash = bytes.fromhex(json.loads(previous_file.read_text())['hash'])
+        sequence = self.store.latest_ledger()  # the semantics bumped it just before responding
+        previous = self.store.read_ledger(sequence - 1)
+        previous_hash = bytes.fromhex(previous['hash']) if previous is not None else b'\x00' * 32  # genesis hash
         ledger_hash, header_xdr, metadata_xdr = build_ledger_artifacts(
             sequence, int(now), previous_hash, envelope['envelopeXdr']
         )
-        record = {
+        record: LedgerRecord = {
             'sequence': sequence,
             'txHash': envelope['txHash'],
             'closedAt': int(now),
@@ -613,51 +571,49 @@ class StellarRpcServer:
             'headerXdr': header_xdr,
             'metadataXdr': metadata_xdr,
         }
-        (self.ledgers_dir / f'ledger_{sequence}.json').write_text(json.dumps(record))
+        self.store.write_ledger(record)
 
-    def _get_events_envelope(
-        self, base: dict[str, Any], params: dict[str, Any], request_id: Any
-    ) -> dict[str, Any] | str:
+    def _get_events_envelope(self, base: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
         """Validate the getEvents params and build the request envelope.
 
         Everything structural is checked here so the K rules (node.md) only handle
         well-typed envelopes; the one state-dependent check (the window against the chain
-        tip) lives in K. Returns a pre-formatted JSON-RPC error string on invalid params.
+        tip) lives in K. Bad params raise :class:`RpcError`.
         """
         xdr_format_error = _unsupported_xdr_format(params)
         if xdr_format_error is not None:
-            return _error_str(request_id, -32602, f'Invalid params: {xdr_format_error}')
+            raise RpcError.invalid_params(xdr_format_error)
 
         pagination = params.get('pagination') or {}
         if not isinstance(pagination, dict):
-            return _error_str(request_id, -32602, "Invalid params: 'pagination' must be an object")
+            raise RpcError.invalid_params("'pagination' must be an object")
         cursor = pagination.get('cursor')
         if cursor is not None and not (isinstance(cursor, str) and _EVENT_CURSOR_RE.fullmatch(cursor)):
-            return _error_str(request_id, -32602, "Invalid params: 'cursor' is malformed")
+            raise RpcError.invalid_params("'cursor' is malformed")
         limit = pagination.get('limit')
         if limit is None:
             limit = _DEFAULT_EVENTS_LIMIT
         if isinstance(limit, float) and limit.is_integer():
             limit = int(limit)
         if not _is_int(limit) or not 1 <= limit <= _MAX_EVENTS_LIMIT:
-            return _error_str(request_id, -32602, f'Invalid params: limit must be between 1 and {_MAX_EVENTS_LIMIT}')
+            raise RpcError.invalid_params(f'limit must be between 1 and {_MAX_EVENTS_LIMIT}')
 
         start_ledger = params.get('startLedger')
         end_ledger = params.get('endLedger')
         if cursor is not None and (start_ledger is not None or end_ledger is not None):
-            return _error_str(request_id, -32600, 'startLedger and endLedger must be omitted when a cursor is set')
+            raise RpcError.invalid_request('startLedger and endLedger must be omitted when a cursor is set')
         if cursor is None and start_ledger is None:
-            return _error_str(request_id, -32600, 'startLedger or a pagination cursor is required')
+            raise RpcError.invalid_request('startLedger or a pagination cursor is required')
         for name, value in (('startLedger', start_ledger), ('endLedger', end_ledger)):
             if value is not None and not _is_int(value):
-                return _error_str(request_id, -32602, f'Invalid params: {name} must be a ledger sequence number')
+                raise RpcError.invalid_params(f'{name} must be a ledger sequence number')
         if start_ledger is not None and start_ledger < 1:
-            return _error_str(request_id, -32600, 'startLedger must be positive')
+            raise RpcError.invalid_request('startLedger must be positive')
 
         filters = params.get('filters') or []
         error = _validate_event_filters(filters)
         if error is not None:
-            return _error_str(request_id, -32602, f'Invalid params: {error}')
+            raise RpcError.invalid_params(error)
 
         return {
             **base,
@@ -675,20 +631,17 @@ class StellarRpcServer:
         contract id — see "Event capture" in node.md); this turns each into the spec's
         Event shape — base64 SCVal XDR topics/value, strkey contract id, TOID-style id —
         which K cannot build itself. Runs after every successful sendTransaction; with
-        nothing staged it only removes the staging file.
+        nothing staged it does nothing.
         """
-        staging = self.io_dir / _EVENTS_STAGING
-        if not staging.exists():
-            return
-        lines = [line for line in staging.read_text().splitlines() if line.strip()]
-        staging.unlink()
+        lines = self.store.read_staged_event_lines()
+        self.store.clear_staged_events()
         if not lines:
             return
-        ledger = self._latest_ledger()
+        ledger = self.store.latest_ledger()
         closed_at = datetime.fromtimestamp(int(now), tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         # One transaction per ledger: TOID with application order 1, operation index 0.
         toid = (ledger << 32) | (1 << 12)
-        events = []
+        events: list[EventRecord] = []
         for index, line in enumerate(lines):
             staged = json.loads(line)
             try:
@@ -711,18 +664,7 @@ class StellarRpcServer:
                 }
             )
         if events:
-            (self.events_dir / f'events_{ledger}.json').write_text(json.dumps(events))
-
-    def _archive_request(self, method: str | None, params: dict[str, Any], request_id: Any) -> None:
-        """Write each incoming JSON-RPC call to its own ``requests/request_<n>.json`` file.
-
-        This is an audit trail for the developer; the canonical ``request.json`` the semantics
-        consume is written separately by :class:`NodeInterpreter`. The server is single-threaded
-        (requests are serialised), so the counter needs no locking.
-        """
-        archive = {'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params}
-        (self.requests_dir / f'request_{self._request_count}.json').write_text(json.dumps(archive))
-        self._request_count += 1
+            self.store.write_events(ledger, events)
 
     def _error_status_response(self, rpc_id: Any, tx_hash: str, now: str) -> str:
         """Synthesise the sendTransaction response for a transaction rejected at admission.
@@ -738,19 +680,19 @@ class StellarRpcServer:
                 'hash': tx_hash,
                 'status': 'ERROR',
                 'errorResultXdr': malformed_tx_result_xdr(),
-                'latestLedger': self._latest_ledger(),
+                'latestLedger': self.store.latest_ledger(),
                 'latestLedgerCloseTime': now,
             },
         )
 
-    def _failure_response(self, rpc_id: Any, envelope: dict[str, Any], now: str) -> str:
+    def _failure_response(self, rpc_id: Any, envelope: Mapping[str, Any], now: str) -> str:
         """Synthesise the sendTransaction response for a transaction that got stuck (failed).
 
         The K run does not produce a ``response.json`` for a failed transaction and the
         world state is left unchanged. We record a FAILED receipt so a later getTransaction
         finds it, without bumping the ledger.
         """
-        ledger = self._latest_ledger()
+        ledger = self.store.latest_ledger()
         tx_hash = envelope['txHash']
         tx_envelope = TransactionEnvelope.from_xdr(envelope['envelopeXdr'], self.encoder.network_passphrase)
 
@@ -771,7 +713,7 @@ class StellarRpcServer:
             'ledger': ledger,
             'createdAt': now,
         }
-        (self.receipts_dir / f'receipt_{tx_hash}.json').write_text(json.dumps(receipt))
+        self.store.write_receipt(tx_hash, receipt)
 
         return _result_str(
             rpc_id,
@@ -825,21 +767,6 @@ def _validate_event_filters(filters: Any) -> str | None:
     return None
 
 
-def _next_request_index(requests_dir: Path) -> int:
-    """Return the next free index for ``requests/request_<n>.json``.
-
-    One past the highest index already present, so resuming an io-dir continues the archive
-    rather than overwriting it; 0 when the directory holds no request files yet.
-    """
-    highest = -1
-    for path in requests_dir.glob('request_*.json'):
-        try:
-            highest = max(highest, int(path.stem.removeprefix('request_')))
-        except ValueError:
-            continue  # ignore files that don't match the request_<int> pattern
-    return highest + 1
-
-
 def _configure_logging() -> None:
     """Attach a stderr handler to the komet_node logger once, if nothing else has.
 
@@ -871,14 +798,14 @@ def _unsupported_xdr_format(params: dict[str, Any]) -> str | None:
     return "unknown xdrFormat, expected 'base64'"
 
 
-def _check_xdr_format(params: dict[str, Any], request_id: Any) -> str | None:
-    """Validate the optional ``xdrFormat`` param; ``None`` means the request may proceed.
+def _require_supported_xdr_format(params: dict[str, Any]) -> None:
+    """Raise :class:`RpcError` if the request's ``xdrFormat`` is unsupported.
 
-    Returns a pre-formatted -32602 error string for an unsupported format (see
-    :func:`_unsupported_xdr_format`).
+    A thin wrapper over :func:`_unsupported_xdr_format` for the raise-based dispatch path.
     """
     message = _unsupported_xdr_format(params)
-    return None if message is None else _error_str(request_id, -32602, f'Invalid params: {message}')
+    if message is not None:
+        raise RpcError.invalid_params(message)
 
 
 def _error_str(rpc_id: Any, code: int, message: str) -> str:

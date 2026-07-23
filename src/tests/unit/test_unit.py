@@ -1,6 +1,6 @@
 import pytest
 
-from komet_node.interpreter import NodeInterpreterError
+from komet_node.errors import TransactionEncodingError
 from komet_node.transaction import _xlm_to_stroops
 
 
@@ -15,5 +15,5 @@ def test_xlm_to_stroops_max_precision() -> None:
 
 def test_xlm_to_stroops_rejects_sub_stroop() -> None:
     # 8 decimal places cannot be represented exactly; must be rejected, not truncated
-    with pytest.raises(NodeInterpreterError):
+    with pytest.raises(TransactionEncodingError):
         _xlm_to_stroops('0.00000001')
