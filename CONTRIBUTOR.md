@@ -36,29 +36,23 @@ gh auth logout   # remove stored credentials
 
 ### Creating a token with minimal permissions
 
-Prefer **fine-grained personal access tokens** — they let you grant only the
-access you actually need, scoped to a single repository, with a short expiry.
-Please generate tokens with the **least privilege** required for your work; avoid
-broad "classic" tokens with the full `repo` scope unless there is no alternative.
+Create a **fine-grained** personal access token at **GitHub → Settings → Developer
+settings → [Fine-grained personal access tokens](https://github.com/settings/personal-access-tokens/new)**
+with the least privilege for your work:
 
-1. Go to **GitHub → Settings → Developer settings →
-   [Fine-grained personal access tokens](https://github.com/settings/personal-access-tokens/new)**.
-2. Give the token a descriptive name and set the **shortest expiry** that fits
-   your workflow.
-3. Under **Repository access**, choose **Only select repositories** and pick just
-   `runtimeverification/komet-node` (or your fork) — not "All repositories".
-4. Under **Permissions → Repository permissions**, grant only what you need. For a
-   typical contributor workflow that is:
-   - **Contents** → *Read and write* (clone, pull, push branches)
-   - **Pull requests** → *Read and write* (open and update PRs)
-   - **Issues** → *Read and write* (only if you triage or comment on issues)
+- **Repository access** → *Only select repositories* → `runtimeverification/komet-node`
+- **Contents** → *Read and write*
+- **Pull requests** → *Read and write*
+- **Issues** → *Read and write* (only if you triage issues)
 
-   `Metadata → Read` is required and is selected automatically. Leave every other
-   permission at **No access**.
-5. Click **Generate token** and copy it — GitHub shows it only once. Paste it into
-   the `gh auth login` prompt above.
+`Metadata → Read` is selected automatically; leave everything else at *No access*.
 
-> [!TIP]
-> Start with the narrowest set of permissions and add more only if a command
-> fails with an authorization error. A token that can do less is a smaller risk
-> if it ever leaks.
+## Signing commits
+
+To sign commits made with `git`, add an SSH or GPG key of type **Signing key** to
+your GitHub account.
+
+> [!WARNING]
+> Never place an SSH key registered as an **Authentication key** in the container.
+> An authentication key grants full account-wide git access and would bypass the
+> minimal permissions of your fine-grained PAT. Use a **signing-only** key here.
