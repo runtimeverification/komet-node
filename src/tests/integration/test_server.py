@@ -2,26 +2,35 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
-import re
 import shutil
-import socket
-import subprocess
-import threading
 import time
-import urllib.request
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import pytest
 from stellar_sdk import Account, Address, Asset, Keypair, Network, StrKey, TransactionBuilder, xdr
 from stellar_sdk.utils import sha256
 from stellar_sdk.xdr.sc_val_type import SCValType
 
+from komet_node.scval import scval_from_json
 from komet_node.server import StellarRpcServer
 
-if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+from .conftest import (
+    PASSPHRASE,
+    _is_hex64,
+    _is_int_string,
+    _is_number,
+    _post,
+    _post_raw,
+    _rpc,
+    deploy_and_get_invoker,
+    deploy_contract,
+    fund_account,
+    make_invoker,
+    send_tx,
+    wat_to_wasm,
+)
 
+if TYPE_CHECKING:
     from stellar_sdk import TransactionEnvelope
 
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
@@ -29,71 +38,6 @@ ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resol
 ADDER_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'adder.wat').resolve(strict=True)
 BYTES_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'bytes.wat').resolve(strict=True)
 STORAGE_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'storage.wat').resolve(strict=True)
-
-
-def wat_to_wasm(wat_path: Path) -> bytes:
-    proc_res = subprocess.run(['wat2wasm', str(wat_path), '--output=/dev/stdout'], check=True, capture_output=True)
-    return proc_res.stdout
-
-
-def _find_free_port() -> int:
-    with socket.socket() as s:
-        s.bind(('', 0))
-        return s.getsockname()[1]
-
-
-def _wait_for_server(host: str, port: int, timeout: float = 10.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=0.1):
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise TimeoutError(f'Server did not start on {host}:{port}')
-
-
-def _rpc(port: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
-    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode()
-    return _post(port, body)
-
-
-def _post(port: int, body: bytes) -> Any:
-    return json.loads(_post_raw(port, body))
-
-
-def _post_raw(port: int, body: bytes) -> bytes:
-    req = urllib.request.Request(
-        f'http://localhost:{port}',
-        data=body,
-        headers={'Content-Type': 'application/json'},
-    )
-    with urllib.request.urlopen(req) as resp:
-        return resp.read()
-
-
-# Spec-shape helpers. The official serialization rules come from the Go structs in
-# stellar/go-stellar-sdk protocols/rpc (what real stellar-rpc emits): ledger sequence
-# numbers and protocolVersion are JSON numbers; the close-time fields on the singular
-# methods are int64 with Go's `,string` encoding, i.e. JSON strings holding a decimal
-# integer; hashes are 64 lowercase hex characters.
-
-_HEX64_RE = re.compile(r'[0-9a-f]{64}')
-_INT_STRING_RE = re.compile(r'-?[0-9]+')
-
-
-def _is_number(value: Any) -> bool:
-    """True for a JSON number decoded to int (bool is a distinct JSON type)."""
-    return isinstance(value, int) and not isinstance(value, bool)
-
-
-def _is_int_string(value: Any) -> bool:
-    """True for a JSON string holding a decimal integer (Go int64 `,string` encoding)."""
-    return isinstance(value, str) and _INT_STRING_RE.fullmatch(value) is not None
-
-
-def _is_hex64(value: Any) -> bool:
-    return isinstance(value, str) and _HEX64_RE.fullmatch(value) is not None
 
 
 def _assert_ledger_bounds(result: dict[str, Any]) -> None:
@@ -135,57 +79,6 @@ def _create_account_xdr(keypair: Keypair, account: Account) -> str:
     )
     envelope.sign(keypair)
     return envelope.to_xdr()
-
-
-@pytest.fixture
-def server(tmp_path: Path) -> Iterator[StellarRpcServer]:
-    port = _find_free_port()
-    srv = StellarRpcServer(
-        host='localhost',
-        port=port,
-        io_dir=tmp_path,
-        network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
-    )
-    thread = threading.Thread(target=srv.serve, daemon=True)
-    thread.start()
-    _wait_for_server('localhost', port)
-    yield srv
-    srv.shutdown()
-
-
-def _deploy_and_get_invoker(server: StellarRpcServer, wat_path: Path) -> Callable[..., str]:
-    """Create an account, upload `wat_path`, and deploy a contract instance from it.
-
-    Returns an ``invoke(func, args=None)`` callable that runs a contract function and returns
-    the executed transaction's hash, asserting the whole setup and each call reaches SUCCESS.
-    """
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
-
-    def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-
-    def send(tb: TransactionBuilder) -> str:
-        env = tb.set_timeout(30).build()
-        env.sign(keypair)
-        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
-        assert res['result']['status'] == 'PENDING'
-        tx_hash = res['result']['hash']
-        get_res = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
-        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
-        return tx_hash
-
-    send(builder().append_create_account_op(keypair.public_key, '1000'))
-    wasm_bytecode = wat_to_wasm(wat_path)
-    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
-    salt = b'\x00' * 32
-    send(builder().append_create_contract_op(sha256(wasm_bytecode), keypair.public_key, None, salt))
-    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
-
-    def invoke(func: str, args: list[xdr.SCVal] | None = None) -> str:
-        return send(builder().append_invoke_contract_function_op(contract_address, func, args or []))
-
-    return invoke
 
 
 def test_default_io_dir_is_a_fresh_temp_dir() -> None:
@@ -520,14 +413,10 @@ def test_ledger_seq_increments(server: StellarRpcServer) -> None:
     account = Account(keypair.public_key, sequence=0)
 
     def send_create_account() -> None:
-        envelope = (
-            TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-            .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
-            .set_timeout(30)
-            .build()
+        tb = TransactionBuilder(account, PASSPHRASE).append_create_account_op(
+            destination=keypair.public_key, starting_balance='1000'
         )
-        envelope.sign(keypair)
-        _rpc(server.port(), 'sendTransaction', {'transaction': envelope.to_xdr()})
+        send_tx(server, keypair, tb)
 
     send_create_account()
     assert _rpc(server.port(), 'getLatestLedger', {})['result']['sequence'] == 1
@@ -537,43 +426,13 @@ def test_ledger_seq_increments(server: StellarRpcServer) -> None:
 
 
 def test_full_lifecycle_over_http(server: StellarRpcServer) -> None:
-    """Full contract lifecycle through the HTTP server: account → upload → deploy → invoke."""
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
+    """Full contract lifecycle through the HTTP server: account → upload → deploy → invoke.
 
-    def send(envelope_xdr: str) -> dict[str, Any]:
-        send_res = _rpc(server.port(), 'sendTransaction', {'transaction': envelope_xdr})
-        assert send_res['result']['status'] == 'PENDING'
-        tx_hash = send_res['result']['hash']
-        get_res = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})
-        assert get_res['result']['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
-        return get_res['result']
-
-    def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-
-    def sign_and_xdr(tb: TransactionBuilder) -> str:
-        env = tb.set_timeout(30).build()
-        env.sign(keypair)
-        return env.to_xdr()
-
-    # 1. Create account
-    send(sign_and_xdr(builder().append_create_account_op(keypair.public_key, '1000')))
-
-    # 2. Upload wasm
-    wasm_bytecode = wat_to_wasm(EMPTY_CONTRACT_WAT)
-    send(sign_and_xdr(builder().append_upload_contract_wasm_op(wasm_bytecode)))
-
-    # 3. Deploy contract
-    from stellar_sdk.utils import sha256
-
-    wasm_hash = sha256(wasm_bytecode)
-    salt = b'\x00' * 32
-    send(sign_and_xdr(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt)))
-
-    # 4. Invoke foo()
-    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
-    send(sign_and_xdr(builder().append_invoke_contract_function_op(contract_address, 'foo', [])))
+    Each step asserts SUCCESS inside the shared helpers; this is the end-to-end smoke test
+    that the whole pipeline works over HTTP, independent of any trace/return-value assertions.
+    """
+    invoke = deploy_and_get_invoker(server, EMPTY_CONTRACT_WAT)
+    invoke('foo')
 
 
 def test_trace_transaction_retrieves_trace_by_hash(server: StellarRpcServer) -> None:
@@ -624,7 +483,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
     result is caught. The entry/exit frames carry per-run contract and account ids, so they are
     checked structurally rather than by value.
     """
-    invoke = _deploy_and_get_invoker(server, EMPTY_CONTRACT_WAT)
+    invoke = deploy_and_get_invoker(server, EMPTY_CONTRACT_WAT)
     tx_hash = invoke('foo')
 
     trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
@@ -662,7 +521,7 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
     takes arguments the arguments are bound as locals while intermediate values build up on the
     stack — exercising a richer trace than the argument-less ``foo()`` case.
     """
-    invoke = _deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
+    invoke = deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
     tx_hash = invoke(
         'test_integers',
         [
@@ -713,15 +572,23 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
 
 
 def test_call_tx_with_args(server: StellarRpcServer) -> None:
-    """Exercise the scval_to_json / #decodeArg pipeline for each supported SCVal type.
+    """The scval_to_json / #decodeArg pipeline decodes each supported SCVal arg type correctly.
 
     Uses a minimal contract (args.wat) whose functions accept various arg types and return
-    Void. Covers: bool, u32, i32, u64, i64, u128, i128, symbol.
+    Void. For each call the arguments echoed in the trace's ``callContract`` frame must
+    round-trip back to the exact SCVals that were sent — so a decoding bug is caught even
+    when the transaction still succeeds. Covers: bool, u32, i32, u64, i64, u128, i128, symbol.
     """
-    invoke = _deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
+    invoke = deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
 
-    invoke('test_bool', [xdr.SCVal(type=SCValType.SCV_BOOL, b=True)])
-    invoke(
+    def assert_args_round_trip(func: str, args: list[xdr.SCVal]) -> None:
+        tx_hash = invoke(func, args)
+        entry = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result'][0]
+        assert entry['function'] == func
+        assert [scval_from_json(arg) for arg in entry['args']] == args
+
+    assert_args_round_trip('test_bool', [xdr.SCVal(type=SCValType.SCV_BOOL, b=True)])
+    assert_args_round_trip(
         'test_integers',
         [
             xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(42)),
@@ -730,14 +597,14 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
             xdr.SCVal(type=SCValType.SCV_I64, i64=xdr.Int64(-200)),
         ],
     )
-    invoke(
+    assert_args_round_trip(
         'test_wide_integers',
         [
             xdr.SCVal(type=SCValType.SCV_U128, u128=xdr.UInt128Parts(hi=xdr.Uint64(0), lo=xdr.Uint64(999))),
             xdr.SCVal(type=SCValType.SCV_I128, i128=xdr.Int128Parts(hi=xdr.Int64(0), lo=xdr.Uint64(888))),
         ],
     )
-    invoke('test_symbol', [xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(sc_symbol=b'hello'))])
+    assert_args_round_trip('test_symbol', [xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(sc_symbol=b'hello'))])
 
 
 def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
@@ -748,44 +615,17 @@ def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
     stuck in the semantics and was recorded as FAILED. ``uncheckedCallTx`` drops the return
     value check.
     """
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
+    keypair, account = fund_account(server)  # ledger 1
+    deployed = deploy_contract(server, keypair, account, ADDER_CONTRACT_WAT)  # ledgers 2, 3
+    invoke = make_invoker(server, keypair, account, deployed.address)
 
-    def send(tb: TransactionBuilder) -> None:
-        env = tb.set_timeout(30).build()
-        env.sign(keypair)
-        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
-        assert res['result']['status'] == 'PENDING'
-        tx_hash = res['result']['hash']
-        get_res = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
-        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
-
-    def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-
-    # Set up: create account, upload adder.wat, deploy contract
-    send(builder().append_create_account_op(keypair.public_key, '1000'))
-
-    wasm_bytecode = wat_to_wasm(ADDER_CONTRACT_WAT)
-    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
-
-    from stellar_sdk.utils import sha256
-
-    wasm_hash = sha256(wasm_bytecode)
-    salt = b'\x00' * 32
-    send(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
-
-    # add(2, 3) returns U32(5), not Void — the send() helper asserts SUCCESS.
-    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
-    send(
-        builder().append_invoke_contract_function_op(
-            contract_address,
-            'add',
-            [
-                xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(2)),
-                xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(3)),
-            ],
-        )
+    # add(2, 3) returns U32(5), not Void — make_invoker asserts the call reaches SUCCESS.
+    invoke(
+        'add',
+        [
+            xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(2)),
+            xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(3)),
+        ],
     )
 
     # All four transactions, including the non-Void invocation, advanced the ledger.
@@ -839,20 +679,11 @@ def _assert_ledger_entry_shape(entry: dict[str, Any], expected_key: str) -> None
         assert type(entry['liveUntilLedgerSeq']) is int
 
 
-def _send_tx(server: StellarRpcServer, keypair: Keypair, tb: TransactionBuilder) -> None:
-    env = tb.set_timeout(30).build()
-    env.sign(keypair)
-    res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
-    assert res['result']['status'] == 'PENDING'
-    get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
-    assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
-
-
 def test_get_ledger_entries_account(server: StellarRpcServer) -> None:
     """An ACCOUNT ledger key resolves to an AccountEntry; unknown keys are silently dropped."""
     keypair = Keypair.random()
     account = Account(keypair.public_key, sequence=0)
-    _send_tx(
+    send_tx(
         server,
         keypair,
         TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE).append_create_account_op(
@@ -883,24 +714,12 @@ def test_get_ledger_entries_account(server: StellarRpcServer) -> None:
 
 def test_get_ledger_entries_contract_code_and_data(server: StellarRpcServer) -> None:
     """CONTRACT_CODE, the CONTRACT_DATA instance entry, and persistent CONTRACT_DATA storage."""
-    from stellar_sdk.utils import sha256
-
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
-
-    def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-
     # Set up: create account, upload storage.wat, deploy, invoke store() which writes the
     # persistent storage entry U32(7) -> U32(42).
-    _send_tx(server, keypair, builder().append_create_account_op(keypair.public_key, '1000'))
-    wasm_bytecode = wat_to_wasm(STORAGE_CONTRACT_WAT)
-    _send_tx(server, keypair, builder().append_upload_contract_wasm_op(wasm_bytecode))
-    wasm_hash = sha256(wasm_bytecode)
-    salt = b'\x00' * 32
-    _send_tx(server, keypair, builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
-    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
-    _send_tx(server, keypair, builder().append_invoke_contract_function_op(contract_address, 'store', []))
+    keypair, account = fund_account(server)
+    deployed = deploy_contract(server, keypair, account, STORAGE_CONTRACT_WAT)
+    wasm_hash, wasm_bytecode, contract_address = deployed.wasm_hash, deployed.wasm_bytecode, deployed.address
+    make_invoker(server, keypair, account, contract_address)('store')
 
     code_key = _contract_code_ledger_key(wasm_hash)
     instance_key = _contract_data_ledger_key(
@@ -1499,28 +1318,13 @@ def test_batch_of_only_notifications_returns_nothing(server: StellarRpcServer) -
 def _deploy_adder_contract(server: StellarRpcServer, keypair: Keypair, account: Account) -> str:
     """Create the account, upload adder.wat, and deploy it; return the contract address.
 
-    Submits three transactions, so the ledger sequence afterwards is 3.
+    Takes the caller's keypair/account (the simulate tests reuse the account's sequence to
+    build a follow-up unsigned invocation). Submits three transactions, so the ledger
+    sequence afterwards is 3.
     """
-    from stellar_sdk.utils import sha256
-
-    def send(tb: TransactionBuilder) -> None:
-        env = tb.set_timeout(30).build()
-        env.sign(keypair)
-        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
-        assert res['result']['status'] == 'PENDING'
-        get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
-        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
-
-    def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-
-    send(builder().append_create_account_op(keypair.public_key, '1000'))
-    wasm_bytecode = wat_to_wasm(ADDER_CONTRACT_WAT)
-    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
-    wasm_hash = sha256(wasm_bytecode)
-    salt = b'\x00' * 32
-    send(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
-    return server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+    tb = TransactionBuilder(account, PASSPHRASE).append_create_account_op(keypair.public_key, '1000')
+    send_tx(server, keypair, tb)
+    return deploy_contract(server, keypair, account, ADDER_CONTRACT_WAT).address
 
 
 def _build_add_invocation(account: Account, contract_address: str) -> TransactionEnvelope:
@@ -1753,15 +1557,10 @@ def test_get_transaction_invocation_reports_return_value(server: StellarRpcServe
     account = Account(keypair.public_key, sequence=0)
 
     def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        return TransactionBuilder(account, PASSPHRASE)
 
     def send(tb: TransactionBuilder) -> dict[str, Any]:
-        env = tb.set_timeout(30).build()
-        env.sign(keypair)
-        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
-        assert res['result']['status'] == 'PENDING'
-        get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
-        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
+        _, get_res = send_tx(server, keypair, tb)
         # The internal K-side returnValue field must never leak into getTransaction responses.
         assert 'returnValue' not in get_res
         # Every successful receipt, whatever the operation, has a decodable txSUCCESS result.
@@ -1773,8 +1572,6 @@ def test_get_transaction_invocation_reports_return_value(server: StellarRpcServe
 
     wasm_bytecode = wat_to_wasm(ADDER_CONTRACT_WAT)
     send(builder().append_upload_contract_wasm_op(wasm_bytecode))
-
-    from stellar_sdk.utils import sha256
 
     wasm_hash = sha256(wasm_bytecode)
     salt = b'\x00' * 32
@@ -1815,33 +1612,11 @@ def test_get_transaction_reports_empty_bytes_return_value(server: StellarRpcServ
     as ``"0"`` (an odd-length non-hex value that breaks the XDR rewrite and would leak
     the internal ``returnValue`` field to clients).
     """
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
+    keypair, account = fund_account(server)
+    deployed = deploy_contract(server, keypair, account, BYTES_CONTRACT_WAT)
 
-    def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-
-    def send(tb: TransactionBuilder) -> dict[str, Any]:
-        env = tb.set_timeout(30).build()
-        env.sign(keypair)
-        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
-        assert 'result' in res, f'sendTransaction failed: {res}'
-        get_res = _rpc(server.port(), 'getTransaction', {'hash': res['result']['hash']})['result']
-        assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
-        return get_res
-
-    send(builder().append_create_account_op(keypair.public_key, '1000'))
-
-    wasm_bytecode = wat_to_wasm(BYTES_CONTRACT_WAT)
-    send(builder().append_upload_contract_wasm_op(wasm_bytecode))
-
-    from stellar_sdk.utils import sha256
-
-    salt = b'\x00' * 32
-    send(builder().append_create_contract_op(sha256(wasm_bytecode), keypair.public_key, None, salt))
-
-    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
-    invoke_result = send(builder().append_invoke_contract_function_op(contract_address, 'empty_bytes', []))
+    invoke_tx_hash = make_invoker(server, keypair, account, deployed.address)('empty_bytes')
+    invoke_result = _rpc(server.port(), 'getTransaction', {'hash': invoke_tx_hash})['result']
     assert 'returnValue' not in invoke_result  # internal receipt field, must never be served
 
     return_value = _soroban_return_value(_tx_meta_of(invoke_result))
@@ -1860,24 +1635,19 @@ def test_get_transaction_failed_reports_error_result_xdr(server: StellarRpcServe
     keypair = Keypair.random()
     account = Account(keypair.public_key, sequence=0)
 
-    def send(tb: TransactionBuilder) -> str:
-        env = tb.set_timeout(30).build()
-        env.sign(keypair)
-        res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
-        tx_hash = res['result']['hash']
-        assert isinstance(tx_hash, str)
-        return tx_hash
-
     def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
+        return TransactionBuilder(account, PASSPHRASE)
 
     # A successful reference transaction first, to compare receipt shapes across statuses.
-    ok_hash = send(builder().append_create_account_op(keypair.public_key, '1000'))
-    ok_result = _rpc(server.port(), 'getTransaction', {'hash': ok_hash})['result']
+    _, ok_result = send_tx(server, keypair, builder().append_create_account_op(keypair.public_key, '1000'))
     assert ok_result['status'] == 'SUCCESS'
 
+    # A failing invocation of a never-deployed contract — submitted directly, since send_tx
+    # asserts SUCCESS and this transaction is expected to end up FAILED.
     missing_contract = StrKey.encode_contract(b'\x22' * 32)  # valid C-strkey, never deployed
-    bad_hash = send(builder().append_invoke_contract_function_op(missing_contract, 'foo', []))
+    env = builder().append_invoke_contract_function_op(missing_contract, 'foo', []).set_timeout(30).build()
+    env.sign(keypair)
+    bad_hash = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})['result']['hash']
 
     get_result = _rpc(server.port(), 'getTransaction', {'hash': bad_hash})['result']
     assert get_result['status'] == 'FAILED'

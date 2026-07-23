@@ -10,17 +10,12 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-from komet_node.hello import hello
 from komet_node.interpreter import NodeInterpreter
 
 if TYPE_CHECKING:
     from pathlib import Path
 
     import pytest
-
-
-def test_hello() -> None:
-    assert hello('World') == 'Hello, World!'
 
 
 def test_empty_config_ignores_stray_request_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

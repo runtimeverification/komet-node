@@ -1,12 +1,7 @@
 import pytest
 
-from komet_node.hello import hello
 from komet_node.interpreter import NodeInterpreterError
 from komet_node.transaction import _xlm_to_stroops
-
-
-def test_hello() -> None:
-    assert hello('World') == 'Hello, World!'
 
 
 def test_xlm_to_stroops_whole() -> None:

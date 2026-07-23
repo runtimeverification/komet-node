@@ -13,26 +13,20 @@ one contract event with topics ``[Symbol("transfer")]`` and data ``U32(42)`` via
 
 from __future__ import annotations
 
-import json
 import re
-import socket
-import subprocess
-import threading
-import time
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import pytest
-from stellar_sdk import Account, Keypair, Network, StrKey, TransactionBuilder, xdr
-from stellar_sdk.utils import sha256
+from stellar_sdk import StrKey, TransactionBuilder, xdr
 from stellar_sdk.xdr.sc_val_type import SCValType
 
-from komet_node.server import StellarRpcServer
+from .conftest import PASSPHRASE, _is_number, _rpc, deploy_contract, fund_account, send_tx
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from stellar_sdk import Account, Keypair
+
+    from komet_node.server import StellarRpcServer
 
 EVENTS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'events.wat').resolve(strict=True)
 
@@ -47,69 +41,8 @@ EVENT_ID_RE = re.compile(r'\d{19}-\d{10}')
 
 
 # ---------------------------------------------------------------------------
-# Helpers (mirrored from test_server.py so this module stays self-contained)
+# Helpers (the server fixture, RPC plumbing, and deploy helpers live in conftest.py)
 # ---------------------------------------------------------------------------
-
-
-def wat_to_wasm(wat_path: Path) -> bytes:
-    proc_res = subprocess.run(['wat2wasm', str(wat_path), '--output=/dev/stdout'], check=True, capture_output=True)
-    return proc_res.stdout
-
-
-def _find_free_port() -> int:
-    with socket.socket() as s:
-        s.bind(('', 0))
-        return s.getsockname()[1]
-
-
-def _wait_for_server(host: str, port: int, timeout: float = 10.0) -> None:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        try:
-            with socket.create_connection((host, port), timeout=0.1):
-                return
-        except OSError:
-            time.sleep(0.05)
-    raise TimeoutError(f'Server did not start on {host}:{port}')
-
-
-def _rpc(port: int, method: str, params: dict[str, Any]) -> dict[str, Any]:
-    body = json.dumps({'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params}).encode()
-    req = urllib.request.Request(
-        f'http://localhost:{port}',
-        data=body,
-        headers={'Content-Type': 'application/json'},
-    )
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
-
-
-@pytest.fixture
-def server(tmp_path: Path) -> Iterator[StellarRpcServer]:
-    port = _find_free_port()
-    srv = StellarRpcServer(
-        host='localhost',
-        port=port,
-        io_dir=tmp_path,
-        network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
-    )
-    thread = threading.Thread(target=srv.serve, daemon=True)
-    thread.start()
-    _wait_for_server('localhost', port)
-    yield srv
-    srv.shutdown()
-
-
-def _send(server: StellarRpcServer, keypair: Keypair, tb: TransactionBuilder) -> str:
-    """Sign, submit, and confirm a transaction; return its hash."""
-    env = tb.set_timeout(30).build()
-    env.sign(keypair)
-    res = _rpc(server.port(), 'sendTransaction', {'transaction': env.to_xdr()})
-    assert res['result']['status'] == 'PENDING'
-    tx_hash = res['result']['hash']
-    get_res = _rpc(server.port(), 'getTransaction', {'hash': tx_hash})['result']
-    assert get_res['status'] == 'SUCCESS', f'Transaction failed: {get_res}'
-    return tx_hash
 
 
 def _deploy_events_contract(server: StellarRpcServer) -> tuple[Keypair, Account, str]:
@@ -118,34 +51,16 @@ def _deploy_events_contract(server: StellarRpcServer) -> tuple[Keypair, Account,
     Returns the funding keypair, its (mutated) sequence-tracking account, and the C-strkey
     address of the deployed contract.
     """
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
-
-    def builder() -> TransactionBuilder:
-        return TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-
-    _send(server, keypair, builder().append_create_account_op(keypair.public_key, '1000'))
-
-    wasm_bytecode = wat_to_wasm(EVENTS_CONTRACT_WAT)
-    _send(server, keypair, builder().append_upload_contract_wasm_op(wasm_bytecode))
-
-    wasm_hash = sha256(wasm_bytecode)
-    salt = b'\x00' * 32
-    _send(server, keypair, builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
-
-    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
-    return keypair, account, contract_address
+    keypair, account = fund_account(server)
+    deployed = deploy_contract(server, keypair, account, EVENTS_CONTRACT_WAT)
+    return keypair, account, deployed.address
 
 
 def _emit_event(server: StellarRpcServer, keypair: Keypair, account: Account, contract_address: str) -> str:
     """Invoke the contract's `emit` function; return the transaction hash."""
-    tb = TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-    return _send(server, keypair, tb.append_invoke_contract_function_op(contract_address, 'emit', []))
-
-
-def _is_json_number(value: Any) -> bool:
-    """True for a JSON number decoded to int (bool is an int subclass, so exclude it)."""
-    return isinstance(value, int) and not isinstance(value, bool)
+    tb = TransactionBuilder(account, PASSPHRASE).append_invoke_contract_function_op(contract_address, 'emit', [])
+    tx_hash, _ = send_tx(server, keypair, tb)
+    return tx_hash
 
 
 def _assert_request_error(response: dict[str, Any]) -> None:
@@ -218,14 +133,11 @@ def test_get_events_rejects_invalid_xdr_format(server: StellarRpcServer) -> None
 
 def test_get_events_no_events_returns_empty_array(server: StellarRpcServer) -> None:
     """A range that contains no contract events yields an empty events array, not null."""
-    keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
-    tb = TransactionBuilder(account, Network.TESTNET_NETWORK_PASSPHRASE)
-    _send(server, keypair, tb.append_create_account_op(keypair.public_key, '1000'))
+    fund_account(server)
 
     result = _rpc(server.port(), 'getEvents', {'startLedger': 1})['result']
     assert result['events'] == []
-    assert _is_json_number(result['latestLedger'])
+    assert _is_number(result['latestLedger'])
     assert result['latestLedger'] == 1
     # Real stellar-rpc always populates the cursor (the position to resume scanning from).
     assert isinstance(result['cursor'], str)
@@ -237,7 +149,7 @@ def test_get_events_returns_emitted_contract_event(server: StellarRpcServer) -> 
     tx_hash = _emit_event(server, keypair, account, contract_address)  # ledger 4
 
     result = _rpc(server.port(), 'getEvents', {'startLedger': 1})['result']
-    assert _is_json_number(result['latestLedger'])
+    assert _is_number(result['latestLedger'])
     assert result['latestLedger'] == 4
     assert isinstance(result['cursor'], str)
 
@@ -246,7 +158,7 @@ def test_get_events_returns_emitted_contract_event(server: StellarRpcServer) -> 
     event = result['events'][0]
 
     assert event['type'] == 'contract'
-    assert _is_json_number(event['ledger'])
+    assert _is_number(event['ledger'])
     assert event['ledger'] == 4
     # ledgerClosedAt is an ISO-8601 timestamp string.
     assert isinstance(event['ledgerClosedAt'], str)
