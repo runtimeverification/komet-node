@@ -220,8 +220,7 @@ class StellarRpcServer:
         if self._fresh:
             status = 'starting from a fresh state (empty io-dir)'
         else:
-            metadata = json.loads((self.io_dir / 'metadata.json').read_text())
-            status = f'resuming existing state (latest ledger {metadata.get("latest_ledger", 0)})'
+            status = f'resuming existing state (latest ledger {self._latest_ledger()})'
         _log.info('komet-node ready — %s', status)
         _log.info('io-dir: %s', self.io_dir)
         _log.info('listening on http://%s:%d', self.host, self.port())
@@ -319,56 +318,7 @@ class StellarRpcServer:
                 return format_error
 
         if method in _TX_METHODS:
-            transaction = params.get('transaction')
-            if not isinstance(transaction, str):
-                return _error_str(request_id, -32602, "Invalid params: 'transaction' (XDR string) is required")
-            # Undecodable XDR is a JSON-RPC client error (-32602, as in real stellar-rpc);
-            # a transaction that decodes but cannot be processed (e.g. an unsupported
-            # operation) is instead rejected at admission time with status ERROR below.
-            try:
-                parsed = TransactionEnvelope.from_xdr(transaction, self.encoder.network_passphrase)
-            except Exception:
-                traceback.print_exc()
-                return _error_str(request_id, -32602, 'Invalid params: could not decode transaction XDR')
-            try:
-                envelope, program_steps, uploaded_wasms = self.encoder.build_tx_request(
-                    method, request_id, transaction, now
-                )
-            except Exception:
-                # Log the detail, but keep the client-facing response neutral rather than
-                # leaking internal exceptions.
-                traceback.print_exc()
-                return json.dumps(self._error_status_response(request_id, parsed.hash_hex(), now))
-            # A hash that already has a receipt is a duplicate submission: the semantics
-            # answer DUPLICATE without running the steps (see node.md). Steps injected into
-            # the <program> cell (wasm uploads) would execute *before* dispatch, though, so
-            # they must not be injected for a duplicate.
-            is_duplicate = (self.receipts_dir / f'receipt_{envelope["txHash"]}.json').exists()
-            if is_duplicate:
-                program_steps = None
-            # Stale staged events (e.g. from a previously failed transaction) must not leak
-            # into this transaction's event records.
-            (self.io_dir / _EVENTS_STAGING).unlink(missing_ok=True)
-            response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
-            if response is None:
-                (self.io_dir / _EVENTS_STAGING).unlink(missing_ok=True)
-                return json.dumps(self._failure_response(request_id, envelope, now))
-            # Rewrite the freshly written SUCCESS receipt's internal `returnValue` into real
-            # resultXdr/resultMetaXdr. Skip it for a duplicate: that receipt was already
-            # finalised on first submission and no longer carries `returnValue`, so
-            # reprocessing it would overwrite the stored result with an empty one.
-            if not is_duplicate:
-                self._attach_result_xdr(envelope['txHash'])
-            # Turn any events the run staged into events/events_<ledger>.json. A duplicate
-            # runs no steps and stages nothing, so this is a no-op for it.
-            self._finalize_events(envelope['txHash'], now)
-            # Keep the raw bytes of successfully uploaded wasm modules: the K configuration
-            # stores modules parsed, and getLedgerEntries CONTRACT_CODE entries must return
-            # the original bytes.
-            for wasm_hash, wasm in uploaded_wasms.items():
-                (self.wasms_dir / f'{wasm_hash}.wasm').write_bytes(wasm)
-            self._record_closed_ledger(envelope, now)
-            return response
+            return self._handle_send_transaction(method, params, request_id, now)
 
         if method == 'simulateTransaction':
             return self._handle_simulate(params, request_id, now)
@@ -384,6 +334,63 @@ class StellarRpcServer:
         response = self.interpreter.run(self.state_file, self.io_dir, read_only_envelope, None)
         if response is None:
             return _error_str(request_id, -32603, 'Internal error')
+        return response
+
+    def _handle_send_transaction(self, method: str, params: dict[str, Any], request_id: Any, now: str) -> str:
+        """Execute and commit a ``sendTransaction`` call, returning the response JSON string.
+
+        Decodes the transaction XDR, runs it through the semantics, and — on the success
+        path — finalises the receipt's result XDR, materialises any staged events, persists
+        uploaded wasm bytes, and records the closed ledger. Undecodable XDR is a JSON-RPC
+        client error (-32602); a transaction that decodes but cannot be admitted gets an
+        ERROR status response; one that gets stuck mid-run gets a FAILED receipt.
+        """
+        transaction = params.get('transaction')
+        if not isinstance(transaction, str):
+            return _error_str(request_id, -32602, "Invalid params: 'transaction' (XDR string) is required")
+        try:
+            parsed = TransactionEnvelope.from_xdr(transaction, self.encoder.network_passphrase)
+        except Exception:
+            traceback.print_exc()
+            return _error_str(request_id, -32602, 'Invalid params: could not decode transaction XDR')
+        try:
+            envelope, program_steps, uploaded_wasms = self.encoder.build_tx_request(
+                method, request_id, transaction, now
+            )
+        except Exception:
+            # Log the detail, but keep the client-facing response neutral rather than
+            # leaking internal exceptions.
+            traceback.print_exc()
+            return self._error_status_response(request_id, parsed.hash_hex(), now)
+        # A hash that already has a receipt is a duplicate submission: the semantics
+        # answer DUPLICATE without running the steps (see node.md). Steps injected into
+        # the <program> cell (wasm uploads) would execute *before* dispatch, though, so
+        # they must not be injected for a duplicate.
+        is_duplicate = (self.receipts_dir / f'receipt_{envelope["txHash"]}.json').exists()
+        if is_duplicate:
+            program_steps = None
+        # Stale staged events (e.g. from a previously failed transaction) must not leak
+        # into this transaction's event records.
+        (self.io_dir / _EVENTS_STAGING).unlink(missing_ok=True)
+        response = self.interpreter.run(self.state_file, self.io_dir, envelope, program_steps)
+        if response is None:
+            (self.io_dir / _EVENTS_STAGING).unlink(missing_ok=True)
+            return self._failure_response(request_id, envelope, now)
+        # Rewrite the freshly written SUCCESS receipt's internal `returnValue` into real
+        # resultXdr/resultMetaXdr. Skip it for a duplicate: that receipt was already
+        # finalised on first submission and no longer carries `returnValue`, so
+        # reprocessing it would overwrite the stored result with an empty one.
+        if not is_duplicate:
+            self._attach_result_xdr(envelope['txHash'])
+        # Turn any events the run staged into events/events_<ledger>.json. A duplicate
+        # runs no steps and stages nothing, so this is a no-op for it.
+        self._finalize_events(envelope['txHash'], now)
+        # Keep the raw bytes of successfully uploaded wasm modules: the K configuration
+        # stores modules parsed, and getLedgerEntries CONTRACT_CODE entries must return
+        # the original bytes.
+        for wasm_hash, wasm in uploaded_wasms.items():
+            (self.wasms_dir / f'{wasm_hash}.wasm').write_bytes(wasm)
+        self._record_closed_ledger(envelope, now)
         return response
 
     def _get_ledger_entries(self, params: dict[str, Any], request_id: Any, now: str) -> str:
@@ -465,7 +472,7 @@ class StellarRpcServer:
         try:
             envelope = self.encoder.build_simulate_request(request_id, transaction, now)
         except SimulationRejected as err:
-            return json.dumps(self._simulate_error_response(request_id, str(err)))
+            return self._simulate_error_response(request_id, str(err))
         except Exception:
             traceback.print_exc()
             return _error_str(request_id, -32602, 'Invalid params: could not process transaction')
@@ -474,10 +481,10 @@ class StellarRpcServer:
         if response is None:
             # The run got stuck: the invocation could not be executed at all (e.g. the
             # target contract does not exist). Report it as a simulation error.
-            return json.dumps(self._simulate_error_response(request_id, 'transaction simulation failed'))
-        return json.dumps(self._simulate_response(request_id, json.loads(response)['result']))
+            return self._simulate_error_response(request_id, 'transaction simulation failed')
+        return self._simulate_response(request_id, json.loads(response)['result'])
 
-    def _simulate_response(self, rpc_id: Any, k_result: dict[str, Any]) -> dict[str, Any]:
+    def _simulate_response(self, rpc_id: Any, k_result: dict[str, Any]) -> str:
         """Map the internal K simulation result to the spec response shape.
 
         This is the one read path where Python builds response content: the spec requires
@@ -494,13 +501,11 @@ class StellarRpcServer:
                 'results': [{'xdr': scval_from_json(k_result['returnValue']).to_xdr(), 'auth': []}],
                 'transactionData': _TRANSACTION_DATA,
             }
-        return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+        return _result_str(rpc_id, result)
 
-    def _simulate_error_response(self, rpc_id: Any, message: str) -> dict[str, Any]:
+    def _simulate_error_response(self, rpc_id: Any, message: str) -> str:
         """Build the ``{error, latestLedger}`` result for a simulation that never ran in K."""
-        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
-        result = {'error': message, 'latestLedger': metadata.get('latest_ledger', 0)}
-        return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+        return _result_str(rpc_id, {'error': message, 'latestLedger': self._latest_ledger()})
 
     def _history_envelope(
         self, method: str, params: dict[str, Any], request_id: Any, base: dict[str, Any]
@@ -517,11 +522,9 @@ class StellarRpcServer:
         def invalid(message: str) -> str:
             return _error_str(request_id, -32602, f'Invalid params: {message}')
 
-        xdr_format = params.get('xdrFormat', 'base64')
-        if xdr_format == 'json':
-            return invalid("xdrFormat 'json' is not supported; use 'base64'")
-        if xdr_format not in ('', 'base64'):
-            return invalid("'xdrFormat' must be 'base64'")
+        xdr_format_error = _unsupported_xdr_format(params)
+        if xdr_format_error is not None:
+            return invalid(xdr_format_error)
 
         pagination = params.get('pagination') or {}
         if not isinstance(pagination, dict):
@@ -621,11 +624,9 @@ class StellarRpcServer:
         well-typed envelopes; the one state-dependent check (the window against the chain
         tip) lives in K. Returns a pre-formatted JSON-RPC error string on invalid params.
         """
-        xdr_format = params.get('xdrFormat') or 'base64'
-        if xdr_format == 'json':
-            return _error_str(request_id, -32602, "Invalid params: xdrFormat 'json' is not supported, use 'base64'")
-        if xdr_format != 'base64':
-            return _error_str(request_id, -32602, "Invalid params: xdrFormat must be 'base64' or 'json'")
+        xdr_format_error = _unsupported_xdr_format(params)
+        if xdr_format_error is not None:
+            return _error_str(request_id, -32602, f'Invalid params: {xdr_format_error}')
 
         pagination = params.get('pagination') or {}
         if not isinstance(pagination, dict):
@@ -683,8 +684,7 @@ class StellarRpcServer:
         staging.unlink()
         if not lines:
             return
-        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
-        ledger = metadata['latest_ledger']
+        ledger = self._latest_ledger()
         closed_at = datetime.fromtimestamp(int(now), tz=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
         # One transaction per ledger: TOID with application order 1, operation index 0.
         toid = (ledger << 32) | (1 << 12)
@@ -724,7 +724,7 @@ class StellarRpcServer:
         (self.requests_dir / f'request_{self._request_count}.json').write_text(json.dumps(archive))
         self._request_count += 1
 
-    def _error_status_response(self, rpc_id: Any, tx_hash: str, now: str) -> dict[str, Any]:
+    def _error_status_response(self, rpc_id: Any, tx_hash: str, now: str) -> str:
         """Synthesise the sendTransaction response for a transaction rejected at admission.
 
         Mirrors real stellar-rpc: a transaction that decodes as XDR but cannot be processed
@@ -732,17 +732,18 @@ class StellarRpcServer:
         the ledger, so no receipt is stored (``getTransaction`` stays ``NOT_FOUND``) and the
         ledger does not advance.
         """
-        metadata = json.loads((self.io_dir / 'metadata.json').read_text())
-        result = {
-            'hash': tx_hash,
-            'status': 'ERROR',
-            'errorResultXdr': malformed_tx_result_xdr(),
-            'latestLedger': metadata.get('latest_ledger', 0),
-            'latestLedgerCloseTime': now,
-        }
-        return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+        return _result_str(
+            rpc_id,
+            {
+                'hash': tx_hash,
+                'status': 'ERROR',
+                'errorResultXdr': malformed_tx_result_xdr(),
+                'latestLedger': self._latest_ledger(),
+                'latestLedgerCloseTime': now,
+            },
+        )
 
-    def _failure_response(self, rpc_id: Any, envelope: dict[str, Any], now: str) -> dict[str, Any]:
+    def _failure_response(self, rpc_id: Any, envelope: dict[str, Any], now: str) -> str:
         """Synthesise the sendTransaction response for a transaction that got stuck (failed).
 
         The K run does not produce a ``response.json`` for a failed transaction and the
@@ -772,13 +773,15 @@ class StellarRpcServer:
         }
         (self.receipts_dir / f'receipt_{tx_hash}.json').write_text(json.dumps(receipt))
 
-        result = {
-            'hash': tx_hash,
-            'status': 'PENDING',
-            'latestLedger': ledger,
-            'latestLedgerCloseTime': now,
-        }
-        return {'jsonrpc': '2.0', 'id': rpc_id, 'result': result}
+        return _result_str(
+            rpc_id,
+            {
+                'hash': tx_hash,
+                'status': 'PENDING',
+                'latestLedger': ledger,
+                'latestLedgerCloseTime': now,
+            },
+        )
 
 
 def _is_int(value: Any) -> bool:
@@ -851,24 +854,39 @@ def _configure_logging() -> None:
     _log.setLevel(logging.INFO)
 
 
-def _check_xdr_format(params: dict[str, Any], request_id: Any) -> str | None:
-    """Validate the optional ``xdrFormat`` param; ``None`` means the request may proceed.
+def _unsupported_xdr_format(params: dict[str, Any]) -> str | None:
+    """Describe why the request's ``xdrFormat`` is unsupported, or ``None`` if it is fine.
 
-    Only ``'base64'`` (the spec default) is supported. The spec's alternative ``'json'``
-    format is not implemented in komet-node, so it gets a dedicated error message; any
-    other value is rejected as invalid. Both cases are Invalid params (-32602), matching
+    komet-node implements only ``'base64'`` (the spec default); an absent, null, or empty
+    value means the default, so it is also fine. The spec's alternative ``'json'`` format is
+    not implemented and gets a dedicated message; any other value is reported as unknown.
+    Callers turn the returned message into their own Invalid params (-32602) error, matching
     real stellar-rpc's handling of a bad format value.
     """
-    xdr_format = params.get('xdrFormat', 'base64')
+    xdr_format = params.get('xdrFormat') or 'base64'
     if xdr_format == 'base64':
         return None
     if xdr_format == 'json':
-        return _error_str(request_id, -32602, "Invalid params: xdrFormat 'json' is not supported, use 'base64'")
-    return _error_str(request_id, -32602, "Invalid params: unknown xdrFormat, expected 'base64'")
+        return "xdrFormat 'json' is not supported, use 'base64'"
+    return "unknown xdrFormat, expected 'base64'"
+
+
+def _check_xdr_format(params: dict[str, Any], request_id: Any) -> str | None:
+    """Validate the optional ``xdrFormat`` param; ``None`` means the request may proceed.
+
+    Returns a pre-formatted -32602 error string for an unsupported format (see
+    :func:`_unsupported_xdr_format`).
+    """
+    message = _unsupported_xdr_format(params)
+    return None if message is None else _error_str(request_id, -32602, f'Invalid params: {message}')
 
 
 def _error_str(rpc_id: Any, code: int, message: str) -> str:
     return json.dumps({'jsonrpc': '2.0', 'id': rpc_id, 'error': {'code': code, 'message': message}})
+
+
+def _result_str(rpc_id: Any, result: dict[str, Any]) -> str:
+    return json.dumps({'jsonrpc': '2.0', 'id': rpc_id, 'result': result})
 
 
 def _error_bytes(rpc_id: Any, code: int, message: str) -> bytes:
