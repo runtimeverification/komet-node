@@ -9,13 +9,14 @@
   "init": true,
   "mounts": [
     "source=claude-code-config-${devcontainerId},target=/home/vscode/.claude,type=volume",
+    "source=gh-config-${devcontainerId},target=/home/vscode/.config/gh,type=volume",
     "source=${localEnv:HOME}${localEnv:USERPROFILE}/.gitconfig,target=/home/vscode/.gitconfig,type=bind,readonly"
   ],
   "containerEnv": {
     "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
     "GIT_CONFIG_GLOBAL": "/home/vscode/.gitconfig.local"
   },
-  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude && bash .devcontainer/setup-git.sh && direnv allow /workspace && nix develop /workspace --command bash -c 'uv sync --frozen'",
+  "postCreateCommand": "sudo chown -R vscode:vscode /home/vscode/.claude /home/vscode/.config/gh && bash .devcontainer/setup-git.sh && direnv allow /workspace && nix develop /workspace --command bash -c 'uv sync --frozen'",
   "customizations": {
     "vscode": {
       "extensions": [
