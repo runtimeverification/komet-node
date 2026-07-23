@@ -11,8 +11,8 @@ from stellar_sdk import Account, Address, Asset, Keypair, Network, StrKey, Trans
 from stellar_sdk.utils import sha256
 from stellar_sdk.xdr.sc_val_type import SCValType
 
+from komet_node.__main__ import build_server
 from komet_node.scval import scval_from_json
-from komet_node.server import StellarRpcServer
 
 from .conftest import (
     PASSPHRASE,
@@ -22,6 +22,7 @@ from .conftest import (
     _post,
     _post_raw,
     _rpc,
+    contract_address_from_deployer,
     deploy_and_get_invoker,
     deploy_contract,
     fund_account,
@@ -32,6 +33,8 @@ from .conftest import (
 
 if TYPE_CHECKING:
     from stellar_sdk import TransactionEnvelope
+
+    from komet_node.server import StellarRpcServer
 
 EMPTY_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'empty.wat').resolve(strict=True)
 ARGS_CONTRACT_WAT = (Path(__file__).parent / 'data' / 'wasm' / 'args.wat').resolve(strict=True)
@@ -82,8 +85,8 @@ def _create_account_xdr(keypair: Keypair, account: Account) -> str:
 
 
 def test_default_io_dir_is_a_fresh_temp_dir() -> None:
-    """With no io_dir, the server provisions a fresh temporary directory and seeds it."""
-    srv = StellarRpcServer(host='localhost', port=0)
+    """With no io_dir, the composition root provisions a fresh temporary directory and seeds it."""
+    srv = build_server(port=0)
     try:
         assert srv.io_dir.exists()
         assert srv.io_dir.resolve() != Path.cwd()
@@ -1577,7 +1580,7 @@ def test_get_transaction_invocation_reports_return_value(server: StellarRpcServe
     salt = b'\x00' * 32
     send(builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
 
-    contract_address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+    contract_address = contract_address_from_deployer(keypair.public_key, salt)
     invoke_result = send(
         builder().append_invoke_contract_function_op(
             contract_address,

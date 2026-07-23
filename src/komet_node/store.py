@@ -23,44 +23,15 @@ from growing without bound as the chain advances. The layout::
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any
+
+from komet_node.interfaces import Store
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
-
-# The ``ledgers/ledger_<seq>.json`` record for one closed ledger. Carries the ledger-header
-# XDR artifacts (hash/headerXdr/metadataXdr) that only Python can build; the semantics read
-# them back to serve getTransactions/getLedgers. The functional TypedDict form is used because
-# the keys are the spec's camelCase JSON wire names, not Python identifiers.
-LedgerRecord = TypedDict(
-    'LedgerRecord',
-    {
-        'sequence': int,
-        'txHash': str,
-        'closedAt': int,
-        'hash': str,
-        'headerXdr': str,
-        'metadataXdr': str,
-    },
-)
-
-# One entry of an ``events/events_<ledger>.json`` array, in the getEvents Event shape.
-EventRecord = TypedDict(
-    'EventRecord',
-    {
-        'type': str,
-        'ledger': int,
-        'ledgerClosedAt': str,
-        'contractId': str,
-        'id': str,
-        'inSuccessfulContractCall': bool,
-        'txHash': str,
-        'topic': list[str],
-        'value': str,
-    },
-)
+    from komet_node.interfaces import EventRecord, LedgerRecord
 
 
 # Where the K semantics stage the contract events of the currently executing transaction
@@ -68,8 +39,8 @@ EventRecord = TypedDict(
 _EVENTS_STAGING = 'events_staged.jsonl'
 
 
-class ChainStore:
-    """Reads and writes the files of a single komet-node io-dir."""
+class ChainStore(Store):
+    """Reads and writes the files of a single komet-node io-dir (the :class:`Store` concretion)."""
 
     def __init__(self, io_dir: Path) -> None:
         self.root = io_dir.resolve()

@@ -5,28 +5,27 @@ import json
 import logging
 import re
 import sys
-import tempfile
 import time
 import traceback
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, TypedDict
+from typing import TYPE_CHECKING, Any, Final
 
-from stellar_sdk import Network, StrKey, TransactionEnvelope, xdr
+from stellar_sdk import StrKey, TransactionEnvelope, xdr
 
 from komet_node.errors import RpcError
-from komet_node.interpreter import NodeInterpreter
 from komet_node.ledger import build_ledger_artifacts
 from komet_node.ledger_entries import InvalidParamsError, format_ledger_entries_response, ledger_key_descriptors
 from komet_node.result_xdr import transaction_meta_xdr, transaction_result_xdr
 from komet_node.scval import scval_from_json
-from komet_node.store import ChainStore, EventRecord, LedgerRecord
-from komet_node.transaction import SimulationRejected, TransactionEncoder, malformed_tx_result_xdr
+from komet_node.transaction import SimulationRejected, malformed_tx_result_xdr
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from http.server import HTTPServer as HTTPServerType
+    from pathlib import Path
+
+    from komet_node.interfaces import Encoder, EventRecord, Interpreter, LedgerRecord, SimulateResult, Store
 
 _PROTOCOL_VERSION: Final = 22
 
@@ -103,15 +102,6 @@ _XDR_FORMAT_METHODS: Final = ('getTransaction', 'sendTransaction')
 
 _log = logging.getLogger('komet_node')
 
-# The internal simulateTransaction result K emits (node.md): always ``latestLedger``, then
-# either ``error`` (a failed simulation) or ``returnValue`` (a JSON SCVal for a successful
-# one). ``total=False`` — the two outcomes are mutually exclusive.
-SimulateResult = TypedDict(
-    'SimulateResult',
-    {'latestLedger': int, 'error': str, 'returnValue': Any},
-    total=False,
-)
-
 
 class StellarRpcServer:
     """
@@ -119,37 +109,43 @@ class StellarRpcServer:
 
     The compiled semantics run one request per process invocation and hold no state
     between runs, so this server supplies what they lack: it keeps the HTTP socket open,
-    persists state to disk, and decodes the Stellar XDR envelope (:class:`TransactionEncoder`)
-    that K cannot parse. It then runs the request envelope through the semantics
-    (:class:`NodeInterpreter`). All RPC dispatch, receipt bookkeeping, ledger accounting,
-    and response formatting are performed in K (``node.md``). The on-disk artifacts — input
-    and output — belong to the :class:`~komet_node.store.ChainStore`, which owns the io-dir
-    layout; this server holds one and asks it for receipts, ledgers, events, and the ledger
-    counter rather than touching paths itself.
+    persists state to disk, and decodes the Stellar XDR envelope (an injected
+    :class:`~komet_node.interfaces.Encoder`) that K cannot parse. It then runs the request
+    envelope through the semantics (an :class:`~komet_node.interfaces.Interpreter`). All RPC
+    dispatch, receipt bookkeeping,
+    ledger accounting, and response formatting are performed in K (``node.md``). The on-disk
+    artifacts — input and output — belong to the injected :class:`~komet_node.interfaces.Store`,
+    which owns the io-dir layout; this server holds one and asks it for receipts, ledgers,
+    events, and the ledger counter rather than touching paths itself.
+
+    The three collaborators (interpreter, encoder, store) are injected rather than constructed
+    here, so the server depends only on the protocols in :mod:`komet_node.interfaces` and a test
+    can drive it with fakes. A composition root wires the concretes — see ``build_server`` in
+    ``__main__.py``.
     """
 
-    interpreter: NodeInterpreter
-    encoder: TransactionEncoder
-    store: ChainStore
+    interpreter: Interpreter
+    encoder: Encoder
+    store: Store
     io_dir: Path
     state_file: Path
 
     def __init__(
         self,
+        *,
+        interpreter: Interpreter,
+        encoder: Encoder,
+        store: Store,
         host: str = 'localhost',
         port: int = 8000,
-        io_dir: Path | None = None,
-        network_passphrase: str = Network.TESTNET_NETWORK_PASSPHRASE,
     ) -> None:
+        self.interpreter = interpreter
+        self.encoder = encoder
+        self.store = store
         self.host = host
         self._port = port
-        self.interpreter = NodeInterpreter()
-        self.encoder = TransactionEncoder(network_passphrase)
         self._httpd: HTTPServerType | None = None
 
-        # With no io-dir given, run against a fresh temporary directory: a throwaway chain
-        # that starts empty on every launch and leaves the working directory untouched.
-        self.store = ChainStore(Path(tempfile.mkdtemp(prefix='komet-node-')) if io_dir is None else io_dir)
         self._fresh = self.store.initialize(self.interpreter.empty_config)
         # state_file and io_dir are the paths the interpreter subprocess resolves against; kept
         # as attributes so callers (and tests) can reach the io-dir root directly.

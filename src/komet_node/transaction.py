@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from decimal import Decimal
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, TypedDict
+from typing import TYPE_CHECKING, Any
 
 from komet.kast.syntax import upload_wasm
 from pykwasm.wasm2kast import wasm2kast
@@ -11,6 +11,7 @@ from stellar_sdk import Network, StrKey, TransactionEnvelope, xdr
 from stellar_sdk.operation import CreateAccount, InvokeHostFunction
 from stellar_sdk.utils import sha256
 
+from komet_node.interfaces import Encoder
 from komet_node.scval import scval_to_json
 
 from .errors import TransactionEncodingError
@@ -20,21 +21,9 @@ if TYPE_CHECKING:
     from stellar_sdk import MuxedAccount, Transaction
     from stellar_sdk.operation import Operation
 
-_STROOPS_PER_XLM = Decimal('10000000')
+    from komet_node.interfaces import SimulateRequest, TxRequest
 
-# The request envelopes consumed by node.md. The functional TypedDict form is used because the
-# keys are the JSON wire names (some camelCase). `steps` is the JSON-encoded operation list;
-# for a wasm upload it is empty and the steps ride in the <program> cell instead (see
-# build_tx_request). Key *order* also matters to K's JSON matcher — see _encode_operation —
-# which a TypedDict cannot express, only the field names and types.
-TxRequest = TypedDict(
-    'TxRequest',
-    {'method': str, 'id': Any, 'now': str, 'txHash': str, 'envelopeXdr': str, 'steps': list},
-)
-SimulateRequest = TypedDict(
-    'SimulateRequest',
-    {'method': str, 'id': Any, 'now': str, 'steps': list},
-)
+_STROOPS_PER_XLM = Decimal('10000000')
 
 
 def malformed_tx_result_xdr() -> str:
@@ -75,7 +64,7 @@ class SimulationRejected(Exception):
     """
 
 
-class TransactionEncoder:
+class TransactionEncoder(Encoder):
     """
     Decodes Stellar XDR transactions into the request envelope consumed by ``node.md``.
 

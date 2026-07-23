@@ -14,6 +14,7 @@ from pyk.kore.syntax import App, SortApp
 from pyk.utils import check_file_path, run_process_2
 
 from .errors import NodeInterpreterError
+from .interfaces import Interpreter
 from .utils import simbolik_definition
 
 if TYPE_CHECKING:
@@ -79,7 +80,7 @@ def _set_cell(pattern: Pattern, cell_symbol: str, value: Pattern) -> Pattern:
     return pattern
 
 
-class NodeInterpreter:
+class NodeInterpreter(Interpreter):
     """
     Runs the K node semantics against a saved KORE world-state configuration.
 
