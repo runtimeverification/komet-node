@@ -503,11 +503,11 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
 
     # The executed WebAssembly instructions, exactly as shown in the README.
     assert trace[1:-1] == [
-        {'pos': 3, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}},
-        {'pos': 11, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}},
-        {'pos': 19, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}},
-        {'pos': None, 'instr': ['block'], 'stack': [], 'locals': {}},
-        {'pos': 3, 'instr': ['const', 'i64', 2], 'stack': [], 'locals': {}},
+        {'pos': 3, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}, 'mem': None},
+        {'pos': 11, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}, 'mem': None},
+        {'pos': 19, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}, 'mem': None},
+        {'pos': None, 'instr': ['block'], 'stack': [], 'locals': {}, 'mem': None},
+        {'pos': 3, 'instr': ['const', 'i64', 2], 'stack': [], 'locals': {}, 'mem': None},
     ]
 
     # An endWasm exit frame closes the trace: the call succeeded and returned Void.
@@ -555,8 +555,10 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
     instr_records = [record for record in trace if 'locals' in record]
     assert instr_records
     for record in instr_records:
-        assert set(record) == {'pos', 'instr', 'stack', 'locals'}
+        assert set(record) == {'pos', 'instr', 'stack', 'locals', 'mem'}
         assert record['pos'] is None or isinstance(record['pos'], int)
+        # mem is null when linear memory is unchanged since the previous record, else a list of runs.
+        assert record['mem'] is None or isinstance(record['mem'], list)
         assert isinstance(record['instr'], list) and record['instr']
         assert isinstance(record['instr'][0], str)  # opcode mnemonic
         # stack and locals hold [type, value] pairs.
