@@ -17,7 +17,7 @@ The encoder is stateless apart from this one configuration value; it holds no le
 
 ## `build_tx_request(method, rpc_id, transaction_xdr, now)`
 
-`build_tx_request` is the entry point. It decodes the XDR envelope and returns a `(request, program_steps)` pair:
+`build_tx_request` is the `sendTransaction` entry point. It decodes the XDR envelope and returns a `(request, program_steps, uploaded_wasms)` triple:
 
 ```python
 request = {
@@ -30,10 +30,12 @@ request = {
 }
 ```
 
-- For the common case, every operation is encoded as a JSON step and `program_steps` is `None`.
-- For a wasm-upload transaction, the operations cannot be expressed as JSON (the `ModuleDecl` has no JSON form), so `steps` is `[]` and `program_steps` carries the kasmer `uploadWasm` step for the interpreter to splice into the `<program>` cell. Soroban allows only one host-function operation per transaction, so such a transaction is exactly one upload op.
+- For the common case, every operation is encoded as a JSON step, and both `program_steps` and `uploaded_wasms` are empty (`None` and `{}`).
+- For a wasm-upload transaction, the operations cannot be expressed as JSON (the `ModuleDecl` has no JSON form), so `steps` is `[]` and `program_steps` carries the kasmer `uploadWasm` step for the interpreter to splice into the `<program>` cell. Soroban allows only one host-function operation per transaction, so such a transaction is exactly one upload op. `uploaded_wasms` then maps the module's hex sha256 to its raw bytes, which the server stores under `wasms/` so `getLedgerEntries` can return the original bytes for `CONTRACT_CODE` entries (the K state keeps modules parsed).
 
 `now` is read from the wall clock here, in Python, and passed through the envelope because K has no clock; the semantics use it to fill `createdAt` / `latestLedgerCloseTime`.
+
+`build_simulate_request(rpc_id, transaction_xdr, now)` is the `simulateTransaction` counterpart. It decodes the single `InvokeHostFunction` operation into a `steps` array the same way, but returns only the request envelope (no `txHash` or `envelopeXdr`, since a dry run is never stored) and raises `SimulationRejected` for an operation that cannot be simulated — a wasm upload or contract deploy.
 
 ---
 

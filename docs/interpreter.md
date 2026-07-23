@@ -36,7 +36,7 @@ The result is the empty idle K configuration — no accounts, no contracts, no s
 
 The run happens in a throwaway empty directory on purpose. The idle configuration ends with empty `<k>`/`<program>` cells, which is exactly the precondition that makes the request-handling rule fire if a `request.json` is present. Running in an empty directory guarantees no stray `request.json` is picked up and dispatched into the configuration that is about to be saved as `state.kore`.
 
-### `run(state_file, io_dir, request, program_steps=None)`
+### `run(state_file, io_dir, request, program_steps=None, *, commit=True)`
 
 `run` is the main entry point. It runs a single RPC request envelope through the following steps:
 
@@ -45,6 +45,8 @@ The run happens in a throwaway empty directory on purpose. The idle configuratio
 3. For a wasm upload only, splice the upload steps into the `<program>` cell (see below).
 4. Run the interpreter with its subprocess working directory set to `io_dir` (so the K file-system hooks resolve the relative paths `request.json`, `response.json`, `metadata.json`, and the `receipts/` and `traces/` files). The directory is set on the subprocess only — the server's own process never `chdir`s, so concurrent requests in other threads are unaffected.
 5. If the semantics wrote `response.json`, persist the new configuration to `state.kore` and return the response text. If not, the transaction got stuck (failed) — leave `state.kore` unchanged and return `None`, so the caller can synthesise a failure response.
+
+`commit` defaults to `True`. Pass `commit=False` to run a request without persisting its result: the response text is still returned, but the new configuration is discarded and `state.kore` is left unchanged even on success. `simulateTransaction` uses this to execute a dry run against the current world state without advancing the chain.
 
 ### `_inject_program(pattern, steps)` — the wasm-upload path
 

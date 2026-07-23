@@ -45,13 +45,13 @@ flowchart TB
 
 ### `server.py` — `StellarRpcServer`
 
-`StellarRpcServer` is the long-running process around the semantics: a plain `http.server.HTTPServer` that keeps the HTTP socket open and the state files on disk across requests — the networking and persistence the one-shot K interpreter has no notion of. It receives JSON-RPC requests, uses `TransactionEncoder` to turn a transaction into a request envelope, hands the envelope to `NodeInterpreter`, and returns the `response.json` the semantics produced. It holds **no** ledger counter, receipt store, or response-formatting logic — those live in K.
+`StellarRpcServer` is the long-running process around the semantics: a plain `http.server.HTTPServer` that keeps the HTTP socket open across requests — the networking the one-shot K interpreter has no notion of. It receives JSON-RPC requests, uses an `Encoder` to turn a transaction into a request envelope, hands the envelope to an `Interpreter`, and returns the `response.json` the semantics produced. It holds **no** ledger counter, receipt store, or response-formatting logic — those live in K — and it reaches the on-disk artifacts through a `Store` rather than touching paths itself.
 
-`handle_rpc(method, params, id)` is the dispatch entry point and is usable without the HTTP layer (scripts, tests).
+The three collaborators (`Encoder`, `Interpreter`, `Store`) are injected as the protocols declared in `interfaces.py`, not as their concrete classes, so a test can substitute fakes; `build_server` in `__main__.py` wires up the concretes. `handle_rpc(method, params, id)` is the dispatch entry point and is usable without the HTTP layer (scripts, tests).
 
 → **[Detailed documentation](server.md)**
 
-The server implements eleven RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `getVersionInfo`, `getFeeStats`, `sendTransaction`, `getTransaction`, `getTransactions`, `getLedgers`, `getLedgerEntries`, and the komet-specific `traceTransaction` extension — and the K semantics answer all of them. JSON-RPC framing (single calls, batch arrays, notifications) is handled in Python; the semantics see one request envelope per invocation. For `getLedgerEntries` the semantics' answer is an intermediate shape: K performs the state lookups, and `ledger_entries.py` translates between the base64 XDR wire format (`LedgerKey` in, `LedgerEntryData` out) and the JSON the semantics exchange, since K cannot parse or produce XDR.
+The server implements thirteen RPC methods — `getHealth`, `getNetwork`, `getLatestLedger`, `getVersionInfo`, `getFeeStats`, `sendTransaction`, `simulateTransaction`, `getTransaction`, `getTransactions`, `getLedgers`, `getLedgerEntries`, `getEvents`, and the komet-specific `traceTransaction` extension — and the K semantics answer all of them. JSON-RPC framing (single calls, batch arrays, notifications) is handled in Python; the semantics see one request envelope per invocation. For `getLedgerEntries` the semantics' answer is an intermediate shape: K performs the state lookups, and `ledger_entries.py` translates between the base64 XDR wire format (`LedgerKey` in, `LedgerEntryData` out) and the JSON the semantics exchange, since K cannot parse or produce XDR.
 
 `sendTransaction` always returns `PENDING` and clients poll `getTransaction` for the result — matching the Stellar RPC async pattern even though the transaction executes synchronously. See [server.md](server.md) for details.
 
@@ -73,6 +73,12 @@ The server implements eleven RPC methods — `getHealth`, `getNetwork`, `getLate
 
 ---
 
+### `store.py` — `ChainStore`
+
+`ChainStore` owns the io-dir layout: it knows the paths, the file-naming conventions, and the JSON shapes, and it is the only component that reads or writes them. The server holds one and asks it for receipts, ledgers, events, and the ledger counter. It is the concrete `Store` the server depends on through the [io-dir table below](#the-io-dir).
+
+---
+
 ### `kdist/node.md` — K Semantics
 
 `node.md` is the K module compiled into the LLVM binary. It implements the whole RPC layer on the K side: it reads `request.json`, dispatches on the `method` field, reads and updates `metadata.json` and the per-transaction `receipts/` files, executes transaction steps via KASMER, and writes the JSON-RPC `response.json`. KASMER is the Komet execution harness whose `Step`s — `setAccount`, `deployContract`, `callTx`, `uploadWasm` — carry out the Soroban operations a transaction decodes into.
@@ -89,7 +95,7 @@ All of the server's input and output artifacts live in one directory, the *io di
 |---|---|---|---|
 | `state.kore` | persistent | `NodeInterpreter` | the full K world-state configuration — accounts, contract code (including uploaded wasm `ModuleDecl`s), contract storage, ledger metadata — serialized in KORE. Read before each run and rewritten after a successful one. |
 | `metadata.json` | persistent | the K semantics | `{"latest_ledger": N}` — the server ledger counter, bumped by 1 per committed transaction. |
-| `receipts/receipt_<hash>.json` | persistent | the semantics and the server (on success — the server rewrites the semantics' internal `returnValue` field into `resultXdr`/`resultMetaXdr`), or the server alone (on failure) | one stored receipt per transaction, keyed by tx hash, answering `getTransaction`. Each is `{status, ledger, createdAt, envelopeXdr, resultXdr, resultMetaXdr?}`. |
+| `receipts/receipt_<hash>.json` | persistent | the semantics and the server (on success — the server rewrites the semantics' internal `returnValue` field into `resultXdr`/`resultMetaXdr`), or the server alone (on failure) | one stored receipt per transaction, keyed by tx hash, answering `getTransaction`. Each is `{status, applicationOrder, feeBump, envelopeXdr, resultXdr, ledger, createdAt, resultMetaXdr?}`. |
 | `traces/trace_<hash>.jsonl` | persistent | the semantics | one execution trace per transaction, keyed by tx hash — the instruction-level records, one JSON object per line. `traceTransaction` returns these records as a JSON array. |
 | `ledgers/ledger_<seq>.json` | persistent | the server (on success) | one record per closed ledger — `{sequence, txHash, closedAt, hash, headerXdr, metadataXdr}` — the ledger→transaction index behind `getTransactions` and `getLedgers`. Written in Python because the header artifacts are XDR, which K cannot construct. |
 | `requests/request_<n>.json` | persistent | the server | an archive of each incoming JSON-RPC request, numbered by a monotonic counter, kept for debugging. |
@@ -106,7 +112,7 @@ The world state stays in KORE (rather than a JSON snapshot) because an uploaded 
 ```mermaid
 flowchart TB
     boot(["server start"]) --> exists{"state.kore exists?"}
-    exists -->|"no"| init["empty_config() builds the idle K config in KORE<br/>write state.kore · seed metadata.json {latest_ledger: 0}<br/>create receipts/ traces/ requests/ wasms/"]
+    exists -->|"no"| init["empty_config() builds the idle K config in KORE<br/>write state.kore · seed metadata.json {latest_ledger: 0}<br/>create receipts/ traces/ ledgers/ requests/ wasms/ events/"]
     exists -->|"yes"| reuse["use existing state.kore<br/>seed metadata.json if missing · ensure artifact dirs exist"]
     init --> ready(["ready for requests"])
     reuse --> ready

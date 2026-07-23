@@ -224,7 +224,7 @@ Common tasks are driven by `make` (see the [Makefile](Makefile) for the complete
 To build the node from source use:
 
 ```bash
-make build-kdist
+make kdist-build
 make build
 pip install dist/*.whl
 ```
