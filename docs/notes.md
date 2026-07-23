@@ -13,7 +13,7 @@
 | [`server.py`](server.md) — `StellarRpcServer` | Long-running HTTP/JSON-RPC server wrapping the one-shot K interpreter; `handle_rpc` dispatch; owns the io-dir files. Holds no ledger or receipt state. |
 | [`transaction.py`](transaction.md) — `TransactionEncoder` | XDR → request envelope + (for wasm uploads) kasmer steps; address/contract-id helpers. |
 | [`interpreter.py`](interpreter.md) — `NodeInterpreter` | Runs request envelopes through `llvm_interpret`; persists `state.kore`. No `kast`↔`kore` whole-config conversions. |
-| `scval.py` | XDR `SCVal` ↔ Komet `SCValue` (`scvalue_from_xdr`), XDR `SCVal` ↔ request/response JSON (`scval_to_json`, `scval_from_json`). |
+| `scval.py` | XDR `SCVal` ↔ request/response JSON (`scval_to_json`, `scval_from_json`). |
 | `ledger_entries.py` | `getLedgerEntries` XDR translation: base64 `LedgerKey` → key descriptors for the semantics, intermediate entries → base64 `LedgerEntryData`. |
 | [`kdist/node.md`](node-semantics.md) | The K RPC layer: reads `request.json`, dispatches, updates `metadata.json` and the per-transaction `receipts/` files, writes `response.json`. |
 
