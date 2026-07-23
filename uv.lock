@@ -730,7 +730,7 @@ wheels = [
 [[package]]
 name = "komet"
 version = "0.1.84"
-source = { git = "https://github.com/runtimeverification/komet.git?rev=v0.1.85#089b3aa59bcb685764a4579f7077ca1c2add8168" }
+source = { git = "https://github.com/runtimeverification/komet.git?rev=v0.1.86#e898e5b252abce6f02e3cb0341525fd09d95737b" }
 dependencies = [
     { name = "pykwasm" },
     { name = "tomli" },
@@ -770,7 +770,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "kframework", specifier = ">=7.1.323,<7.1.324" },
-    { name = "komet", git = "https://github.com/runtimeverification/komet.git?rev=v0.1.85" },
+    { name = "komet", git = "https://github.com/runtimeverification/komet.git?rev=v0.1.86" },
     { name = "stellar-sdk", specifier = ">=13.2.1" },
 ]
 

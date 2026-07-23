@@ -136,11 +136,11 @@ curl -s http://localhost:8000 -H 'Content-Type: application/json' \
       "to":   {"type": "address", "addrType": "contract", "value": "6a20fec1a9081773a5f23ce370f925f236346e510438ddd6d40f6b2711c134e0"},
       "function": "foo", "args":[], "depth":1, "storage":[]
     },
-    {"pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
-    {"pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
-    {"pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}},
-    {"pos": null, "instr": ["block"],                 "stack": [], "locals": {}},
-    {"pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}},
+    {"pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null},
+    {"pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null},
+    {"pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null},
+    {"pos": null, "instr": ["block"],                 "stack": [], "locals": {}, "mem": null},
+    {"pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}, "mem": null},
     {"pos": null, "instr": ["endWasm"], "success":true, "depth":1, "result": {"type": "void"}}
   ]
 }
@@ -159,7 +159,7 @@ The example above only has three of these: `callContract`, instruction records, 
 Here's what each record type carries:
  
 - `callContract`: logged for each contract call in the transaction, including contract-to-contract calls. Records the caller, the callee, the function name, the arguments, the call depth, and the callee's storage before the call runs.
-- Instruction records: logged at each WebAssembly instruction's entry. `pos` is the instruction's byte offset in the binary (`null` for synthetic instructions), `instr` is the instruction and its operands, and `stack`/`locals` are the value stack and locals as `[type, value]` pairs.
+- Instruction records: logged at each WebAssembly instruction's entry. `pos` is the instruction's byte offset in the binary (`null` for synthetic instructions), `instr` is the instruction and its operands, and `stack`/`locals` are the value stack and locals as `[type, value]` pairs. `mem` is a snapshot of linear memory as a list of `{addr, bytes}` runs, emitted only when memory changed since the previous record and `null` otherwise (reuse the most recent snapshot).
 - `hostCall`: logged when the contract calls a host function. `instr` gives `["hostCall", moduleId, functionId]`, identifying which host function ran. `locals` holds the function's arguments, indexed by position. Host calls don't use the stack, so `stack` is absent.
   Here's a `hostCall` record for a call to `put_contract_data`, module id `l`, function id `_`:
 ```jsonc
