@@ -22,7 +22,10 @@ import pytest
 from stellar_sdk import Account, Keypair, Network, TransactionBuilder
 from stellar_sdk.utils import sha256
 
+from komet_node.interpreter import NodeInterpreter
 from komet_node.server import StellarRpcServer
+from komet_node.store import ChainStore
+from komet_node.transaction import TransactionEncoder
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -115,11 +118,14 @@ def _is_hex64(value: Any) -> bool:
 @pytest.fixture
 def server(tmp_path: Path) -> Iterator[StellarRpcServer]:
     port = _find_free_port()
+    # The test composition root: wire the concrete collaborators explicitly (the production
+    # one lives in komet_node.__main__.build_server).
     srv = StellarRpcServer(
+        interpreter=NodeInterpreter(),
+        encoder=TransactionEncoder(PASSPHRASE),
+        store=ChainStore(tmp_path),
         host='localhost',
         port=port,
-        io_dir=tmp_path,
-        network_passphrase=PASSPHRASE,
     )
     thread = threading.Thread(target=srv.serve, daemon=True)
     thread.start()
@@ -144,6 +150,11 @@ class Deployed(NamedTuple):
     address: str
     wasm_hash: bytes
     wasm_bytecode: bytes
+
+
+def contract_address_from_deployer(public_key: str, salt: bytes) -> str:
+    """The deterministic C-address CREATE_CONTRACT assigns for a (deployer account, salt) pair."""
+    return TransactionEncoder(PASSPHRASE).contract_address_from_deployer_address(public_key, salt)
 
 
 def send_tx(server: StellarRpcServer, keypair: Keypair, tb: TransactionBuilder) -> tuple[str, dict[str, Any]]:
@@ -186,7 +197,7 @@ def deploy_contract(server: StellarRpcServer, keypair: Keypair, account: Account
     wasm_hash = sha256(wasm_bytecode)
     salt = b'\x00' * 32
     send_tx(server, keypair, builder().append_create_contract_op(wasm_hash, keypair.public_key, None, salt))
-    address = server.encoder.contract_address_from_deployer_address(keypair.public_key, salt)
+    address = contract_address_from_deployer(keypair.public_key, salt)
     return Deployed(address=address, wasm_hash=wasm_hash, wasm_bytecode=wasm_bytecode)
 
 

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
 from pathlib import Path
 
 from stellar_sdk import Network
 
+from komet_node.interpreter import NodeInterpreter
 from komet_node.server import StellarRpcServer
+from komet_node.store import ChainStore
+from komet_node.transaction import TransactionEncoder
 
 _DESCRIPTION = 'Komet Node — a local Stellar testnet backed by the K semantics of Soroban.'
 
@@ -35,13 +39,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    server = StellarRpcServer(
-        host=args.host,
-        port=args.port,
-        io_dir=args.io_dir,
-        network_passphrase=Network.TESTNET_NETWORK_PASSPHRASE,
-    )
+    server = build_server(io_dir=args.io_dir, host=args.host, port=args.port)
     server.serve()
+
+
+def build_server(
+    *,
+    io_dir: Path | None = None,
+    network_passphrase: str = Network.TESTNET_NETWORK_PASSPHRASE,
+    host: str = 'localhost',
+    port: int = 8000,
+) -> StellarRpcServer:
+    """Composition root: build the concrete collaborators and wire up the server.
+
+    With no ``io_dir`` the chain runs against a fresh temporary directory — a throwaway chain
+    that starts empty on every launch and leaves the working directory untouched.
+    """
+    resolved_io_dir = Path(tempfile.mkdtemp(prefix='komet-node-')) if io_dir is None else io_dir
+    return StellarRpcServer(
+        interpreter=NodeInterpreter(),
+        encoder=TransactionEncoder(network_passphrase),
+        store=ChainStore(resolved_io_dir),
+        host=host,
+        port=port,
+    )
 
 
 if __name__ == '__main__':
