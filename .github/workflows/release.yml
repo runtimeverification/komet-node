@@ -41,7 +41,7 @@ jobs:
           fetch-depth: 0
 
       # The build-and-publish logic lives in scripts/deploy.sh so CI and manual
-      # deployments stay in sync (single source of truth). See CONTRIBUTOR.md.
+      # deployments stay in sync (single source of truth). See CONTRIBUTING.md.
       - name: 'Build and publish komet-node to both Nix caches'
         shell: bash
         env:
@@ -75,7 +75,7 @@ jobs:
           fetch-depth: 0
 
       # Build, smoke-test, and push logic lives in scripts/deploy.sh so CI and
-      # manual deployments stay in sync (single source of truth). See CONTRIBUTOR.md.
+      # manual deployments stay in sync (single source of truth). See CONTRIBUTING.md.
       - name: 'Build, test, and push Docker image to Docker Hub'
         env:
           DOCKERHUB_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
