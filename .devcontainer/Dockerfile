@@ -59,13 +59,18 @@ ENV PATH=/home/vscode/.nix-profile/bin:/home/vscode/.npm-global/bin:$PATH
 #   - gh                  → GitHub CLI for PRs/issues/auth; global so it's usable
 #                           from anywhere. Auth is persisted across rebuilds via a
 #                           named volume on ~/.config/gh (see devcontainer.json).
+#   - cachix              → required by scripts/deploy.sh `nix-cache` to push the
+#                           build closure to the k-framework cache. kup (the other
+#                           half of that deploy step) is fetched via nix at run
+#                           time, so only cachix needs provisioning here.
 RUN . /home/vscode/.nix-profile/etc/profile.d/nix.sh \
     && nix registry add nixpkgs github:NixOS/nixpkgs/nixos-25.05 \
     && nix profile install \
         nixpkgs#direnv \
         nixpkgs#nix-direnv \
         nixpkgs#nodejs_22 \
-        nixpkgs#gh
+        nixpkgs#gh \
+        nixpkgs#cachix
 
 # Claude Code CLI — installed to a per-user prefix so root isn't required.
 RUN . /home/vscode/.nix-profile/etc/profile.d/nix.sh \

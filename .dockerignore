@@ -15,3 +15,16 @@ cov-*
 result
 result-*
 state.kore
+
+# Never ship local secrets. The build context is the whole repo, and the
+# Dockerfile does `COPY . komet-node`, so any credential file sitting here
+# would be baked into a published image layer (a later `rm` does not remove
+# it from history). deploy.sh is run by hand with tokens exported, often via a
+# direnv `.envrc` or a `.env`, so keep those and any key/token files out.
+.envrc
+.env
+.env.*
+*.pem
+*.key
+*.token
+secrets*

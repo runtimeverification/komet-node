@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Verifies that `kup publish` actually pushed AND pinned komet-node in the
-# private k-framework-binary cache. Cachix has intermittently dropped the
+# k-framework-binary cache. Cachix has intermittently dropped the
 # `cachix pin` requests kup makes under the hood, so we confirm both the pin
 # (visible via the pin API) and the narinfo (the pushed store path) before
 # treating the publish as successful.
