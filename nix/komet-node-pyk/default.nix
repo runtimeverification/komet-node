@@ -19,7 +19,12 @@ let
     workspaceRoot = lib.cleanSource (nix-gitignore.gitignoreSourcePure [
         ../../.gitignore
         ".github/"
-        "result*"
+        # Anchor to the repo root so this only excludes the top-level `./result*`
+        # nix build symlinks. Without the leading slash the gitignore pattern
+        # matches any path component starting with "result" at any depth, which
+        # silently dropped `src/komet_node/result_xdr.py` from the packaged
+        # source and made the built node crash with `ModuleNotFoundError`.
+        "/result*"
         # do not include submodule directories that might be initilized empty or non-existent due to nix/git
         # otherwise cachix build might not match the version that is requested by `kup`
         # TODO: for new projects, add your submodule directories that are not required for nix builds here!
