@@ -2,6 +2,7 @@
 __pycache__/
 .coverage
 .direnv/
+.env
 
 # Runtime artifacts written by the server / interpreter in the io dir
 metadata.json
