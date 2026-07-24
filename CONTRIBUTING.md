@@ -79,12 +79,14 @@ where `<version>` comes from `package/version`.
 
 ### Prerequisites
 
-Both subcommands run from a checkout of the revision you are releasing, with the
+The subcommands run from a checkout of the revision you are releasing, with the
 following tools on `PATH`:
 
 - `nix-cache` needs `nix` and `cachix`. It fetches `kup` from
   `github:runtimeverification/kup` itself, so you do not install kup separately.
 - `docker` needs `docker`.
+- `release-draft`, `release-cut`, and `release-abort` need `gh`, authenticated
+  via `gh auth login` or a `GH_TOKEN`/`GITHUB_TOKEN` in the environment.
 
 Each subcommand checks its tools up front and exits with a clear message if one
 is missing, before starting the build.
@@ -102,14 +104,16 @@ further setup.
 | ----------- | ------------------------------ |
 | `nix-cache` | `CACHIX_PUBLIC_TOKEN`, `CACHIX_PRIVATE_KFB_TOKEN` |
 | `docker`    | `DOCKERHUB_PASSWORD` |
+| `release-*` | none — `gh` supplies its own authentication |
 
 `OWNER_REPO` and `REV` default to the current checkout's `origin` remote and
 `HEAD`. Override them if you are publishing a revision other than the one checked
 out. `DOCKERHUB_USERNAME`, `DOCKERHUB_NAMESPACE`, and `DOCKERHUB_REPO` default to
 the release account and repository; override them only to publish elsewhere.
 
-Both subcommands refuse to run if the working tree is not clean. CI builds from a
-fresh checkout, so a manual build must too: uncommitted changes and untracked
+The `nix-cache` and `docker` subcommands refuse to run if the working tree is not
+clean. CI builds from a fresh checkout, so a manual build must too: uncommitted
+changes and untracked
 files would otherwise be baked into the published image or flake build without
 matching the `REV` they are published under. Commit, stash, or clean the tree
 first. `git status --porcelain` ignores `.gitignore`d paths, so runtime artifacts
@@ -118,17 +122,18 @@ deliberately want to publish an uncommitted state.
 
 ### Manual release while CI is down
 
-The workflow also drafts, cleans up, and finalizes the GitHub release around the
-deployment jobs. When you deploy by hand, run those `gh` steps yourself in this
-order. `nix-cache` runs once per architecture (the workflow uses an `x86_64` and
-an `ARM64` runner), so run it on a machine of each architecture that should be
+`deploy.sh` wraps the GitHub-release steps too, so a manual release runs the same
+subcommands the workflow does, in the same order. Run them from a checkout of the
+`main` commit you are releasing: `release-draft` targets `REV` (the current
+`HEAD` by default), and kup resolves komet-node versions against `main`, so a
+release built from an unmerged commit will not be installable with `kup`.
+`nix-cache` runs once per architecture (the workflow uses an `x86_64` and an
+`ARM64` runner), so run it on a machine of each architecture that should be
 cached.
 
 ```sh
-VERSION=v$(cat package/version)
-
 # 1. Draft the release.
-gh release create "$VERSION" --draft --title "$VERSION" --target "$(git rev-parse HEAD)"
+./scripts/deploy.sh release-draft
 
 # 2. Deploy. Export the secrets first (see the table above).
 #    Run nix-cache once per architecture; docker once.
@@ -136,8 +141,8 @@ gh release create "$VERSION" --draft --title "$VERSION" --target "$(git rev-pars
 ./scripts/deploy.sh docker
 
 # 3. Finalize the release once every deployment has succeeded.
-gh release edit "$VERSION" --draft=false
+./scripts/deploy.sh release-cut
 
 # If a deployment fails, remove the draft instead:
-#   gh release delete "$VERSION" --yes --cleanup-tag
+#   ./scripts/deploy.sh release-abort
 ```

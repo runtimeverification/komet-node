@@ -13,13 +13,16 @@ set -euo pipefail
 # unavailable. See CONTRIBUTING.md ("Deploying a release") for the runbook.
 #
 # Subcommands:
-#   nix-cache   Build komet-node and push it to both Nix caches (the
-#               k-framework closure + the k-framework-binary kup binary).
-#   docker      Build the Docker image, smoke-test it, and push to Docker Hub.
-#   all         Run nix-cache then docker.
+#   nix-cache       Build komet-node and push it to both Nix caches (the
+#                   k-framework closure + the k-framework-binary kup binary).
+#   docker          Build the Docker image, smoke-test it, and push to Docker Hub.
+#   all             Run nix-cache then docker.
+#   release-draft   Create the draft GitHub release for this version and revision.
+#   release-cut     Publish (un-draft) the release once its artifacts are up.
+#   release-abort   Delete the draft release and its tag (failure cleanup).
 #
 # Usage:
-#   scripts/deploy.sh <nix-cache|docker|all>
+#   scripts/deploy.sh <nix-cache|docker|all|release-draft|release-cut|release-abort>
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -156,15 +159,51 @@ deploy_docker() {
   docker image push "${tag}"
 }
 
+# --- release lifecycle -----------------------------------------------------
+# The GitHub release is drafted before the artifacts are published and finalized
+# after, so it only becomes visible once its Docker image and cache pins exist.
+# These wrap the `gh` calls the Release workflow makes, keeping the release
+# lifecycle in the same single source of truth as the deploy steps. `gh`
+# authenticates via its own login or GH_TOKEN/GITHUB_TOKEN; no secret is read
+# here directly. The release is drafted against REV, which must be the commit you
+# deployed -- and, for a real release, a commit on `main`, since kup resolves
+# komet-node versions against `main`.
+release_tag() { echo "v${KOMET_NODE_VERSION}"; }
+
+deploy_release_draft() {
+  require_cmd gh git
+  local tag; tag="$(release_tag)"
+  echo ":: drafting release ${tag} targeting ${REV}"
+  gh release create "${tag}" --repo "${OWNER_REPO}" --draft --title "${tag}" --target "${REV}"
+}
+
+deploy_release_cut() {
+  require_cmd gh git
+  local tag; tag="$(release_tag)"
+  echo ":: publishing release ${tag}"
+  gh release edit "${tag}" --repo "${OWNER_REPO}" --draft=false
+}
+
+deploy_release_abort() {
+  require_cmd gh git
+  local tag; tag="$(release_tag)"
+  echo ":: deleting drafted release ${tag}"
+  # Best-effort: the cleanup path must never fail on its own account.
+  gh release delete "${tag}" --repo "${OWNER_REPO}" --yes --cleanup-tag || true
+}
+
 usage() {
-  sed -n '8,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  sed -n '8,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
 
 main() {
   case "${1:-}" in
-    nix-cache) deploy_nix_cache ;;
-    docker)    deploy_docker ;;
-    all)       deploy_nix_cache; deploy_docker ;;
+    nix-cache)     deploy_nix_cache ;;
+    docker)        deploy_docker ;;
+    all)           deploy_nix_cache; deploy_docker ;;
+    release-draft) deploy_release_draft ;;
+    release-cut)   deploy_release_cut ;;
+    release-abort) deploy_release_abort ;;
     -h | --help | help | "")
       usage
       [ -n "${1:-}" ] # exit non-zero when no subcommand was given
