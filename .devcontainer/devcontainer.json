@@ -3,6 +3,13 @@
   "build": {
     "dockerfile": "Dockerfile"
   },
+  // An isolated Docker daemon inside the container, so `scripts/deploy.sh docker`
+  // can build and push the release image without touching the host's Docker. The
+  // feature adds the docker CLI, runs dockerd, and puts `vscode` in the docker
+  // group; it also marks the container privileged, which dockerd requires.
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
   "remoteUser": "vscode",
   "workspaceFolder": "/workspace",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
