@@ -10,7 +10,7 @@ set -euo pipefail
 # This is the single source of truth for the deployment steps that the Release
 # workflow (.github/workflows/release.yml) performs. The workflow calls the
 # subcommands below, and you can run the exact same steps by hand when CI is
-# unavailable. See scripts/README.md for the full manual-deployment runbook.
+# unavailable. See CONTRIBUTOR.md ("Deploying a release") for the runbook.
 #
 # Subcommands:
 #   nix-cache   Build komet-node and push it to both Nix caches (the
