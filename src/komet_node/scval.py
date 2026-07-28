@@ -58,6 +58,20 @@ def scval_to_json(scval: SCVal) -> dict:
                 return {'type': 'address', 'addrType': 'account', 'value': raw.hex()}
             assert addr.contract_id is not None
             return {'type': 'address', 'addrType': 'contract', 'value': addr.contract_id.contract_id.hash.hex()}
+        case SCValType.SCV_VEC:
+            # A vec recurses element-wise. User enums and tuples reduce to vecs at
+            # the XDR level, so this also covers those composite arguments.
+            assert scval.vec is not None
+            return {'type': 'vec', 'value': [scval_to_json(v) for v in scval.vec.sc_vec]}
+        case SCValType.SCV_MAP:
+            # A map recurses over its entries. Structs reduce to symbol-keyed maps at
+            # the XDR level. Key order follows the XDR entry order, which the SDK keeps
+            # sorted; the K side rebuilds a Map so ordering there is immaterial.
+            assert scval.map is not None
+            return {
+                'type': 'map',
+                'value': [{'key': scval_to_json(e.key), 'val': scval_to_json(e.val)} for e in scval.map.sc_map],
+            }
         case _:
             raise NotImplementedError(f'Unsupported SCVal type for JSON encoding: {scval.type}')
 

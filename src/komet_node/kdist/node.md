@@ -1164,6 +1164,23 @@ SCVal arg encoding (key order also significant):
     rule #decodeArg({ "type" : "bytes"   , "value" : V:String }) => ScBytes(HexBytes(V))
     rule #decodeArg({ "type" : "address" , "addrType" : "account"  , "value" : V:String }) => ScAddress(Account(HexBytes(V)))
     rule #decodeArg({ "type" : "address" , "addrType" : "contract" , "value" : V:String }) => ScAddress(Contract(HexBytes(V)))
+
+    // Composite arguments. A vec reuses #decodeArgList (which already yields a List of
+    // ScVal); a map decodes its entries into a Map from ScVal keys to ScVal values.
+    // Enums, structs, and tuples all bottom out in vecs and maps, so these two rules
+    // cover every composite call argument. Encoded by scval_to_json as
+    //   { "type": "vec", "value": [ <scval>, ... ] }
+    //   { "type": "map", "value": [ { "key": <scval>, "val": <scval> }, ... ] }
+    rule #decodeArg({ "type" : "vec" , "value" : [ ELEMS:JSONs ] }) => ScVec(#decodeArgList(ELEMS))
+    rule #decodeArg({ "type" : "map" , "value" : [ ENTRIES:JSONs ] }) => ScMap(#decodeMapEntries(ENTRIES))
+
+    syntax Map ::= #decodeMapEntries(JSONs) [function]
+    rule #decodeMapEntries(.JSONs)          => .Map
+    rule #decodeMapEntries(E:JSON, ES:JSONs)
+        => #decodeMapEntry(E) #decodeMapEntries(ES)
+
+    syntax Map ::= #decodeMapEntry(JSON) [function]
+    rule #decodeMapEntry({ "key" : K:JSON , "val" : V:JSON }) => #decodeArg(K) |-> #decodeArg(V)
 ```
 
 `uncheckedCallTx` is like komet's `callTx` but it does not entail a return value check.

@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime, timezone
@@ -100,6 +101,13 @@ _TX_METHODS: Final = ('sendTransaction',)
 # the default 'base64' format; see _require_supported_xdr_format.
 _XDR_FORMAT_METHODS: Final = ('getTransaction', 'sendTransaction')
 
+# The request path drives deep Python recursion (pyk's recursive-descent KORE parser and the
+# recursive cell rewrites in interpreter.py) proportional to the world-state term. komet_node
+# raises the recursion *limit* (see __init__.py) so large real contracts do not hit CPython's
+# default 1000; this backs that limit with a matching C stack, run on a dedicated serve thread,
+# so a deep term raises a catchable error rather than overflowing an 8 MB stack into a SIGSEGV.
+_SERVE_STACK_SIZE: Final = 512 * 1024 * 1024
+
 _log = logging.getLogger('komet_node')
 
 
@@ -177,7 +185,18 @@ class StellarRpcServer:
         # switch to ThreadingHTTPServer without reworking that file protocol.
         self._httpd = HTTPServer((self.host, int(self._port)), Handler)
         self._log_ready()
-        self._httpd.serve_forever()
+
+        # Run the (blocking) serve loop on a worker thread with a large stack so the raised
+        # recursion limit is usable: the request handler recurses on this thread, and a big
+        # C stack is what keeps a deep world-state term from segfaulting. stack_size is a
+        # no-op fallback (default stack) on the rare platform that does not support it.
+        try:
+            threading.stack_size(_SERVE_STACK_SIZE)
+        except (ValueError, RuntimeError):
+            pass
+        worker = threading.Thread(target=self._httpd.serve_forever, name='komet-node-serve')
+        worker.start()
+        worker.join()
 
     def _log_ready(self) -> None:
         """Announce, once the socket is bound, where the server listens and how it started."""

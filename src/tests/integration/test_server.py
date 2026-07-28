@@ -612,6 +612,82 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
     assert_args_round_trip('test_symbol', [xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(sc_symbol=b'hello'))])
 
 
+def test_call_tx_with_composite_args(server: StellarRpcServer) -> None:
+    """The scval_to_json / #decodeArg pipeline decodes composite (vec / map) call args.
+
+    Regression test for the composite-argument blocker: komet-node used to decode only
+    scalar SCVals in call arguments (``scval_to_json`` raised on SCV_VEC/SCV_MAP, and the
+    ``#decodeArg`` rules had no vec/map cases), so a Vec/Map argument was rejected at
+    admission and never ran. Both sides now recurse, so a contract call carrying vec and
+    map arguments reaches SUCCESS (asserted by ``invoke``) and — like ``test_call_tx_with_args``
+    — the arguments echoed in the trace's ``callContract`` frame round-trip back to the exact
+    SCVals sent, so a decoding bug is caught even when the transaction still succeeds.
+
+    User enums, structs, and tuples all reduce to vec/map at the XDR level, so the nested
+    ``Vec<(enum, i128)>`` case below (with an Address-carrying variant and a negative i128)
+    stands in for the real ``Vec<(AssetKey, i128)>`` motivating argument.
+    """
+    invoke = deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
+
+    def assert_args_round_trip(func: str, args: list[xdr.SCVal]) -> None:
+        tx_hash = invoke(func, args)
+        trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
+        # A composite argument is allocated as a host object first, so the callContract
+        # frame is not necessarily trace[0] (unlike the scalar-only case): find it.
+        entry = next(record for record in trace if record.get('instr') == ['callContract'])
+        assert entry['function'] == func
+        assert [scval_from_json(arg) for arg in entry['args']] == args
+
+    def sym(name: str) -> xdr.SCVal:
+        return xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(sc_symbol=name.encode()))
+
+    def i128(value: int) -> xdr.SCVal:
+        # Two's-complement split into (hi: signed int64, lo: unsigned int64) so negative
+        # and high-bit values round-trip, not just small positive ones.
+        unsigned = value & ((1 << 128) - 1)
+        hi = unsigned >> 64
+        lo = unsigned & ((1 << 64) - 1)
+        if hi >= (1 << 63):
+            hi -= 1 << 64
+        return xdr.SCVal(type=SCValType.SCV_I128, i128=xdr.Int128Parts(hi=xdr.Int64(hi), lo=xdr.Uint64(lo)))
+
+    def u32(value: int) -> xdr.SCVal:
+        return xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(value))
+
+    def vec(elems: list[xdr.SCVal]) -> xdr.SCVal:
+        return xdr.SCVal(type=SCValType.SCV_VEC, vec=xdr.SCVec(elems))
+
+    def mp(entries: list[tuple[xdr.SCVal, xdr.SCVal]]) -> xdr.SCVal:
+        return xdr.SCVal(type=SCValType.SCV_MAP, map=xdr.SCMap([xdr.SCMapEntry(key=k, val=v) for k, v in entries]))
+
+    address = Address(Keypair.random().public_key).to_xdr_sc_val()
+
+    # A flat vec of scalars.
+    assert_args_round_trip('test_vec', [vec([u32(1), u32(2), u32(3)])])
+
+    # The nested motivating case: Vec<(enum, i128)> mirroring Vec<(AssetKey, i128)> — a unit
+    # variant (Native), an Address-carrying variant (Stellar(addr)), and a positive and a
+    # negative i128, exercising SCV_ADDRESS nested in a composite and the full signed i128 range.
+    assert_args_round_trip(
+        'test_vec',
+        [
+            vec(
+                [
+                    vec([vec([sym('Native')]), i128(1000)]),
+                    vec([vec([sym('Stellar'), address]), i128(-5)]),
+                ]
+            )
+        ],
+    )
+
+    # A map from symbol keys to scalar values (a struct at the XDR level). Keys are sent in
+    # sorted order ('amount' < 'nonce') to match the canonical SCMap ordering the trace echoes.
+    assert_args_round_trip('test_map', [mp([(sym('amount'), i128(500)), (sym('nonce'), u32(7))])])
+
+    # A map nested inside a vec — composites compose in both directions.
+    assert_args_round_trip('test_vec', [vec([mp([(sym('k'), u32(1))])])])
+
+
 def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
     """A contract invocation that returns a non-Void value succeeds.
 
