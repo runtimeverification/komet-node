@@ -23,6 +23,15 @@
   ;; _ (Soroban ABI stub)
   (func (;4;) (type 0))
 
+  ;; test_vec / test_map: accept 1 composite arg (a HostVal object handle),
+  ;; return Void. Declared last and referenced by symbolic id so their function
+  ;; indices (and the exports below) do not depend on declaration order —
+  ;; wat2wasm numbers functions by position, ignoring the ;;(;N;) comments.
+  (func $test_vec (type 1) (param i64) (result i64)
+    i64.const 2)
+  (func $test_map (type 1) (param i64) (result i64)
+    i64.const 2)
+
   (memory (;0;) 16)
   (global (;0;) (mut i32) (i32.const 1048576))
   (global (;1;) i32 (i32.const 1048576))
@@ -34,6 +43,8 @@
   (export "test_wide_integers" (func 2))
   (export "test_symbol" (func 3))
   (export "_" (func 4))
+  (export "test_vec" (func $test_vec))
+  (export "test_map" (func $test_map))
   (export "__data_end" (global 1))
   (export "__heap_base" (global 2))
 )
