@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -455,9 +456,66 @@ def test_trace_transaction_retrieves_trace_by_hash(server: StellarRpcServer) -> 
     assert send_result['status'] == 'PENDING'
 
     # The trace is keyed by the same hash getTransaction uses. A create-account op runs no
-    # wasm instructions, so the stored trace is an empty array (resolved, not null/NOT_FOUND).
+    # wasm instructions, so the trace holds only the leading `ledger` baseline record every
+    # traced transaction opens with (resolved, not null/NOT_FOUND).
     trace = _rpc(server.port(), 'traceTransaction', {'hash': send_result['hash']})['result']
-    assert trace == []
+    assert [record['instr'] for record in trace] == [['ledger']]
+
+
+def test_trace_opens_with_a_ledger_baseline_record(server: StellarRpcServer) -> None:
+    """Every traced transaction opens with a `ledger` baseline record: the ledger scalars plus
+    every account's balance, as the transaction's steps FOUND them.
+
+    A debugger seeds its view of chain state from this and replays the per-operation events that
+    follow on top, so it can show the ledger at any point of a recorded execution rather than
+    only the parts a contract happened to touch.
+
+    The balances are those that existed when the transaction started, so a transaction that
+    creates its own account reports none — the `setAccount` step runs after the baseline. The
+    second transaction below therefore sees the account the first one created, which is what
+    makes the field useful for the debugger (it traces the last of a sequence).
+    """
+    keypair = Keypair.random()
+    account = Account(keypair.public_key, sequence=0)
+
+    def submit(sequence: int) -> str:
+        envelope = (
+            TransactionBuilder(Account(keypair.public_key, sequence=sequence), PASSPHRASE)
+            .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
+            .set_timeout(30)
+            .build()
+        )
+        envelope.sign(keypair)
+        return _rpc(server.port(), 'sendTransaction', {'transaction': envelope.to_xdr()})['result']['hash']
+
+    first_hash = submit(0)
+    first = _rpc(server.port(), 'traceTransaction', {'hash': first_hash})['result'][0]
+
+    assert first['instr'] == ['ledger']
+    assert first['pos'] is None
+    # The ledger scalars are always reported.
+    assert isinstance(first['sequence'], int)
+    assert isinstance(first['timestamp'], int)
+    # Nothing existed before the first transaction ran its own steps.
+    assert first['accounts'] == []
+    # Reserved for contract-instance / uploaded-code metadata; empty means "not reported".
+    assert first['contracts'] == []
+    assert first['codes'] == []
+
+    # A second transaction starts from the ledger the first one left behind, so its baseline
+    # carries the account, with the balance and the address shape the debugger expects.
+    second_hash = submit(1)
+    second = _rpc(server.port(), 'traceTransaction', {'hash': second_hash})['result'][0]
+
+    assert second['instr'] == ['ledger']
+    assert second['accounts'], 'the second transaction should see the first transaction\'s account'
+    entry = second['accounts'][0]
+    assert entry['account']['type'] == 'address'
+    assert entry['account']['addrType'] == 'account'
+    assert re.fullmatch(r'[0-9a-f]*', entry['account']['value'])
+    assert isinstance(entry['balance'], int)
+    # The ledger advances between transactions.
+    assert second['sequence'] > first['sequence']
 
 
 def test_trace_transaction_unknown_hash_returns_null(server: StellarRpcServer) -> None:
@@ -493,8 +551,13 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
 
     trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
 
-    # A callContract entry frame opens the trace: the account calls foo() on the contract with
-    # no arguments at call depth 1.
+    # A `ledger` baseline record opens every traced transaction (see
+    # test_trace_opens_with_a_ledger_baseline_record); the callContract entry frame follows it.
+    assert trace[0]['instr'] == ['ledger']
+    trace = trace[1:]
+
+    # A callContract entry frame opens the execution: the account calls foo() on the contract
+    # with no arguments at call depth 1.
     entry = trace[0]
     assert entry['instr'] == ['callContract']
     assert entry['function'] == 'foo'
@@ -509,6 +572,11 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
 
     # The executed WebAssembly instructions, exactly as shown in the README, each tagged with the
     # executing contract.
+    # The first three records EVALUATE the module's global initialisers. A global is allocated
+    # only once its own initialiser has run, so each of these sees exactly the globals declared
+    # before it: none, then one, then two. By the time the function frame runs all three are
+    # allocated and reported by module-relative index (0..2, never store-level addresses).
+    initialised = {'0': ['i32', 1048576], '1': ['i32', 1048576], '2': ['i32', 1048576]}
     assert trace[1:-1] == [
         {
             'pos': 3,
@@ -516,6 +584,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'stack': [],
             'locals': {},
             'mem': None,
+            'globals': {},
             'executingContract': contract_id,
         },
         {
@@ -524,6 +593,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'stack': [],
             'locals': {},
             'mem': None,
+            'globals': {'0': ['i32', 1048576]},
             'executingContract': contract_id,
         },
         {
@@ -532,15 +602,25 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'stack': [],
             'locals': {},
             'mem': None,
+            'globals': {'0': ['i32', 1048576], '1': ['i32', 1048576]},
             'executingContract': contract_id,
         },
-        {'pos': None, 'instr': ['block'], 'stack': [], 'locals': {}, 'mem': None, 'executingContract': contract_id},
+        {
+            'pos': None,
+            'instr': ['block'],
+            'stack': [],
+            'locals': {},
+            'mem': None,
+            'globals': initialised,
+            'executingContract': contract_id,
+        },
         {
             'pos': 3,
             'instr': ['const', 'i64', 2],
             'stack': [],
             'locals': {},
             'mem': None,
+            'globals': initialised,
             'executingContract': contract_id,
         },
     ]
@@ -579,6 +659,10 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
     assert isinstance(trace, list)
     assert len(trace) > 0
 
+    # Skip the leading `ledger` baseline record every traced transaction opens with.
+    assert trace[0]['instr'] == ['ledger']
+    trace = trace[1:]
+
     # The callContract entry frame echoes the call target and its decoded arguments.
     entry = trace[0]
     assert entry['instr'] == ['callContract']
@@ -594,10 +678,17 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
     instr_records = [record for record in trace if 'locals' in record]
     assert instr_records
     for record in instr_records:
-        assert set(record) == {'pos', 'instr', 'stack', 'locals', 'mem', 'executingContract'}
+        assert set(record) == {'pos', 'instr', 'stack', 'locals', 'mem', 'globals', 'executingContract'}
         assert record['pos'] is None or isinstance(record['pos'], int)
         # mem is null when linear memory is unchanged since the previous record, else a list of runs.
         assert record['mem'] is None or isinstance(record['mem'], list)
+        # globals is the executing module's globals keyed by module-relative index, repeated in
+        # full on every record (never null, unlike mem).
+        assert isinstance(record['globals'], dict)
+        assert all(key.isdigit() for key in record['globals'])
+        assert all(
+            isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) for e in record['globals'].values()
+        )
         assert isinstance(record['instr'], list) and record['instr']
         assert isinstance(record['instr'][0], str)  # opcode mnemonic
         # stack and locals hold [type, value] pairs.
@@ -627,7 +718,10 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
 
     def assert_args_round_trip(func: str, args: list[xdr.SCVal]) -> None:
         tx_hash = invoke(func, args)
-        entry = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result'][0]
+        trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
+        # The trace opens with the `ledger` baseline record, so find the call frame rather
+        # than assuming it is first.
+        entry = next(record for record in trace if record.get('instr') == ['callContract'])
         assert entry['function'] == func
         assert [scval_from_json(arg) for arg in entry['args']] == args
 

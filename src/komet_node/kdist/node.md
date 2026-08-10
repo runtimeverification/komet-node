@@ -436,6 +436,7 @@ already run by the time we get here, leaving `steps` empty).
     rule <k> #runTx( REQ )
           => #enableTrace( #traceFile( #getString( "txHash", REQ ) ) )
           ~> setLedgerSequence( #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ) )
+          ~> #traceLedger
           ~> #decodeSteps( #stepsJSONs( #getJSON( "steps", REQ, [ .JSONs ] ) ) )
           ~> #finalizeTx( REQ )
              ...
@@ -453,6 +454,61 @@ at it so the executing steps append their records to it.
 ```k
     rule <k> #enableTrace( PATH ) => #writeFile( PATH, "" ) ... </k>
          <ioDir> _ => PATH </ioDir>
+```
+
+`#traceLedger` writes the trace's first record: the **ledger baseline**, carrying the ledger
+scalars and every account's balance. A debugger seeds its view of chain state from this record
+and then replays the per-operation events (storage writes, contract calls) that follow, so it
+can show the ledger at any point of a recorded execution rather than only the parts a contract
+happened to touch.
+
+It runs after `setLedgerSequence` so the sequence it reports is this transaction's, not the
+previous one's, and before `#decodeSteps` so it describes the ledger as the steps *found* it —
+any `setAccount`, upload or deploy among those steps is a change on top of this baseline.
+`generateLedgerTrace` lives in komet's `tracing.md` beside the other record builders.
+
+The balances cannot be read in one match: `<accounts>` is a K *cell collection*, so no
+function can take it as an argument (its generated sort is not usable in a hand-written
+`syntax` declaration), and a rule cannot match a variable number of `<account>` cells at
+once. So `#collectAccounts` gathers them one per rewrite step into a plain `Map`, which
+`generateLedgerTrace` then serializes. This mirrors `#collectGlobals` in komet's
+`tracing.md`; the difference is that the globals have a `<globalAddrs>` index to drain,
+while here the accumulator itself is the record of what has been visited — an account is
+collected only if its address is not already a key.
+
+```k
+    syntax KItem ::= "#traceLedger"                 [symbol(traceLedger)]
+                   | #collectAccounts(acc: Map)     [symbol(collectAccounts)]
+ // ---------------------------------------------------------
+    rule <k> #traceLedger => #collectAccounts(.Map) ... </k>
+         <ioDir> PATH </ioDir>
+      requires PATH =/=String ""
+
+    rule [collectAccounts-step]:
+        <k> #collectAccounts(ACCTS => ACCTS [ ADDR <- BAL ]) ... </k>
+        <account>
+          <accountId> ADDR </accountId>
+          <balance>   BAL  </balance>
+          ...
+        </account>
+      requires notBool ADDR in_keys(ACCTS)
+      [preserves-definedness]
+
+    // Every account visited: emit the record.
+    rule [collectAccounts-done]:
+        <k> #collectAccounts(ACCTS)
+         => #appendFileJSONLn( PATH, generateLedgerTrace( SEQ, TS, ACCTS ) )
+            ...
+        </k>
+        <ioDir> PATH </ioDir>
+        <ledgerSequenceNumber> SEQ </ledgerSequenceNumber>
+        <ledgerTimestamp> TS </ledgerTimestamp>
+      [owise]
+
+    // Tracing disabled (a simulate/dry run leaves `<ioDir>` empty): a no-op, so the
+    // step never wedges.
+    rule <k> #traceLedger => .K ... </k>
+         <ioDir> "" </ioDir>
 ```
 
 After the steps run, record the receipt, write the new ledger counter, and respond. The trace
