@@ -459,7 +459,7 @@ def test_trace_transaction_retrieves_trace_by_hash(server: StellarRpcServer) -> 
     # wasm instructions, so the trace holds only the leading `ledger` baseline record every
     # traced transaction opens with (resolved, not null/NOT_FOUND).
     trace = _rpc(server.port(), 'traceTransaction', {'hash': send_result['hash']})['result']
-    assert [record['instr'] for record in trace] == [['ledger']]
+    assert [record['kind'] for record in trace] == ['ledger']
 
 
 def test_trace_opens_with_a_ledger_baseline_record(server: StellarRpcServer) -> None:
@@ -476,7 +476,6 @@ def test_trace_opens_with_a_ledger_baseline_record(server: StellarRpcServer) -> 
     makes the field useful for the debugger (it traces the last of a sequence).
     """
     keypair = Keypair.random()
-    account = Account(keypair.public_key, sequence=0)
 
     def submit(sequence: int) -> str:
         envelope = (
@@ -491,8 +490,7 @@ def test_trace_opens_with_a_ledger_baseline_record(server: StellarRpcServer) -> 
     first_hash = submit(0)
     first = _rpc(server.port(), 'traceTransaction', {'hash': first_hash})['result'][0]
 
-    assert first['instr'] == ['ledger']
-    assert first['pos'] is None
+    assert first['kind'] == 'ledger'
     # The ledger scalars are always reported.
     assert isinstance(first['sequence'], int)
     assert isinstance(first['timestamp'], int)
@@ -507,8 +505,8 @@ def test_trace_opens_with_a_ledger_baseline_record(server: StellarRpcServer) -> 
     second_hash = submit(1)
     second = _rpc(server.port(), 'traceTransaction', {'hash': second_hash})['result'][0]
 
-    assert second['instr'] == ['ledger']
-    assert second['accounts'], 'the second transaction should see the first transaction\'s account'
+    assert second['kind'] == 'ledger'
+    assert second['accounts'], "the second transaction should see the first transaction's account"
     entry = second['accounts'][0]
     assert entry['account']['type'] == 'address'
     assert entry['account']['addrType'] == 'account'
@@ -553,13 +551,13 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
 
     # A `ledger` baseline record opens every traced transaction (see
     # test_trace_opens_with_a_ledger_baseline_record); the callContract entry frame follows it.
-    assert trace[0]['instr'] == ['ledger']
+    assert trace[0]['kind'] == 'ledger'
     trace = trace[1:]
 
     # A callContract entry frame opens the execution: the account calls foo() on the contract
     # with no arguments at call depth 1.
     entry = trace[0]
-    assert entry['instr'] == ['callContract']
+    assert entry['kind'] == 'callContract'
     assert entry['function'] == 'foo'
     assert entry['args'] == []
     assert entry['depth'] == 1
@@ -579,6 +577,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
     initialised = {'0': ['i32', 1048576], '1': ['i32', 1048576], '2': ['i32', 1048576]}
     assert trace[1:-1] == [
         {
+            'kind': 'instr',
             'pos': 3,
             'instr': ['const', 'i32', 1048576],
             'stack': [],
@@ -588,6 +587,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'executingContract': contract_id,
         },
         {
+            'kind': 'instr',
             'pos': 11,
             'instr': ['const', 'i32', 1048576],
             'stack': [],
@@ -597,6 +597,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'executingContract': contract_id,
         },
         {
+            'kind': 'instr',
             'pos': 19,
             'instr': ['const', 'i32', 1048576],
             'stack': [],
@@ -606,6 +607,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'executingContract': contract_id,
         },
         {
+            'kind': 'instr',
             'pos': None,
             'instr': ['block'],
             'stack': [],
@@ -615,6 +617,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'executingContract': contract_id,
         },
         {
+            'kind': 'instr',
             'pos': 3,
             'instr': ['const', 'i64', 2],
             'stack': [],
@@ -628,7 +631,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
     # An endWasm exit frame closes the trace: the call succeeded and returned Void. The exit frame
     # is tagged with the finishing contract (the current top of stack) before its pop.
     exit_frame = trace[-1]
-    assert exit_frame['instr'] == ['endWasm']
+    assert exit_frame['kind'] == 'endWasm'
     assert exit_frame['success'] is True
     assert exit_frame['result'] == {'type': 'void'}
     assert exit_frame['depth'] == 1
@@ -637,7 +640,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
 
 def test_trace_records_have_expected_structure_and_reflect_arguments(server: StellarRpcServer) -> None:
     """The trace opens with a ``callContract`` frame that echoes the decoded arguments, and each
-    WebAssembly instruction record is a ``{pos, instr, stack, locals}`` object. For a call that
+    WebAssembly instruction record is a ``{kind, pos, instr, stack, locals, ...}`` object. For a call that
     takes arguments the arguments are bound as locals while intermediate values build up on the
     stack — exercising a richer trace than the argument-less ``foo()`` case.
 
@@ -660,12 +663,12 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
     assert len(trace) > 0
 
     # Skip the leading `ledger` baseline record every traced transaction opens with.
-    assert trace[0]['instr'] == ['ledger']
+    assert trace[0]['kind'] == 'ledger'
     trace = trace[1:]
 
     # The callContract entry frame echoes the call target and its decoded arguments.
     entry = trace[0]
-    assert entry['instr'] == ['callContract']
+    assert entry['kind'] == 'callContract'
     assert entry['function'] == 'test_integers'
     assert entry['args'] == [
         {'type': 'u32', 'value': 42},
@@ -675,10 +678,10 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
     ]
 
     # The instruction records (everything between the call-boundary frames) share one shape.
-    instr_records = [record for record in trace if 'locals' in record]
+    instr_records = [record for record in trace if record['kind'] == 'instr']
     assert instr_records
     for record in instr_records:
-        assert set(record) == {'pos', 'instr', 'stack', 'locals', 'mem', 'globals', 'executingContract'}
+        assert set(record) == {'kind', 'pos', 'instr', 'stack', 'locals', 'mem', 'globals', 'executingContract'}
         assert record['pos'] is None or isinstance(record['pos'], int)
         # mem is null when linear memory is unchanged since the previous record, else a list of runs.
         assert record['mem'] is None or isinstance(record['mem'], list)
@@ -686,9 +689,7 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
         # full on every record (never null, unlike mem).
         assert isinstance(record['globals'], dict)
         assert all(key.isdigit() for key in record['globals'])
-        assert all(
-            isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) for e in record['globals'].values()
-        )
+        assert all(isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) for e in record['globals'].values())
         assert isinstance(record['instr'], list) and record['instr']
         assert isinstance(record['instr'][0], str)  # opcode mnemonic
         # stack and locals hold [type, value] pairs.
@@ -721,7 +722,7 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
         trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
         # The trace opens with the `ledger` baseline record, so find the call frame rather
         # than assuming it is first.
-        entry = next(record for record in trace if record.get('instr') == ['callContract'])
+        entry = next(record for record in trace if record.get('kind') == 'callContract')
         assert entry['function'] == func
         assert [scval_from_json(arg) for arg in entry['args']] == args
 
@@ -767,7 +768,7 @@ def test_call_tx_with_composite_args(server: StellarRpcServer) -> None:
         trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
         # A composite argument is allocated as a host object first, so the callContract
         # frame is not necessarily trace[0] (unlike the scalar-only case): find it.
-        entry = next(record for record in trace if record.get('instr') == ['callContract'])
+        entry = next(record for record in trace if record.get('kind') == 'callContract')
         assert entry['function'] == func
         assert [scval_from_json(arg) for arg in entry['args']] == args
 
@@ -1905,15 +1906,14 @@ def test_trace_transaction_served_from_file_without_interpreter(server: StellarR
     contract_id = 'ab' * 32
     # The stored records as written to disk: the server adds the per-record ``executingContract``
     # tag on the serve path, so the on-disk records carry no ``executingContract`` field of their own.
-    records = [
+    records: list[dict[str, Any]] = [
         {
-            'pos': 0,
-            'instr': ['callContract'],
+            'kind': 'callContract',
             'function': 'f',
             'to': {'type': 'address', 'addrType': 'contract', 'value': contract_id},
         },
-        {'pos': 1, 'instr': ['const', 'i32', 1]},
-        {'pos': None, 'instr': ['endWasm'], 'success': True},
+        {'kind': 'instr', 'pos': 1, 'instr': ['const', 'i32', 1]},
+        {'kind': 'endWasm', 'success': True},
     ]
     (server.io_dir / 'traces' / f'trace_{tx_hash}.jsonl').write_text('\n'.join(json.dumps(r) for r in records) + '\n')
 
@@ -1970,10 +1970,10 @@ def test_trace_transaction_missing_file_returns_null_without_interpreter(server:
 # already carry to name their storage-target contract.
 #
 # Reconstruction walks the records maintaining a stack of contract ids:
-#   * callContract (instr[0] == 'callContract'): PUSH to.value; the record itself is tagged with
+#   * callContract (kind == 'callContract'): PUSH to.value; the record itself is tagged with
 #     that pushed callee.
-#   * any exit marker (instr[0].startswith('endWasm') — success ``endWasm`` and trap
-#     ``endWasm-error`` alike): tag the record with the CURRENT top, THEN pop.
+#   * an exit marker (kind == 'endWasm', emitted for a normal return and a trap alike — the two
+#     differ only in its ``success`` field): tag the record with the CURRENT top, THEN pop.
 #   * every other record: tag with the current top.
 #   * before any callContract (empty stack): tag ``None``.
 # The root callContract may never close (execution can end mid-call); its span simply runs to
@@ -1992,8 +1992,7 @@ _CONTRACT_C = 'c3' * 32
 def _call_record(to: str, *, function: str = 'f', depth: int = 1) -> dict[str, Any]:
     """A ``callContract`` boundary marker targeting contract ``to`` (verbatim in ``to.value``)."""
     return {
-        'pos': None,
-        'instr': ['callContract'],
+        'kind': 'callContract',
         'from': {'type': 'address', 'addrType': 'account', 'value': 'G' + 'A' * 55},
         'to': {'type': 'address', 'addrType': 'contract', 'value': to},
         'function': function,
@@ -2005,17 +2004,29 @@ def _call_record(to: str, *, function: str = 'f', depth: int = 1) -> dict[str, A
 
 def _instr_record(pos: int) -> dict[str, Any]:
     """A plain WebAssembly instruction record."""
-    return {'pos': pos, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}, 'mem': None}
+    return {
+        'kind': 'instr',
+        'pos': pos,
+        'instr': ['const', 'i32', 1048576],
+        'stack': [],
+        'locals': {},
+        'mem': None,
+        'globals': {},
+    }
 
 
 def _end_record(*, depth: int = 1) -> dict[str, Any]:
     """A success ``endWasm`` exit marker."""
-    return {'pos': None, 'instr': ['endWasm'], 'success': True, 'depth': depth, 'result': {'type': 'void'}}
+    return {'kind': 'endWasm', 'success': True, 'depth': depth, 'result': {'type': 'void'}}
 
 
 def _end_error_record(*, depth: int = 1) -> dict[str, Any]:
-    """A trap ``endWasm-error`` exit marker (still a pop; keys only on the ``endWasm`` prefix)."""
-    return {'pos': None, 'instr': ['endWasm-error'], 'success': False, 'depth': depth}
+    """A trap exit marker: the same ``endWasm`` kind, reporting ``success: false``.
+
+    komet emits one record kind for both outcomes, so the pop must key on ``kind`` alone and
+    ignore ``success`` — a trap closes its call exactly as a normal return does.
+    """
+    return {'kind': 'endWasm', 'success': False, 'depth': depth, 'result': {'type': 'error'}}
 
 
 def _contract_data_record(target: str, *, args: list[dict[str, Any]] | None = None) -> dict[str, Any]:
@@ -2023,13 +2034,14 @@ def _contract_data_record(target: str, *, args: list[dict[str, Any]] | None = No
 
     Per the trace METADATA it carries a DOCUMENTED top-level ``contract`` field: an ADDRESS OBJECT
     naming the storage-TARGET contract — not a string, and not the executing contract. It is NOT a
-    call-boundary marker (``instr[0] == 'contractData'``), so it must leave the reconstruction stack
+    call-boundary marker (``kind == 'contractData'``), so it must leave the reconstruction stack
     untouched. The serve-path annotation must preserve this ``contract`` object verbatim and add its
     own ``executingContract`` string under the distinct key.
     """
     return {
-        'pos': None,
-        'instr': ['contractData', 'put', 'temporary'],
+        'kind': 'contractData',
+        'operation': 'put',
+        'durability': 'temporary',
         'contract': {'type': 'address', 'addrType': 'contract', 'value': target},
         'args': args if args is not None else [{'type': 'symbol', 'value': 'foo'}, {'type': 'u32', 'value': 123456789}],
     }
@@ -2098,8 +2110,8 @@ def test_trace_contract_annotation_nested_balanced(server: StellarRpcServer) -> 
 
 
 def test_trace_contract_annotation_trap_exit_pops(server: StellarRpcServer) -> None:
-    """A trap exit (``endWasm-error``) pops the callee just like a success ``endWasm``: the pop
-    keys on ``instr[0].startswith('endWasm')``. B's span — including the trapping record itself —
+    """A trap exit pops the callee just like a normal return: both are ``kind: "endWasm"`` and the
+    pop keys on that alone, never on ``success``. B's span — including the trapping record itself —
     is tagged B, and records after it fall back to the caller A.
     """
     records = [
@@ -2253,8 +2265,8 @@ def test_trace_contract_annotation_sibling_root_calls(server: StellarRpcServer) 
 
 def test_trace_contract_annotation_marker_lookalike_arg_is_not_a_marker(server: StellarRpcServer) -> None:
     """False-positive guard: a ``contractData`` record whose ``args`` contains a symbol VALUE literally
-    equal to a marker mnemonic (``endWasm``) is NOT a boundary marker — classification keys on
-    ``instr[0] == 'contractData'``, never on payload substrings. The stack stays untouched, a following
+    equal to a marker mnemonic (``endWasm``) is NOT a boundary marker — classification keys on the
+    record's own ``kind``, never on payload substrings. The stack stays untouched, a following
     instruction is still tagged with the current contract, and the record keeps its own storage-target
     ``contract`` object while also gaining ``executingContract``.
     """

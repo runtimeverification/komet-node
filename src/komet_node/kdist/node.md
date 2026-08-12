@@ -524,8 +524,10 @@ komet's `moduleGlobals` faces the same restriction and sidesteps it by reading t
 ```
 
 `generateLedgerTrace` builds the record: the ledger scalars plus every account's balance. It
-follows the same shape as komet's record builders (`pos` and an `instr` tag naming the event),
-so a consumer reads it off the same two fields as every other line in the file.
+follows the same convention as komet's record builders — a `kind` field naming the record,
+then fields shaped for that record alone — so a consumer dispatches on the same field as for
+every other line in the file. It carries no `pos`, like komet's other non-instruction records:
+the baseline does not come from any position in a binary.
 
 `contracts` and `codes` are reserved for the contract-instance and uploaded-code metadata
 (wasm hash, instance/code TTLs); they are emitted empty for now, and a consumer must treat an
@@ -536,8 +538,7 @@ empty list as "not reported" rather than "none exist".
  // ---------------------------------------------------------------------------------------------
     rule generateLedgerTrace(SEQ, TS, ACCTS)
       => {
-          "pos"       : null ,
-          "instr"     : [ "ledger" ] ,
+          "kind"      : "ledger" ,
           "sequence"  : SEQ ,
           "timestamp" : TS ,
           "accounts"  : [ AccountBalances2JSONs(ACCTS) ] ,

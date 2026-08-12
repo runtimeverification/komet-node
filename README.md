@@ -123,7 +123,7 @@ curl -s http://localhost:8000 -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","id":1,"method":"traceTransaction","params":{"hash":"c7099cbe10a9bfa1cdf9c9d368e1e1c932f535a70e4403b7aa409ce19fc36805"}}'
 ```
 
-`traceTransaction` returns the stored trace as its result: a JSON array with one record per executed WebAssembly instruction.
+`traceTransaction` returns the stored trace as its result: a JSON array of records, one per executed WebAssembly instruction plus the higher-level records described below. Every record carries a `kind` field naming what it is, so a consumer dispatches on that one field without inspecting the rest of the record's shape.
 
 ```jsonc
 {
@@ -131,63 +131,78 @@ curl -s http://localhost:8000 -H 'Content-Type: application/json' \
   "id": 1,
   "result": [
     {
-      "pos": null, "instr": ["callContract"],
+      "kind": "ledger", "sequence": 4, "timestamp": 0,
+      "accounts": [{"account": {"type": "address", "addrType": "account", "value": "03a107bf…"}, "balance": 10000000000}],
+      "contracts": [], "codes": [], "executingContract": null
+    },
+    {
+      "kind": "callContract",
       "from": {"type": "address", "addrType": "account",  "value": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"},
       "to":   {"type": "address", "addrType": "contract", "value": "6a20fec1a9081773a5f23ce370f925f236346e510438ddd6d40f6b2711c134e0"},
-      "function": "foo", "args":[], "depth":1, "storage":[]
+      "function": "foo", "args":[], "depth":1, "storage":[],
+      "executingContract": "6a20fec1a9081773a5f23ce370f925f236346e510438ddd6d40f6b2711c134e0"
     },
-    {"pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null},
-    {"pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null},
-    {"pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null},
-    {"pos": null, "instr": ["block"],                 "stack": [], "locals": {}, "mem": null},
-    {"pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}, "mem": null},
-    {"pos": null, "instr": ["endWasm"], "success":true, "depth":1, "result": {"type": "void"}}
+    {"kind": "instr", "pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {},                                       "executingContract": "6a20fec1…"},
+    {"kind": "instr", "pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576]},                  "executingContract": "6a20fec1…"},
+    {"kind": "instr", "pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576], "1": ["i32", 1048576]}, "executingContract": "6a20fec1…"},
+    {"kind": "instr", "pos": null, "instr": ["block"],                 "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576], "1": ["i32", 1048576], "2": ["i32", 1048576]}, "executingContract": "6a20fec1…"},
+    {"kind": "instr", "pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576], "1": ["i32", 1048576], "2": ["i32", 1048576]}, "executingContract": "6a20fec1…"},
+    {"kind": "endWasm", "success": true, "depth": 1, "result": {"type": "void"}, "executingContract": "6a20fec1…"}
   ]
 }
 ```
 
-A trace can contain five kinds of records:
- 
+A `…` marks an abbreviated contract id; the real records carry it in full.
+
+A trace can contain six kinds of records:
+
+- `ledger`
 - `callContract`
-- Wasm instruction records
+- Wasm instruction records (`kind: "instr"`)
 - `hostCall`
 - `contractData`
 - `endWasm`
 
-The example above only has three of these: `callContract`, instruction records, and `endWasm`. `foo()` doesn't touch storage or call any host functions, so no `contractData` or `hostCall` records show up.
- 
+The example above only has four of these: `ledger`, `callContract`, instruction records, and `endWasm`. `foo()` doesn't touch storage or call any host functions, so no `contractData` or `hostCall` records show up.
+
 Here's what each record type carries:
- 
+
+- `ledger`: written once, as the trace's first record, before any step runs. Gives the ledger sequence and timestamp and every account's balance, so a consumer can seed its view of chain state and replay what follows on top of it rather than seeing only the parts a contract happened to touch. `contracts` and `codes` are reserved for contract-instance and uploaded-code metadata and are currently always empty — read an empty list as "not reported" rather than "none exist". This is the one record komet-node emits itself; the rest come from komet.
 - `callContract`: logged for each contract call in the transaction, including contract-to-contract calls. Records the caller, the callee, the function name, the arguments, the call depth, and the callee's storage before the call runs.
-- Instruction records: logged at each WebAssembly instruction's entry. `pos` is the instruction's byte offset in the binary (`null` for synthetic instructions), `instr` is the instruction and its operands, and `stack`/`locals` are the value stack and locals as `[type, value]` pairs. `mem` is a snapshot of linear memory as a list of `{addr, bytes}` runs, emitted only when memory changed since the previous record and `null` otherwise (reuse the most recent snapshot).
-- `hostCall`: logged when the contract calls a host function. `instr` gives `["hostCall", moduleId, functionId]`, identifying which host function ran. `locals` holds the function's arguments, indexed by position. Host calls don't use the stack, so `stack` is absent.
+- Instruction records: logged at each WebAssembly instruction's entry. `pos` is the instruction's byte offset in the binary (`null` for synthetic instructions), `instr` is the instruction and its operands, and `stack`/`locals` are the value stack and locals as `[type, value]` pairs. `mem` is a snapshot of linear memory as a list of `{addr, bytes}` runs, emitted only when memory changed since the previous record and `null` otherwise (reuse the most recent snapshot). `globals` is the executing module's WebAssembly globals keyed by module-relative index; unlike `mem` it is repeated in full on every record and is never `null`.
+- `hostCall`: logged when the contract calls a host function. `module` and `function` identify which host function ran. `locals` holds the function's arguments, indexed by position. Host calls don't use the stack, so `stack` is absent.
   Here's a `hostCall` record for a call to `put_contract_data`, module id `l`, function id `_`:
 ```jsonc
   {
-    "pos": null,
-    "instr": ["hostCall", "l", "_"],
+    "kind": "hostCall",
+    "module": "l",
+    "function": "_",
     "locals": {"2": ["i64",0], "1": ["i64",530242871224172548], "0": ["i64",45954062]}
   }
 ```
- 
-- `contractData`: logged for storage updates. Gives the contract and the storage type (`instance`, `persistent`, or `temporary`). A `put` carries the key and value as its two args; a `del` carries only the key.
+
+- `contractData`: logged for storage updates. Gives the contract, the `operation` (`put` or `del`) and the `durability` (`instance`, `persistent`, or `temporary`). A `put` carries the key and value as its two args; a `del` carries only the key.
   Here's a `contractData` record for a `put`, followed by a `del` on the same key:
 ```jsonc
   {
-    "pos": null,
-    "instr": ["contractData", "put", "temporary"],
+    "kind": "contractData",
+    "operation": "put",
+    "durability": "temporary",
     "contract": {"type": "address", "addrType": "contract", "value": "746573742d7363"},
     "args": [{"type": "symbol", "value": "foo"}, {"type": "u32", "value": 123456789}]
   }
   {
-    "pos": null,
-    "instr": ["contractData", "del", "temporary"],
+    "kind": "contractData",
+    "operation": "del",
+    "durability": "temporary",
     "contract": {"type": "address", "addrType": "contract", "value": "746573742d7363"},
     "args": [{"type": "symbol", "value": "foo"}]
   }
 ```
- 
-- `endWasm`: logged once at the end of a call. Records whether the call succeeded, its depth, and its result.
+
+- `endWasm`: logged once at the end of a call, for a normal return and a trap alike. Records whether the call succeeded, its depth, and its result.
+
+Every served record additionally carries `executingContract`: the contract whose code is executing at that record, or `null` before the first `callContract`. komet-node adds this field when serving the trace — it is not in the stored file — so a consumer can map a record's `pos` against the right contract binary, since a callee's small `pos` values would otherwise collide with its caller's.
 
 
 

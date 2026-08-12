@@ -414,11 +414,11 @@ class StellarRpcServer:
         markers by walking a stack of contract ids (the debug adapter needs it because a callee's
         small ``pos`` values collide with the caller's and must be mapped against the right binary):
 
-          * a ``callContract`` record (``instr[0] == 'callContract'``) PUSHes ``to.value`` before
+          * a ``callContract`` record (``kind == 'callContract'``) PUSHes ``to.value`` before
             tagging, so the record and its whole callee span are tagged with the callee;
-          * an exit marker (``instr[0]`` starting with ``'endWasm'`` — success ``endWasm`` and trap
-            ``endWasm-error`` alike) is tagged with the current top, THEN pops (guarded against
-            underflow);
+          * an ``endWasm`` record (``kind == 'endWasm'``, emitted for a normal return and a trap
+            alike — the two differ only in its ``success`` field) is tagged with the current top,
+            THEN pops (guarded against underflow);
           * every other record is tagged with the current top, or JSON ``null`` when the stack is
             empty (records before any ``callContract``).
 
@@ -451,12 +451,14 @@ class StellarRpcServer:
         ``"contract"`` would duplicate and clobber it — ``executingContract`` avoids the collision.
 
         Boundary detection is cheap: a line is ``json.loads``-parsed only when it contains the
-        substring ``"callContract"`` or ``"endWasm`` (a handful of lines out of the whole trace) —
-        confirmed against the parsed ``instr[0]``; every other line is tagged with the current top
-        of stack without being parsed. The stack holds contract-id strings; an empty stack tags a
+        substring ``"callContract"`` or ``"endWasm"`` (a handful of lines out of the whole trace) —
+        confirmed against the parsed ``kind``; every other line is tagged with the current top of
+        stack without being parsed. The substring test alone is not enough: a record can carry
+        either word as data (a stored symbol, say), which is why the candidate is confirmed against
+        ``kind`` rather than trusted. The stack holds contract-id strings; an empty stack tags a
         record with JSON ``null``. A ``callContract`` record's callee id is read defensively (a
         malformed record missing ``to``/``value`` pushes ``None`` rather than raising and 500-ing
-        the served file), so push/pop balance with the ``endWasm*`` markers is preserved and the
+        the served file), so push/pop balance with the ``endWasm`` markers is preserved and the
         malformed span is simply tagged ``executingContract: null``. The tag is injected before the
         record's closing brace so the original bytes survive verbatim; a line that does not end in
         ``}`` (never a valid JSONL record) is left untouched.
@@ -466,20 +468,18 @@ class StellarRpcServer:
             if not line:
                 continue
             pop_after = False
-            # Only parse boundary CANDIDATES: 'callContract' opens a call, 'endWasm'/'endWasm-error'
-            # close one. Both endWasm spellings share the '"endWasm' prefix.
-            if '"callContract"' in line or '"endWasm' in line:
+            # Only parse boundary CANDIDATES: 'callContract' opens a call, 'endWasm' closes one.
+            if '"callContract"' in line or '"endWasm"' in line:
                 record = json.loads(line)
-                instr = record.get('instr') if isinstance(record, dict) else None
-                op = instr[0] if isinstance(instr, list) and instr else None
-                if op == 'callContract':
+                kind = record.get('kind') if isinstance(record, dict) else None
+                if kind == 'callContract':
                     # Push before tagging: this record and its callee span carry the callee.
                     # Read 'to.value' defensively so a malformed record still pushes (as None),
-                    # keeping push/pop balance with the endWasm* markers intact.
+                    # keeping push/pop balance with the endWasm markers intact.
                     to = record.get('to')
                     addr = to.get('value') if isinstance(to, dict) else None
                     stack.append(addr)
-                elif isinstance(op, str) and op.startswith('endWasm'):
+                elif kind == 'endWasm':
                     # Tag with the finishing callee (still on top), then pop after tagging.
                     pop_after = True
             top = stack[-1] if stack else None

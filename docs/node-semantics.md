@@ -189,11 +189,12 @@ Tracing is always on. Before running the steps, `#enableTrace` clears the transa
 **Trace format** (one JSON record per line):
 
 ```json
-{"pos": 597, "instr": ["local.get", 0], "stack": [["i64", 4]], "locals": {"0": ["i64", 4]}, "mem": null}
+{"kind": "instr", "pos": 597, "instr": ["local.get", 0], "stack": [["i64", 4]], "locals": {"0": ["i64", 4]}, "mem": null}
 ```
 
 | Field | Description |
 |---|---|
+| `kind` | Names the record; always `"instr"` for an instruction record. Every trace record carries one, so a consumer dispatches on this field alone |
 | `pos` | Byte offset of the instruction in the binary, or `null` for synthetic instructions |
 | `instr` | Instruction name and operands as a JSON array |
 | `stack` | Value stack at instruction entry, as `[type, value]` pairs |
@@ -206,7 +207,7 @@ Instruction records are one of several trace record kinds (`ledger`, `callContra
 **The ledger baseline record.** `#traceLedger` writes one `ledger` record as the trace's first line, before any step runs:
 
 ```json
-{"pos": null, "instr": ["ledger"], "sequence": 3, "timestamp": 0,
+{"kind": "ledger", "sequence": 3, "timestamp": 0,
  "accounts": [{"account": {"type": "address", "addrType": "account", "value": "6964b7…"}, "balance": 10000000000}],
  "contracts": [], "codes": []}
 ```
