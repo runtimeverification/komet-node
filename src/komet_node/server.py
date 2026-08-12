@@ -22,7 +22,7 @@ from komet_node.scval import scval_from_json
 from komet_node.transaction import SimulationRejected, malformed_tx_result_xdr
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping
+    from collections.abc import Mapping
     from http.server import HTTPServer as HTTPServerType
     from pathlib import Path
 
@@ -409,23 +409,12 @@ class StellarRpcServer:
         remaining tail once per line, which is O(n^2) in time and memory and OOM-killed the
         interpreter on multi-hundred-MB traces. Hash validation mirrors the read-only path.
 
-        Each served record is additionally stamped with an ``"executingContract"`` field naming the
-        contract whose code is executing at that record, reconstructed from the trace's own call-boundary
-        markers by walking a stack of contract ids (the debug adapter needs it because a callee's
-        small ``pos`` values collide with the caller's and must be mapped against the right binary):
-
-          * a ``callContract`` record (``kind == 'callContract'``) PUSHes ``to.value`` before
-            tagging, so the record and its whole callee span are tagged with the callee;
-          * an ``endWasm`` record (``kind == 'endWasm'``, emitted for a normal return and a trap
-            alike — the two differ only in its ``success`` field) is tagged with the current top,
-            THEN pops (guarded against underflow);
-          * every other record is tagged with the current top, or JSON ``null`` when the stack is
-            empty (records before any ``callContract``).
-
-        The root ``callContract`` may have no matching ``endWasm``; its span simply runs to the end.
-        The annotation is byte-preserving: original record bytes are untouched (the tag is injected
-        before the closing brace) and only the handful of boundary-candidate lines are ever parsed,
-        so peak memory stays proportional to the trace size — the property this path exists to keep.
+        The records are passed through verbatim, so the served array is exactly the stored file.
+        Anything a consumer can derive from the trace is left to the consumer: the debug adapter
+        needs to know which contract is executing at each record, for instance, but a
+        ``callContract`` names its callee and an ``endWasm`` closes it, so that is a fold over
+        records it already walks — tagging every record here would only duplicate derivable data
+        on the one path whose whole purpose is to keep memory proportional to the trace.
         """
         tx_hash = params.get('hash')
         if not isinstance(tx_hash, str):
@@ -436,60 +425,8 @@ class StellarRpcServer:
         if not trace_file.is_file():
             return '{"jsonrpc":"2.0","id":' + json.dumps(request_id) + ',"result":null}'
         text = trace_file.read_text()
-        body = ','.join(self._annotate_trace_lines(text.split('\n')))
+        body = ','.join(line for line in (raw.strip() for raw in text.split('\n')) if line)
         return '{"jsonrpc":"2.0","id":' + json.dumps(request_id) + ',"result":[' + body + ']}'
-
-    @staticmethod
-    def _annotate_trace_lines(lines: Iterable[str]) -> Iterator[str]:
-        """Yield each non-empty trace line with an ``"executingContract"`` tag injected, tracking
-        the call-boundary stack across the whole trace. See :meth:`_trace_transaction` for the
-        rules.
-
-        The tag is deliberately named ``executingContract`` rather than ``contract``: a
-        ``contractData`` trace record already carries its own documented top-level ``"contract"``
-        field (an address object naming the storage-target contract), so injecting our own
-        ``"contract"`` would duplicate and clobber it — ``executingContract`` avoids the collision.
-
-        Boundary detection is cheap: a line is ``json.loads``-parsed only when it contains the
-        substring ``"callContract"`` or ``"endWasm"`` (a handful of lines out of the whole trace) —
-        confirmed against the parsed ``kind``; every other line is tagged with the current top of
-        stack without being parsed. The substring test alone is not enough: a record can carry
-        either word as data (a stored symbol, say), which is why the candidate is confirmed against
-        ``kind`` rather than trusted. The stack holds contract-id strings; an empty stack tags a
-        record with JSON ``null``. A ``callContract`` record's callee id is read defensively (a
-        malformed record missing ``to``/``value`` pushes ``None`` rather than raising and 500-ing
-        the served file), so push/pop balance with the ``endWasm`` markers is preserved and the
-        malformed span is simply tagged ``executingContract: null``. The tag is injected before the
-        record's closing brace so the original bytes survive verbatim; a line that does not end in
-        ``}`` (never a valid JSONL record) is left untouched.
-        """
-        stack: list[str | None] = []
-        for line in lines:
-            if not line:
-                continue
-            pop_after = False
-            # Only parse boundary CANDIDATES: 'callContract' opens a call, 'endWasm' closes one.
-            if '"callContract"' in line or '"endWasm"' in line:
-                record = json.loads(line)
-                kind = record.get('kind') if isinstance(record, dict) else None
-                if kind == 'callContract':
-                    # Push before tagging: this record and its callee span carry the callee.
-                    # Read 'to.value' defensively so a malformed record still pushes (as None),
-                    # keeping push/pop balance with the endWasm markers intact.
-                    to = record.get('to')
-                    addr = to.get('value') if isinstance(to, dict) else None
-                    stack.append(addr)
-                elif kind == 'endWasm':
-                    # Tag with the finishing callee (still on top), then pop after tagging.
-                    pop_after = True
-            top = stack[-1] if stack else None
-            stripped = line.rstrip()
-            if stripped.endswith('}'):
-                yield stripped[:-1] + ',"executingContract":' + json.dumps(top) + '}'
-            else:
-                yield line
-            if pop_after and stack:  # guard against underflow on an unmatched exit marker
-                stack.pop()
 
     def _read_only_envelope(
         self, method: str | None, params: dict[str, Any], request_id: Any, now: str

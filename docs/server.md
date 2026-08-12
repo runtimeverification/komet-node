@@ -189,11 +189,11 @@ Failures are reported in the result body, matching real stellar-rpc; only an und
 
 ```json
 [
-  {"kind": "instr", "pos": 3, "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {}, "executingContract": "6a20fec1…"}
+  {"kind": "instr", "pos": 3, "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {}}
 ]
 ```
 
-The server reads the stored file and streams it back in one linear pass, adding an `executingContract` field to each record: the contract whose code is executing there, tracked across the trace's `callContract`/`endWasm` boundaries, or `null` before the first `callContract`. A consumer needs it to map a record's `pos` against the right contract binary, since a callee's small `pos` values collide with its caller's. The field is named `executingContract` rather than `contract` because `contractData` records already carry a `contract` field of their own.
+The server reads the stored file and streams it back in one linear pass, passing each record through verbatim: the served array is exactly the trace file. It derives nothing, by design — a trace runs to hundreds of megabytes, so anything a consumer can compute for itself should not be duplicated per record here. Which contract is executing at a given record is the standing example: a `callContract` names its callee and an `endWasm` closes it, so the debug adapter folds it out of boundaries it already walks.
 
 ### `getTransaction`
 

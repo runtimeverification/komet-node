@@ -564,12 +564,7 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
     assert entry['from']['addrType'] == 'account'
     assert entry['to']['addrType'] == 'contract'
 
-    # Every record is stamped with the contract whose code is executing: here a single deployed
-    # contract runs the whole trace, so that id (the callContract's callee) tags every record.
-    contract_id = entry['to']['value']
-
-    # The executed WebAssembly instructions, exactly as shown in the README, each tagged with the
-    # executing contract.
+    # The executed WebAssembly instructions, exactly as shown in the README.
     # The first three records EVALUATE the module's global initialisers. A global is allocated
     # only once its own initialiser has run, so each of these sees exactly the globals declared
     # before it: none, then one, then two. By the time the function frame runs all three are
@@ -584,7 +579,6 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'locals': {},
             'mem': None,
             'globals': {},
-            'executingContract': contract_id,
         },
         {
             'kind': 'instr',
@@ -594,7 +588,6 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'locals': {},
             'mem': None,
             'globals': {'0': ['i32', 1048576]},
-            'executingContract': contract_id,
         },
         {
             'kind': 'instr',
@@ -604,7 +597,6 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'locals': {},
             'mem': None,
             'globals': {'0': ['i32', 1048576], '1': ['i32', 1048576]},
-            'executingContract': contract_id,
         },
         {
             'kind': 'instr',
@@ -614,7 +606,6 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'locals': {},
             'mem': None,
             'globals': initialised,
-            'executingContract': contract_id,
         },
         {
             'kind': 'instr',
@@ -624,7 +615,6 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
             'locals': {},
             'mem': None,
             'globals': initialised,
-            'executingContract': contract_id,
         },
     ]
 
@@ -635,7 +625,6 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
     assert exit_frame['success'] is True
     assert exit_frame['result'] == {'type': 'void'}
     assert exit_frame['depth'] == 1
-    assert exit_frame['executingContract'] == contract_id
 
 
 def test_trace_records_have_expected_structure_and_reflect_arguments(server: StellarRpcServer) -> None:
@@ -681,7 +670,7 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
     instr_records = [record for record in trace if record['kind'] == 'instr']
     assert instr_records
     for record in instr_records:
-        assert set(record) == {'kind', 'pos', 'instr', 'stack', 'locals', 'mem', 'globals', 'executingContract'}
+        assert set(record) == {'kind', 'pos', 'instr', 'stack', 'locals', 'mem', 'globals'}
         assert record['pos'] is None or isinstance(record['pos'], int)
         # mem is null when linear memory is unchanged since the previous record, else a list of runs.
         assert record['mem'] is None or isinstance(record['mem'], list)
@@ -1901,11 +1890,13 @@ def test_trace_transaction_served_from_file_without_interpreter(server: StellarR
     semantics instead made the interpreter join the lines with a recursive per-line tail-copy —
     O(n^2) in time and memory — which OOM-killed the interpreter on multi-hundred-MB traces. This
     test pins the record content AND that no interpreter subprocess is spawned to serve the trace.
+
+    The records are served VERBATIM — the array is exactly the stored file, field for field. The
+    server derives nothing and adds nothing; a consumer that wants, say, the contract executing at
+    each record folds it out of the `callContract`/`endWasm` boundaries itself.
     """
     tx_hash = 'a' * 64
     contract_id = 'ab' * 32
-    # The stored records as written to disk: the server adds the per-record ``executingContract``
-    # tag on the serve path, so the on-disk records carry no ``executingContract`` field of their own.
     records: list[dict[str, Any]] = [
         {
             'kind': 'callContract',
@@ -1916,11 +1907,6 @@ def test_trace_transaction_served_from_file_without_interpreter(server: StellarR
         {'kind': 'endWasm', 'success': True},
     ]
     (server.io_dir / 'traces' / f'trace_{tx_hash}.jsonl').write_text('\n'.join(json.dumps(r) for r in records) + '\n')
-
-    # Every served record is stamped with the executing contract, reconstructed from the
-    # call-boundary markers: the callContract pushes contract_id, so the whole single-call span
-    # (call frame, the instruction, and the closing endWasm) is tagged with it.
-    expected = [{**record, 'executingContract': contract_id} for record in records]
 
     calls: list[Any] = []
     original_run = server.interpreter.run
@@ -1935,7 +1921,7 @@ def test_trace_transaction_served_from_file_without_interpreter(server: StellarR
     finally:
         server.interpreter.run = original_run  # type: ignore[method-assign]
 
-    assert response['result'] == expected
+    assert response['result'] == records
     assert calls == [], 'traceTransaction must not invoke the interpreter'
 
 
@@ -1956,331 +1942,3 @@ def test_trace_transaction_missing_file_returns_null_without_interpreter(server:
 
     assert response['result'] is None
     assert calls == [], 'traceTransaction must not invoke the interpreter'
-
-
-# ---------------------------------------------------------------------------
-# Per-record contract annotation on the file-serve path
-#
-# traceTransaction stamps every served record with an ``executingContract`` field naming the
-# contract whose code is executing at that record, reconstructed from the trace's own
-# call-boundary markers (no interpreter involvement). The debug adapter needs this because a
-# callee's small ``pos`` values collide with the caller's and must be mapped against the right
-# binary. The field is deliberately named ``executingContract`` (not ``contract``) so it never
-# collides with the DOCUMENTED top-level ``contract`` address object that ``contractData`` records
-# already carry to name their storage-target contract.
-#
-# Reconstruction walks the records maintaining a stack of contract ids:
-#   * callContract (kind == 'callContract'): PUSH to.value; the record itself is tagged with
-#     that pushed callee.
-#   * an exit marker (kind == 'endWasm', emitted for a normal return and a trap alike — the two
-#     differ only in its ``success`` field): tag the record with the CURRENT top, THEN pop.
-#   * every other record: tag with the current top.
-#   * before any callContract (empty stack): tag ``None``.
-# The root callContract may never close (execution can end mid-call); its span simply runs to
-# the end of the trace.
-#
-# These tests are HERMETIC: they write a synthetic ``traces/trace_<hash>.jsonl`` and serve it
-# directly through ``server.handle_rpc`` — no wat2wasm, no interpreter subprocess.
-# ---------------------------------------------------------------------------
-
-# Distinct 64-hex contract ids standing in for real callee contract ids.
-_CONTRACT_A = 'a1' * 32
-_CONTRACT_B = 'b2' * 32
-_CONTRACT_C = 'c3' * 32
-
-
-def _call_record(to: str, *, function: str = 'f', depth: int = 1) -> dict[str, Any]:
-    """A ``callContract`` boundary marker targeting contract ``to`` (verbatim in ``to.value``)."""
-    return {
-        'kind': 'callContract',
-        'from': {'type': 'address', 'addrType': 'account', 'value': 'G' + 'A' * 55},
-        'to': {'type': 'address', 'addrType': 'contract', 'value': to},
-        'function': function,
-        'args': [],
-        'depth': depth,
-        'storage': [],
-    }
-
-
-def _instr_record(pos: int) -> dict[str, Any]:
-    """A plain WebAssembly instruction record."""
-    return {
-        'kind': 'instr',
-        'pos': pos,
-        'instr': ['const', 'i32', 1048576],
-        'stack': [],
-        'locals': {},
-        'mem': None,
-        'globals': {},
-    }
-
-
-def _end_record(*, depth: int = 1) -> dict[str, Any]:
-    """A success ``endWasm`` exit marker."""
-    return {'kind': 'endWasm', 'success': True, 'depth': depth, 'result': {'type': 'void'}}
-
-
-def _end_error_record(*, depth: int = 1) -> dict[str, Any]:
-    """A trap exit marker: the same ``endWasm`` kind, reporting ``success: false``.
-
-    komet emits one record kind for both outcomes, so the pop must key on ``kind`` alone and
-    ignore ``success`` — a trap closes its call exactly as a normal return does.
-    """
-    return {'kind': 'endWasm', 'success': False, 'depth': depth, 'result': {'type': 'error'}}
-
-
-def _contract_data_record(target: str, *, args: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """A ``contractData`` storage record (emitted on any storage put/del).
-
-    Per the trace METADATA it carries a DOCUMENTED top-level ``contract`` field: an ADDRESS OBJECT
-    naming the storage-TARGET contract — not a string, and not the executing contract. It is NOT a
-    call-boundary marker (``kind == 'contractData'``), so it must leave the reconstruction stack
-    untouched. The serve-path annotation must preserve this ``contract`` object verbatim and add its
-    own ``executingContract`` string under the distinct key.
-    """
-    return {
-        'kind': 'contractData',
-        'operation': 'put',
-        'durability': 'temporary',
-        'contract': {'type': 'address', 'addrType': 'contract', 'value': target},
-        'args': args if args is not None else [{'type': 'symbol', 'value': 'foo'}, {'type': 'u32', 'value': 123456789}],
-    }
-
-
-def _serve_trace(server: StellarRpcServer, records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[Any]]:
-    """Write ``records`` as the trace JSONL for a fresh hash, serve it through ``handle_rpc``, and
-    return ``(served_result, interpreter_calls)``. The interpreter's ``run`` is spied so callers
-    can assert the annotation happens purely on the file-serve path."""
-    tx_hash = 'f' * 64
-    (server.io_dir / 'traces' / f'trace_{tx_hash}.jsonl').write_text('\n'.join(json.dumps(r) for r in records) + '\n')
-
-    calls: list[Any] = []
-    original_run = server.interpreter.run
-
-    def _spy(*args: Any, **kwargs: Any) -> Any:
-        calls.append(args)
-        return original_run(*args, **kwargs)
-
-    server.interpreter.run = _spy  # type: ignore[method-assign]
-    try:
-        response = json.loads(server.handle_rpc('traceTransaction', {'hash': tx_hash}))
-    finally:
-        server.interpreter.run = original_run  # type: ignore[method-assign]
-
-    return response['result'], calls
-
-
-def test_trace_contract_annotation_nested_balanced(server: StellarRpcServer) -> None:
-    """Nested balanced calls: the root A never closes, while B and C each open and close. Each
-    record is tagged with the contract executing at that point; a callee's span (its own
-    callContract through its endWasm inclusive) is tagged with the callee, and control returns to
-    the caller after the pop.
-    """
-    records = [
-        _call_record(_CONTRACT_A),  # push A  -> A
-        _instr_record(1),  #         -> A
-        _call_record(_CONTRACT_B),  # push B  -> B
-        _instr_record(2),  #         -> B
-        _end_record(),  # top B, pop -> B
-        _instr_record(3),  #         -> A (back in the caller)
-        _call_record(_CONTRACT_C),  # push C  -> C
-        _instr_record(4),  #         -> C
-        _end_record(),  # top C, pop -> C
-        _instr_record(5),  #         -> A (root still open, runs to the end)
-    ]
-    expected = [
-        _CONTRACT_A,
-        _CONTRACT_A,
-        _CONTRACT_B,
-        _CONTRACT_B,
-        _CONTRACT_B,
-        _CONTRACT_A,
-        _CONTRACT_C,
-        _CONTRACT_C,
-        _CONTRACT_C,
-        _CONTRACT_A,
-    ]
-
-    result, _calls = _serve_trace(server, records)
-
-    assert [record['executingContract'] for record in result] == expected
-    # The annotation is additive: every original field of each record survives verbatim.
-    for served, original in zip(result, records, strict=True):
-        assert {key: served[key] for key in original} == original
-
-
-def test_trace_contract_annotation_trap_exit_pops(server: StellarRpcServer) -> None:
-    """A trap exit pops the callee just like a normal return: both are ``kind: "endWasm"`` and the
-    pop keys on that alone, never on ``success``. B's span — including the trapping record itself —
-    is tagged B, and records after it fall back to the caller A.
-    """
-    records = [
-        _call_record(_CONTRACT_A),  # push A  -> A
-        _call_record(_CONTRACT_B),  # push B  -> B
-        _instr_record(1),  #         -> B
-        _end_error_record(),  # top B, pop -> B
-        _instr_record(2),  #         -> A
-    ]
-    expected = [_CONTRACT_A, _CONTRACT_B, _CONTRACT_B, _CONTRACT_B, _CONTRACT_A]
-
-    result, _calls = _serve_trace(server, records)
-
-    assert [record['executingContract'] for record in result] == expected
-
-
-def test_trace_contract_annotation_root_left_open(server: StellarRpcServer) -> None:
-    """A single root call with no matching ``endWasm`` (execution ended deep, mid-call): its span
-    runs to the end of the trace and every record is tagged with the root contract.
-    """
-    records = [_call_record(_CONTRACT_A), _instr_record(1), _instr_record(2)]
-
-    result, _calls = _serve_trace(server, records)
-
-    assert [record['executingContract'] for record in result] == [_CONTRACT_A, _CONTRACT_A, _CONTRACT_A]
-
-
-def test_trace_contract_annotation_degenerate_no_call(server: StellarRpcServer) -> None:
-    """Degenerate guard: with no ``callContract`` ever seen the stack stays empty, so every record
-    is tagged ``contract: null``. (Real traces always open with a callContract.)
-    """
-    records = [_instr_record(1), _instr_record(2), _instr_record(3)]
-
-    result, _calls = _serve_trace(server, records)
-
-    assert [record['executingContract'] for record in result] == [None, None, None]
-
-
-def test_trace_contract_annotation_does_not_invoke_interpreter(server: StellarRpcServer) -> None:
-    """The contract annotation is computed purely on the file-serve path; serving a trace that
-    needs annotation must still NOT spawn the interpreter subprocess.
-    """
-    records = [
-        _call_record(_CONTRACT_A),
-        _call_record(_CONTRACT_B),
-        _end_record(),
-        _instr_record(1),
-    ]
-
-    result, calls = _serve_trace(server, records)
-
-    assert [record['executingContract'] for record in result] == [_CONTRACT_A, _CONTRACT_B, _CONTRACT_B, _CONTRACT_A]
-    assert calls == [], 'traceTransaction must not invoke the interpreter'
-
-
-def test_trace_contract_data_documented_contract_field_not_clobbered(server: StellarRpcServer) -> None:
-    """Blocker regression: a ``contractData`` record carries a DOCUMENTED top-level ``contract``
-    field — an ADDRESS OBJECT naming its storage-target contract. The executing-contract annotation
-    must NOT collide with it. It lives under the distinct key ``executingContract`` (a string), so
-    the storage-target ``contract`` object is left byte-for-byte intact and the served JSON line
-    carries no duplicate ``contract`` key.
-    """
-    records = [
-        _call_record(_CONTRACT_A),  # push A  -> executing A
-        _contract_data_record(_CONTRACT_B),  # storage target B; still executing A; NOT a marker
-        _instr_record(1),  # -> executing A
-        _end_record(),  # top A, pop -> A
-    ]
-    tx_hash = 'e' * 64
-    (server.io_dir / 'traces' / f'trace_{tx_hash}.jsonl').write_text('\n'.join(json.dumps(r) for r in records) + '\n')
-
-    raw = server.handle_rpc('traceTransaction', {'hash': tx_hash})
-    result = json.loads(raw)['result']
-
-    data_record = result[1]
-    # The documented storage-target field is UNCHANGED: still the ADDRESS OBJECT, not a string.
-    assert data_record['contract'] == {'type': 'address', 'addrType': 'contract', 'value': _CONTRACT_B}
-    # The executing-contract annotation is added under its own distinct key.
-    assert data_record['executingContract'] == _CONTRACT_A
-    # And the whole span is tagged with the executing contract A (the storage target never affects it).
-    assert [record['executingContract'] for record in result] == [
-        _CONTRACT_A,
-        _CONTRACT_A,
-        _CONTRACT_A,
-        _CONTRACT_A,
-    ]
-
-    # The served line round-trips with NO duplicate ``contract`` key: a strict parse that rejects
-    # duplicate keys still yields the address OBJECT for ``contract`` (a clobbering string injection
-    # would either duplicate the key or overwrite the object).
-    def _reject_dupes(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-        seen: dict[str, Any] = {}
-        for key, value in pairs:
-            assert key not in seen, f'duplicate key {key!r} in served record'
-            seen[key] = value
-        return seen
-
-    strict = json.loads(raw, object_pairs_hook=_reject_dupes)
-    served_data = strict['result'][1]
-    assert served_data['contract'] == {'type': 'address', 'addrType': 'contract', 'value': _CONTRACT_B}
-    assert served_data['executingContract'] == _CONTRACT_A
-
-
-def test_trace_contract_annotation_end_underflow_is_guarded(server: StellarRpcServer) -> None:
-    """Stack-machine guard: an ``endWasm`` with an empty stack (no prior ``callContract``) must be a
-    no-op pop, not an exception. The exit marker and the following instruction both tag ``null``.
-    """
-    records = [_end_record(), _instr_record(1)]
-
-    result, _calls = _serve_trace(server, records)
-
-    assert [record['executingContract'] for record in result] == [None, None]
-
-
-def test_trace_contract_annotation_three_deep_nesting(server: StellarRpcServer) -> None:
-    """Three-deep nesting A->B->C then two exits: each marker tags its OWN contract (the current top
-    before the pop), so C's ``endWasm`` tags C and B's ``endWasm`` tags B, with control returning to
-    A for the trailing instruction.
-    """
-    records = [
-        _call_record(_CONTRACT_A),  # push A  -> A
-        _call_record(_CONTRACT_B),  # push B  -> B
-        _call_record(_CONTRACT_C),  # push C  -> C
-        _end_record(),  # top C, pop -> C
-        _end_record(),  # top B, pop -> B
-        _instr_record(1),  # -> A
-    ]
-    expected = [_CONTRACT_A, _CONTRACT_B, _CONTRACT_C, _CONTRACT_C, _CONTRACT_B, _CONTRACT_A]
-
-    result, _calls = _serve_trace(server, records)
-
-    assert [record['executingContract'] for record in result] == expected
-
-
-def test_trace_contract_annotation_sibling_root_calls(server: StellarRpcServer) -> None:
-    """Two SIBLING root-level calls: each opens and closes at the root (the stack empties between
-    them), so A's span tags A and B's span tags B — no leakage across the sibling boundary.
-    """
-    records = [
-        _call_record(_CONTRACT_A),  # push A  -> A
-        _end_record(),  # top A, pop -> empty
-        _call_record(_CONTRACT_B),  # push B  -> B
-        _end_record(),  # top B, pop -> empty
-    ]
-    expected = [_CONTRACT_A, _CONTRACT_A, _CONTRACT_B, _CONTRACT_B]
-
-    result, _calls = _serve_trace(server, records)
-
-    assert [record['executingContract'] for record in result] == expected
-
-
-def test_trace_contract_annotation_marker_lookalike_arg_is_not_a_marker(server: StellarRpcServer) -> None:
-    """False-positive guard: a ``contractData`` record whose ``args`` contains a symbol VALUE literally
-    equal to a marker mnemonic (``endWasm``) is NOT a boundary marker — classification keys on the
-    record's own ``kind``, never on payload substrings. The stack stays untouched, a following
-    instruction is still tagged with the current contract, and the record keeps its own storage-target
-    ``contract`` object while also gaining ``executingContract``.
-    """
-    lookalike = _contract_data_record(_CONTRACT_B, args=[{'type': 'symbol', 'value': 'endWasm'}])
-    records = [
-        _call_record(_CONTRACT_A),  # push A  -> A
-        lookalike,  # NOT a marker; stack unchanged -> A
-        _instr_record(1),  # -> A (still in A)
-    ]
-
-    result, _calls = _serve_trace(server, records)
-
-    assert [record['executingContract'] for record in result] == [_CONTRACT_A, _CONTRACT_A, _CONTRACT_A]
-    served_data = result[1]
-    assert served_data['contract'] == {'type': 'address', 'addrType': 'contract', 'value': _CONTRACT_B}
-    assert served_data['args'] == [{'type': 'symbol', 'value': 'endWasm'}]
-    assert served_data['executingContract'] == _CONTRACT_A

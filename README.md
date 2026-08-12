@@ -133,26 +133,23 @@ curl -s http://localhost:8000 -H 'Content-Type: application/json' \
     {
       "kind": "ledger", "sequence": 4, "timestamp": 0,
       "accounts": [{"account": {"type": "address", "addrType": "account", "value": "03a107bf…"}, "balance": 10000000000}],
-      "contracts": [], "codes": [], "executingContract": null
+      "contracts": [], "codes": []
     },
     {
       "kind": "callContract",
       "from": {"type": "address", "addrType": "account",  "value": "03a107bff3ce10be1d70dd18e74bc09967e4d6309ba50d5f1ddc8664125531b8"},
       "to":   {"type": "address", "addrType": "contract", "value": "6a20fec1a9081773a5f23ce370f925f236346e510438ddd6d40f6b2711c134e0"},
-      "function": "foo", "args":[], "depth":1, "storage":[],
-      "executingContract": "6a20fec1a9081773a5f23ce370f925f236346e510438ddd6d40f6b2711c134e0"
+      "function": "foo", "args":[], "depth":1, "storage":[]
     },
-    {"kind": "instr", "pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {},                                       "executingContract": "6a20fec1…"},
-    {"kind": "instr", "pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576]},                  "executingContract": "6a20fec1…"},
-    {"kind": "instr", "pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576], "1": ["i32", 1048576]}, "executingContract": "6a20fec1…"},
-    {"kind": "instr", "pos": null, "instr": ["block"],                 "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576], "1": ["i32", 1048576], "2": ["i32", 1048576]}, "executingContract": "6a20fec1…"},
-    {"kind": "instr", "pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576], "1": ["i32", 1048576], "2": ["i32", 1048576]}, "executingContract": "6a20fec1…"},
-    {"kind": "endWasm", "success": true, "depth": 1, "result": {"type": "void"}, "executingContract": "6a20fec1…"}
+    {"kind": "instr", "pos": 3,    "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {}},
+    {"kind": "instr", "pos": 11,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576]}},
+    {"kind": "instr", "pos": 19,   "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576], "1": ["i32", 1048576]}},
+    {"kind": "instr", "pos": null, "instr": ["block"],                 "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576], "1": ["i32", 1048576], "2": ["i32", 1048576]}},
+    {"kind": "instr", "pos": 3,    "instr": ["const", "i64", 2],       "stack": [], "locals": {}, "mem": null, "globals": {"0": ["i32", 1048576], "1": ["i32", 1048576], "2": ["i32", 1048576]}},
+    {"kind": "endWasm", "success": true, "depth": 1, "result": {"type": "void"}}
   ]
 }
 ```
-
-A `…` marks an abbreviated contract id; the real records carry it in full.
 
 A trace can contain six kinds of records:
 
@@ -202,7 +199,7 @@ Here's what each record type carries:
 
 - `endWasm`: logged once at the end of a call, for a normal return and a trap alike. Records whether the call succeeded, its depth, and its result.
 
-Every served record additionally carries `executingContract`: the contract whose code is executing at that record, or `null` before the first `callContract`. komet-node adds this field when serving the trace — it is not in the stored file — so a consumer can map a record's `pos` against the right contract binary, since a callee's small `pos` values would otherwise collide with its caller's.
+The array is exactly the stored trace file — komet-node adds nothing to it. Anything derivable from the records is left to the consumer: which contract is executing at a given record, for instance, follows from the `callContract` and `endWasm` boundaries around it.
 
 
 
