@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from komet.kast.syntax import steps_of, upload_wasm
-from pyk.kast.inner import KApply, KSort
+from pyk.kast.inner import KApply, KSequence, KSort, KVariable
 from pyk.kast.prelude.utils import token
 from pyk.konvert import kast_to_kore
 from pyk.kore.parser import KoreParser
@@ -23,6 +23,7 @@ from stellar_sdk import Account, TransactionBuilder
 from stellar_sdk.utils import sha256
 
 from komet_node.interpreter import EMPTY_PROGRAM_KORE, NodeInterpreter, splice_program
+from komet_node.kore_emit import kast_to_kore_text
 
 from .conftest import PASSPHRASE, wat_to_wasm
 
@@ -193,3 +194,100 @@ def test_upload_steps_cache_survives_a_corrupt_entry(tmp_path: Path, monkeypatch
     entry.write_text('')
 
     assert NodeInterpreter().steps_kore_text(steps) == expected
+
+
+# ---------------------------------------------------------------------------
+# The fast KAST -> KORE emitter
+#
+# `kast_to_kore` runs six normalization passes and then builds a KORE term, each stage
+# rebuilding every node; converting a 389 KB module took 40s of which half was passes that
+# provably could not change it. `kast_to_kore_text` walks a plain term once and writes KORE
+# text directly. These tests pin the only property that matters: it produces exactly what
+# the generic pipeline produces.
+# ---------------------------------------------------------------------------
+
+
+def test_emitted_kore_matches_kast_to_kore_for_a_real_module() -> None:
+    """The correctness claim the fast path rests on, on a real contract module."""
+    interpreter = NodeInterpreter()
+    definition = interpreter.definition.kdefinition
+    wasm = wat_to_wasm(ADDER_CONTRACT_WAT)
+    term = steps_of([upload_wasm(sha256(wasm), wasm2kast(BytesIO(wasm)))])
+
+    emitted = kast_to_kore_text(definition, term, KSort('Steps'))
+
+    assert emitted == kast_to_kore(definition, term, KSort('Steps')).text
+
+
+def test_emitted_kore_matches_kast_to_kore_for_several_modules() -> None:
+    """Two structurally different contracts, so the check is not fitted to one module."""
+    interpreter = NodeInterpreter()
+    definition = interpreter.definition.kdefinition
+
+    for wat in (EMPTY_CONTRACT_WAT, ADDER_CONTRACT_WAT):
+        wasm = wat_to_wasm(wat)
+        term = steps_of([upload_wasm(sha256(wasm), wasm2kast(BytesIO(wasm)))])
+
+        assert (
+            kast_to_kore_text(definition, term, KSort('Steps')) == kast_to_kore(definition, term, KSort('Steps')).text
+        ), f'diverged on {wat.name}'
+
+
+def test_emitted_kore_matches_kast_to_kore_for_a_multi_module_upload() -> None:
+    """A transaction can upload more than one module; the cons list must convert too."""
+    interpreter = NodeInterpreter()
+    definition = interpreter.definition.kdefinition
+    first, second = wat_to_wasm(EMPTY_CONTRACT_WAT), wat_to_wasm(ADDER_CONTRACT_WAT)
+    term = steps_of(
+        [
+            upload_wasm(sha256(first), wasm2kast(BytesIO(first))),
+            upload_wasm(sha256(second), wasm2kast(BytesIO(second))),
+        ]
+    )
+
+    assert kast_to_kore_text(definition, term, KSort('Steps')) == kast_to_kore(definition, term, KSort('Steps')).text
+
+
+def test_non_plain_terms_fall_back_to_the_generic_pipeline() -> None:
+    """A term the emitter does not handle must still convert, via `kast_to_kore`.
+
+    Variables, sequences, rewrites, ML connectives and cells are all excluded from the fast
+    path because the normalization passes it skips exist to rewrite exactly those.
+    """
+    definition = NodeInterpreter().definition.kdefinition
+    # A K sequence is sorted K, not KItem — hence the differing target sorts.
+    non_plain = [
+        (KApply('setExitCode', [KVariable('N', KSort('Int'))]), KSort('KItem')),
+        (KSequence([KApply('setExitCode', [token(0)])]), KSort('K')),
+    ]
+
+    for term, sort in non_plain:
+        assert (
+            kast_to_kore_text(definition, term, sort) == kast_to_kore(definition, term, sort).text
+        ), f'diverged on {term}'
+
+
+def test_plain_scalar_terms_convert_identically() -> None:
+    """Small plain terms take the fast path too; injections and tokens must still match."""
+    definition = NodeInterpreter().definition.kdefinition
+
+    for term, sort in [
+        (KApply('setExitCode', [token(0)]), KSort('Step')),
+        (token(7), KSort('KItem')),
+        (token('hello "quoted" \\ text'), KSort('KItem')),
+        (token(b'\x00\xff\n'), KSort('KItem')),
+    ]:
+        assert (
+            kast_to_kore_text(definition, term, sort) == kast_to_kore(definition, term, sort).text
+        ), f'diverged on {term}'
+
+
+def test_the_interpreter_converts_steps_through_the_fast_path() -> None:
+    """The production call site must use the emitter, not the generic pipeline."""
+    interpreter = NodeInterpreter()
+    wasm = wat_to_wasm(ADDER_CONTRACT_WAT)
+    steps = [upload_wasm(sha256(wasm), wasm2kast(BytesIO(wasm)))]
+
+    converted = interpreter._convert_steps(steps)
+
+    assert converted == kast_to_kore(interpreter.definition.kdefinition, steps_of(steps), KSort('Steps')).text

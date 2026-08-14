@@ -10,13 +10,13 @@ from typing import TYPE_CHECKING, Final
 
 from komet.kast.syntax import steps_of
 from pyk.kast.inner import KApply, KSort, KToken
-from pyk.konvert import kast_to_kore
 from pyk.kore.prelude import SORT_K_ITEM, inj, int_dv, str_dv, top_cell_initializer
 from pyk.kore.syntax import App, SortApp
 from pyk.utils import check_file_path, run_process_2
 
 from .errors import NodeInterpreterError
 from .interfaces import Interpreter
+from .kore_emit import kast_to_kore_text
 from .utils import simbolik_definition
 
 if TYPE_CHECKING:
@@ -197,7 +197,7 @@ class NodeInterpreter(Interpreter):
         return text
 
     def _convert_steps(self, steps: list[KInner]) -> str:
-        return kast_to_kore(self.definition.kdefinition, steps_of(steps), KSort('Steps')).text
+        return kast_to_kore_text(self.definition.kdefinition, steps_of(steps), KSort('Steps'))
 
     @staticmethod
     def _write_cache_entry(entry: Path, text: str) -> None:
