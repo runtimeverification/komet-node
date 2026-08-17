@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import sys
+import threading
 import time
 import traceback
 from datetime import datetime, timezone
@@ -100,6 +101,13 @@ _TX_METHODS: Final = ('sendTransaction',)
 # the default 'base64' format; see _require_supported_xdr_format.
 _XDR_FORMAT_METHODS: Final = ('getTransaction', 'sendTransaction')
 
+# The request path drives deep Python recursion (pyk's recursive-descent KORE parser and the
+# recursive cell rewrites in interpreter.py) proportional to the world-state term. komet_node
+# raises the recursion *limit* (see __init__.py) so large real contracts do not hit CPython's
+# default 1000; this backs that limit with a matching C stack, run on a dedicated serve thread,
+# so a deep term raises a catchable error rather than overflowing an 8 MB stack into a SIGSEGV.
+_SERVE_STACK_SIZE: Final = 512 * 1024 * 1024
+
 _log = logging.getLogger('komet_node')
 
 
@@ -177,7 +185,18 @@ class StellarRpcServer:
         # switch to ThreadingHTTPServer without reworking that file protocol.
         self._httpd = HTTPServer((self.host, int(self._port)), Handler)
         self._log_ready()
-        self._httpd.serve_forever()
+
+        # Run the (blocking) serve loop on a worker thread with a large stack so the raised
+        # recursion limit is usable: the request handler recurses on this thread, and a big
+        # C stack is what keeps a deep world-state term from segfaulting. stack_size is a
+        # no-op fallback (default stack) on the rare platform that does not support it.
+        try:
+            threading.stack_size(_SERVE_STACK_SIZE)
+        except (ValueError, RuntimeError):
+            pass
+        worker = threading.Thread(target=self._httpd.serve_forever, name='komet-node-serve')
+        worker.start()
+        worker.join()
 
     def _log_ready(self) -> None:
         """Announce, once the socket is bound, where the server listens and how it started."""
@@ -296,6 +315,8 @@ class StellarRpcServer:
             return self._handle_simulate(params, request_id, now)
         if method == 'getLedgerEntries':
             return self._get_ledger_entries(params, request_id, now)
+        if method == 'traceTransaction':
+            return self._trace_transaction(params, request_id)
 
         envelope = self._read_only_envelope(method, params, request_id, now)
         response = self.interpreter.run(self.state_file, self.io_dir, envelope, None)
@@ -377,6 +398,35 @@ class StellarRpcServer:
         if response is None:
             raise RpcError.internal()
         return format_ledger_entries_response(response, self.store.wasms_dir)
+
+    def _trace_transaction(self, params: dict[str, Any], request_id: Any) -> str:
+        """Serve a transaction's execution trace directly from its JSONL file.
+
+        The trace was streamed to ``traces/trace_<hash>.jsonl`` during ``sendTransaction`` — one
+        already-valid JSON record per line — so the result array is assembled here in a single
+        linear pass (join the lines with commas, wrap in brackets). This deliberately bypasses
+        the interpreter: the semantics reassembled the array by recursively copying the whole
+        remaining tail once per line, which is O(n^2) in time and memory and OOM-killed the
+        interpreter on multi-hundred-MB traces. Hash validation mirrors the read-only path.
+
+        The records are passed through verbatim, so the served array is exactly the stored file.
+        Anything a consumer can derive from the trace is left to the consumer: the debug adapter
+        needs to know which contract is executing at each record, for instance, but a
+        ``callContract`` names its callee and an ``endWasm`` closes it, so that is a fold over
+        records it already walks — tagging every record here would only duplicate derivable data
+        on the one path whose whole purpose is to keep memory proportional to the trace.
+        """
+        tx_hash = params.get('hash')
+        if not isinstance(tx_hash, str):
+            raise RpcError.invalid_params("'hash' (string) is required")
+        if _TX_HASH_RE.fullmatch(tx_hash) is None:
+            raise RpcError.invalid_params("'hash' must be a 64-character hex string")
+        trace_file = self.io_dir / 'traces' / f'trace_{tx_hash}.jsonl'
+        if not trace_file.is_file():
+            return '{"jsonrpc":"2.0","id":' + json.dumps(request_id) + ',"result":null}'
+        text = trace_file.read_text()
+        body = ','.join(line for line in (raw.strip() for raw in text.split('\n')) if line)
+        return '{"jsonrpc":"2.0","id":' + json.dumps(request_id) + ',"result":[' + body + ']}'
 
     def _read_only_envelope(
         self, method: str | None, params: dict[str, Any], request_id: Any, now: str

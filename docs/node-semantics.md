@@ -84,6 +84,7 @@ If `request.json` is absent, `insert-handleRequestFile` does not fire and K halt
 #runTx(request)
    => #enableTrace(traces/trace_<hash>.jsonl)     ← clear the trace file and point <ioDir> at it
    ~> setLedgerSequence(<latest_ledger from metadata.json>)
+   ~> #traceLedger                                ← write the ledger baseline as the trace's first record
    ~> #decodeSteps(<the "steps" array>)           ← KASMER runs each decoded step
    ~> #finalizeTx(request)
 ```
@@ -188,18 +189,32 @@ Tracing is always on. Before running the steps, `#enableTrace` clears the transa
 **Trace format** (one JSON record per line):
 
 ```json
-{"pos": 597, "instr": ["local.get", 0], "stack": [["i64", 4]], "locals": {"0": ["i64", 4]}, "mem": null}
+{"kind": "instr", "pos": 597, "instr": ["local.get", 0], "stack": [["i64", 4]], "locals": {"0": ["i64", 4]}, "mem": null}
 ```
 
 | Field | Description |
 |---|---|
+| `kind` | Names the record; always `"instr"` for an instruction record. Every trace record carries one, so a consumer dispatches on this field alone |
 | `pos` | Byte offset of the instruction in the binary, or `null` for synthetic instructions |
 | `instr` | Instruction name and operands as a JSON array |
 | `stack` | Value stack at instruction entry, as `[type, value]` pairs |
 | `locals` | Local variable bindings, keyed by index, as `[type, value]` pairs |
 | `mem` | Linear memory as a list of `{addr, bytes}` runs, emitted only when memory changed since the previous record and `null` otherwise (reuse the most recent snapshot) |
+| `globals` | The executing module's WebAssembly globals, keyed by module-relative index, as `[type, value]` pairs. Repeated in full on every record (never `null`, unlike `mem`) |
 
-Instruction records are one of several trace record kinds (`callContract`, `hostCall`, `contractData`, and `endWasm` are the others); see the [Trace a transaction](../README.md#trace-a-transaction) section of the README for all five.
+Instruction records are one of several trace record kinds (`ledger`, `callContract`, `hostCall`, `contractData`, and `endWasm` are the others); see the [Trace a transaction](../README.md#trace-a-transaction) section of the README, and komet's [`docs/tracing.md`](https://github.com/runtimeverification/komet/blob/master/docs/tracing.md) for the full format of each. The `ledger` record is the exception: komet never emits one, so it is built and documented here — see below.
+
+**The ledger baseline record.** `#traceLedger` writes one `ledger` record as the trace's first line, before any step runs:
+
+```json
+{"kind": "ledger", "sequence": 3, "timestamp": 0,
+ "accounts": [{"account": {"type": "address", "addrType": "account", "value": "6964b7…"}, "balance": 10000000000}],
+ "contracts": [], "codes": []}
+```
+
+It describes the ledger as the transaction's steps *found* it, which is what lets a debugger show chain state at any point of a recorded execution rather than only the parts a contract touched: the debugger seeds its view from this record and replays the storage writes and contract calls that follow on top of it.
+
+Because the baseline precedes the steps, a transaction that creates its own account reports no accounts — its `setAccount` step runs afterwards. A later transaction sees what earlier ones left behind, which is the case that matters (the debugger traces the last transaction of a sequence). Balances are read straight from the `<accounts>` cells by `#collectAccounts`, which gathers them one per rewrite step because a K cell collection cannot be passed to a function, and are serialized by `generateLedgerTrace`/`AccountBalances2JSONs` in `node.md` — the cells belong to komet, but the record is komet-node's, so the builders sit beside their only caller. `contracts` and `codes` are reserved for contract-instance and uploaded-code metadata and are currently always empty, so a consumer must read an empty list as "not reported" rather than "none exist".
 
 ---
 

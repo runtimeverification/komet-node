@@ -23,6 +23,7 @@ state that is saved and reused for the next request.
 
 ```k
 requires "soroban-semantics/kasmer.md"
+requires "soroban-semantics/json-utils.md"
 requires "fs.md"
 requires "json.md"
 
@@ -34,6 +35,9 @@ module NODE
     imports KASMER
     imports FILE-OPERATIONS
     imports JSON
+    // For `Address2JSON`, used by the ledger baseline record below. Imported
+    // explicitly rather than relied on through KASMER's tracing-only import chain.
+    imports JSON-UTILS
     imports BYTES
     imports K-EQUAL
     imports STRING
@@ -436,6 +440,7 @@ already run by the time we get here, leaving `steps` empty).
     rule <k> #runTx( REQ )
           => #enableTrace( #traceFile( #getString( "txHash", REQ ) ) )
           ~> setLedgerSequence( #getInt( "latest_ledger", String2JSON( {#readFile("metadata.json")}:>String ) ) )
+          ~> #traceLedger
           ~> #decodeSteps( #stepsJSONs( #getJSON( "steps", REQ, [ .JSONs ] ) ) )
           ~> #finalizeTx( REQ )
              ...
@@ -453,6 +458,110 @@ at it so the executing steps append their records to it.
 ```k
     rule <k> #enableTrace( PATH ) => #writeFile( PATH, "" ) ... </k>
          <ioDir> _ => PATH </ioDir>
+```
+
+`#traceLedger` writes the trace's first record: the **ledger baseline**, carrying the ledger
+scalars and every account's balance. A debugger seeds its view of chain state from this record
+and then replays the per-operation events (storage writes, contract calls) that follow, so it
+can show the ledger at any point of a recorded execution rather than only the parts a contract
+happened to touch.
+
+It runs after `setLedgerSequence` so the sequence it reports is this transaction's, not the
+previous one's, and before `#decodeSteps` so it describes the ledger as the steps *found* it —
+any `setAccount`, upload or deploy among those steps is a change on top of this baseline.
+
+The state reported here — `<ledgerSequenceNumber>`, `<ledgerTimestamp>`, `<accounts>` — is all
+declared in komet's `configuration.md`; this module only reads it. What belongs to komet-node
+is the record itself: opening every trace with a baseline is a decision about how a
+transaction's trace file is laid out, and komet emits no such record. So `generateLedgerTrace`
+and its `AccountBalances2JSONs` helper live here, next to their only caller, rather than in
+komet's `tracing.md` beside the record builders komet does use.
+
+The balances cannot be read in one match: `<accounts>` is a K *cell collection*, so no
+function can take it as an argument (its generated sort is not usable in a hand-written
+`syntax` declaration), and a rule cannot match a variable number of `<account>` cells at
+once. So `#collectAccounts` gathers them one per rewrite step into a plain `Map`, which
+`generateLedgerTrace` then serializes. The accumulator itself is the record of what has been
+visited — an account is collected only if its address is not already a key.
+
+komet's `moduleGlobals` faces the same restriction and sidesteps it by reading the cells as
+[function context](https://github.com/runtimeverification/k/blob/master/docs/user_manual.md#matching-global-context-in-function-rules)
+(see its *Reading Globals*); the same would work here and would remove these rewrite steps.
+
+```k
+    syntax KItem ::= "#traceLedger"                 [symbol(traceLedger)]
+                   | #collectAccounts(acc: Map)     [symbol(collectAccounts)]
+ // ---------------------------------------------------------
+    rule <k> #traceLedger => #collectAccounts(.Map) ... </k>
+         <ioDir> PATH </ioDir>
+      requires PATH =/=String ""
+
+    rule [collectAccounts-step]:
+        <k> #collectAccounts(ACCTS => ACCTS [ ADDR <- BAL ]) ... </k>
+        <account>
+          <accountId> ADDR </accountId>
+          <balance>   BAL  </balance>
+          ...
+        </account>
+      requires notBool ADDR in_keys(ACCTS)
+      [preserves-definedness]
+
+    // Every account visited: emit the record.
+    rule [collectAccounts-done]:
+        <k> #collectAccounts(ACCTS)
+         => #appendFileJSONLn( PATH, generateLedgerTrace( SEQ, TS, ACCTS ) )
+            ...
+        </k>
+        <ioDir> PATH </ioDir>
+        <ledgerSequenceNumber> SEQ </ledgerSequenceNumber>
+        <ledgerTimestamp> TS </ledgerTimestamp>
+      [owise]
+
+    // Tracing disabled (a simulate/dry run leaves `<ioDir>` empty): a no-op, so the
+    // step never wedges.
+    rule <k> #traceLedger => .K ... </k>
+         <ioDir> "" </ioDir>
+```
+
+`generateLedgerTrace` builds the record: the ledger scalars plus every account's balance. It
+follows the same convention as komet's record builders — a `kind` field naming the record,
+then fields shaped for that record alone — so a consumer dispatches on the same field as for
+every other line in the file. It carries no `pos`, like komet's other non-instruction records:
+the baseline does not come from any position in a binary.
+
+`contracts` and `codes` are reserved for the contract-instance and uploaded-code metadata
+(wasm hash, instance/code TTLs); they are emitted empty for now, and a consumer must treat an
+empty list as "not reported" rather than "none exist".
+
+```k
+    syntax JSON ::= generateLedgerTrace(sequence: Int, timestamp: Int, accounts: Map)   [function]
+ // ---------------------------------------------------------------------------------------------
+    rule generateLedgerTrace(SEQ, TS, ACCTS)
+      => {
+          "kind"      : "ledger" ,
+          "sequence"  : SEQ ,
+          "timestamp" : TS ,
+          "accounts"  : [ AccountBalances2JSONs(ACCTS) ] ,
+          "contracts" : [ .JSONs ] ,
+          "codes"     : [ .JSONs ]
+      }
+```
+
+`AccountBalances2JSONs` serializes the `Map` of account `Address` |-> balance that
+`#collectAccounts` built, using komet's `Address2JSON` so addresses match how every other
+record spells them. The `owise` rule skips an entry that is not `Address |-> Int`, which
+`#collectAccounts` cannot produce; it keeps a malformed accumulator from wedging the tracer.
+
+```k
+    syntax JSONs ::= AccountBalances2JSONs(Map)   [function]
+ // ----------------------------------------------------------
+    rule AccountBalances2JSONs(.Map) => .JSONs
+
+    rule AccountBalances2JSONs((ADDR:Address |-> BAL:Int) REST:Map)
+      => { "account" : Address2JSON(ADDR) , "balance" : BAL } , AccountBalances2JSONs(REST)
+
+    rule AccountBalances2JSONs((_K |-> _V) REST:Map) => AccountBalances2JSONs(REST)
+      [owise]
 ```
 
 After the steps run, record the receipt, write the new ledger counter, and respond. The trace
@@ -1164,6 +1273,23 @@ SCVal arg encoding (key order also significant):
     rule #decodeArg({ "type" : "bytes"   , "value" : V:String }) => ScBytes(HexBytes(V))
     rule #decodeArg({ "type" : "address" , "addrType" : "account"  , "value" : V:String }) => ScAddress(Account(HexBytes(V)))
     rule #decodeArg({ "type" : "address" , "addrType" : "contract" , "value" : V:String }) => ScAddress(Contract(HexBytes(V)))
+
+    // Composite arguments. A vec reuses #decodeArgList (which already yields a List of
+    // ScVal); a map decodes its entries into a Map from ScVal keys to ScVal values.
+    // Enums, structs, and tuples all bottom out in vecs and maps, so these two rules
+    // cover every composite call argument. Encoded by scval_to_json as
+    //   { "type": "vec", "value": [ <scval>, ... ] }
+    //   { "type": "map", "value": [ { "key": <scval>, "val": <scval> }, ... ] }
+    rule #decodeArg({ "type" : "vec" , "value" : [ ELEMS:JSONs ] }) => ScVec(#decodeArgList(ELEMS))
+    rule #decodeArg({ "type" : "map" , "value" : [ ENTRIES:JSONs ] }) => ScMap(#decodeMapEntries(ENTRIES))
+
+    syntax Map ::= #decodeMapEntries(JSONs) [function]
+    rule #decodeMapEntries(.JSONs)          => .Map
+    rule #decodeMapEntries(E:JSON, ES:JSONs)
+        => #decodeMapEntry(E) #decodeMapEntries(ES)
+
+    syntax Map ::= #decodeMapEntry(JSON) [function]
+    rule #decodeMapEntry({ "key" : K:JSON , "val" : V:JSON }) => #decodeArg(K) |-> #decodeArg(V)
 ```
 
 `uncheckedCallTx` is like komet's `callTx` but it does not entail a return value check.

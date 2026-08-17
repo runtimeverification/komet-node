@@ -185,13 +185,15 @@ Failures are reported in the result body, matching real stellar-rpc; only an und
 
 `traceTransaction` is **not part of the Stellar RPC specification** — it exists only on komet-node, and clients must not expect it from real Stellar RPC endpoints. It keeps its plain name rather than a vendor-prefixed one (`komet_traceTransaction`): the official spec has no method of that name and none is announced, so there is no collision to avoid, and renaming would break every existing client for no gain. If stellar-rpc ever claims the name, the method will be renamed with a prefix.
 
-`traceTransaction` retrieves the instruction trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored for that transaction. The result is a JSON array with one record per executed WebAssembly instruction (empty when the transaction ran no instructions), or `null` when no transaction with that hash exists.
+`traceTransaction` retrieves the execution trace of a previously submitted transaction. It takes a `hash` parameter (the same one `getTransaction` takes) and returns the trace that `sendTransaction` stored for that transaction. The result is a JSON array of records — one per executed WebAssembly instruction, plus the `ledger` baseline and the Soroban VM records described in the [README](../README.md#trace-a-transaction) — or `null` when no transaction with that hash exists. Each record names itself with a `kind` field.
 
 ```json
 [
-  {"pos": 3, "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null}
+  {"kind": "instr", "pos": 3, "instr": ["const", "i32", 1048576], "stack": [], "locals": {}, "mem": null, "globals": {}}
 ]
 ```
+
+The server reads the stored file and streams it back in one linear pass, passing each record through verbatim: the served array is exactly the trace file. It derives nothing, by design — a trace runs to hundreds of megabytes, so anything a consumer can compute for itself should not be duplicated per record here. Which contract is executing at a given record is the standing example: a `callContract` names its callee and an `endWasm` closes it, so the debug adapter folds it out of boundaries it already walks.
 
 ### `getTransaction`
 

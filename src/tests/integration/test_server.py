@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.metadata
 import json
+import re
 import shutil
 import time
 from pathlib import Path
@@ -455,9 +456,64 @@ def test_trace_transaction_retrieves_trace_by_hash(server: StellarRpcServer) -> 
     assert send_result['status'] == 'PENDING'
 
     # The trace is keyed by the same hash getTransaction uses. A create-account op runs no
-    # wasm instructions, so the stored trace is an empty array (resolved, not null/NOT_FOUND).
+    # wasm instructions, so the trace holds only the leading `ledger` baseline record every
+    # traced transaction opens with (resolved, not null/NOT_FOUND).
     trace = _rpc(server.port(), 'traceTransaction', {'hash': send_result['hash']})['result']
-    assert trace == []
+    assert [record['kind'] for record in trace] == ['ledger']
+
+
+def test_trace_opens_with_a_ledger_baseline_record(server: StellarRpcServer) -> None:
+    """Every traced transaction opens with a `ledger` baseline record: the ledger scalars plus
+    every account's balance, as the transaction's steps FOUND them.
+
+    A debugger seeds its view of chain state from this and replays the per-operation events that
+    follow on top, so it can show the ledger at any point of a recorded execution rather than
+    only the parts a contract happened to touch.
+
+    The balances are those that existed when the transaction started, so a transaction that
+    creates its own account reports none — the `setAccount` step runs after the baseline. The
+    second transaction below therefore sees the account the first one created, which is what
+    makes the field useful for the debugger (it traces the last of a sequence).
+    """
+    keypair = Keypair.random()
+
+    def submit(sequence: int) -> str:
+        envelope = (
+            TransactionBuilder(Account(keypair.public_key, sequence=sequence), PASSPHRASE)
+            .append_create_account_op(destination=keypair.public_key, starting_balance='1000')
+            .set_timeout(30)
+            .build()
+        )
+        envelope.sign(keypair)
+        return _rpc(server.port(), 'sendTransaction', {'transaction': envelope.to_xdr()})['result']['hash']
+
+    first_hash = submit(0)
+    first = _rpc(server.port(), 'traceTransaction', {'hash': first_hash})['result'][0]
+
+    assert first['kind'] == 'ledger'
+    # The ledger scalars are always reported.
+    assert isinstance(first['sequence'], int)
+    assert isinstance(first['timestamp'], int)
+    # Nothing existed before the first transaction ran its own steps.
+    assert first['accounts'] == []
+    # Reserved for contract-instance / uploaded-code metadata; empty means "not reported".
+    assert first['contracts'] == []
+    assert first['codes'] == []
+
+    # A second transaction starts from the ledger the first one left behind, so its baseline
+    # carries the account, with the balance and the address shape the debugger expects.
+    second_hash = submit(1)
+    second = _rpc(server.port(), 'traceTransaction', {'hash': second_hash})['result'][0]
+
+    assert second['kind'] == 'ledger'
+    assert second['accounts'], "the second transaction should see the first transaction's account"
+    entry = second['accounts'][0]
+    assert entry['account']['type'] == 'address'
+    assert entry['account']['addrType'] == 'account'
+    assert re.fullmatch(r'[0-9a-f]*', entry['account']['value'])
+    assert isinstance(entry['balance'], int)
+    # The ledger advances between transactions.
+    assert second['sequence'] > first['sequence']
 
 
 def test_trace_transaction_unknown_hash_returns_null(server: StellarRpcServer) -> None:
@@ -485,16 +541,23 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
     shown in the README) so any drift in format, ordering, or the array-vs-string shape of the
     result is caught. The entry/exit frames carry per-run contract and account ids, so they are
     checked structurally rather than by value.
+
+    CI-only: deploys a real WAT, so it needs ``wat2wasm`` on PATH and cannot run where it is absent.
     """
     invoke = deploy_and_get_invoker(server, EMPTY_CONTRACT_WAT)
     tx_hash = invoke('foo')
 
     trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
 
-    # A callContract entry frame opens the trace: the account calls foo() on the contract with
-    # no arguments at call depth 1.
+    # A `ledger` baseline record opens every traced transaction (see
+    # test_trace_opens_with_a_ledger_baseline_record); the callContract entry frame follows it.
+    assert trace[0]['kind'] == 'ledger'
+    trace = trace[1:]
+
+    # A callContract entry frame opens the execution: the account calls foo() on the contract
+    # with no arguments at call depth 1.
     entry = trace[0]
-    assert entry['instr'] == ['callContract']
+    assert entry['kind'] == 'callContract'
     assert entry['function'] == 'foo'
     assert entry['args'] == []
     assert entry['depth'] == 1
@@ -502,17 +565,63 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
     assert entry['to']['addrType'] == 'contract'
 
     # The executed WebAssembly instructions, exactly as shown in the README.
+    # The first three records EVALUATE the module's global initialisers. A global is allocated
+    # only once its own initialiser has run, so each of these sees exactly the globals declared
+    # before it: none, then one, then two. By the time the function frame runs all three are
+    # allocated and reported by module-relative index (0..2, never store-level addresses).
+    initialised = {'0': ['i32', 1048576], '1': ['i32', 1048576], '2': ['i32', 1048576]}
     assert trace[1:-1] == [
-        {'pos': 3, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}, 'mem': None},
-        {'pos': 11, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}, 'mem': None},
-        {'pos': 19, 'instr': ['const', 'i32', 1048576], 'stack': [], 'locals': {}, 'mem': None},
-        {'pos': None, 'instr': ['block'], 'stack': [], 'locals': {}, 'mem': None},
-        {'pos': 3, 'instr': ['const', 'i64', 2], 'stack': [], 'locals': {}, 'mem': None},
+        {
+            'kind': 'instr',
+            'pos': 3,
+            'instr': ['const', 'i32', 1048576],
+            'stack': [],
+            'locals': {},
+            'mem': None,
+            'globals': {},
+        },
+        {
+            'kind': 'instr',
+            'pos': 11,
+            'instr': ['const', 'i32', 1048576],
+            'stack': [],
+            'locals': {},
+            'mem': None,
+            'globals': {'0': ['i32', 1048576]},
+        },
+        {
+            'kind': 'instr',
+            'pos': 19,
+            'instr': ['const', 'i32', 1048576],
+            'stack': [],
+            'locals': {},
+            'mem': None,
+            'globals': {'0': ['i32', 1048576], '1': ['i32', 1048576]},
+        },
+        {
+            'kind': 'instr',
+            'pos': None,
+            'instr': ['block'],
+            'stack': [],
+            'locals': {},
+            'mem': None,
+            'globals': initialised,
+        },
+        {
+            'kind': 'instr',
+            'pos': 3,
+            'instr': ['const', 'i64', 2],
+            'stack': [],
+            'locals': {},
+            'mem': None,
+            'globals': initialised,
+        },
     ]
 
-    # An endWasm exit frame closes the trace: the call succeeded and returned Void.
+    # An endWasm exit frame closes the trace: the call succeeded and returned Void. The exit frame
+    # is tagged with the finishing contract (the current top of stack) before its pop.
     exit_frame = trace[-1]
-    assert exit_frame['instr'] == ['endWasm']
+    assert exit_frame['kind'] == 'endWasm'
     assert exit_frame['success'] is True
     assert exit_frame['result'] == {'type': 'void'}
     assert exit_frame['depth'] == 1
@@ -520,9 +629,11 @@ def test_trace_transaction_returns_full_instruction_trace_for_foo(server: Stella
 
 def test_trace_records_have_expected_structure_and_reflect_arguments(server: StellarRpcServer) -> None:
     """The trace opens with a ``callContract`` frame that echoes the decoded arguments, and each
-    WebAssembly instruction record is a ``{pos, instr, stack, locals}`` object. For a call that
+    WebAssembly instruction record is a ``{kind, pos, instr, stack, locals, ...}`` object. For a call that
     takes arguments the arguments are bound as locals while intermediate values build up on the
     stack — exercising a richer trace than the argument-less ``foo()`` case.
+
+    CI-only: deploys a real WAT, so it needs ``wat2wasm`` on PATH and cannot run where it is absent.
     """
     invoke = deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
     tx_hash = invoke(
@@ -540,9 +651,13 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
     assert isinstance(trace, list)
     assert len(trace) > 0
 
+    # Skip the leading `ledger` baseline record every traced transaction opens with.
+    assert trace[0]['kind'] == 'ledger'
+    trace = trace[1:]
+
     # The callContract entry frame echoes the call target and its decoded arguments.
     entry = trace[0]
-    assert entry['instr'] == ['callContract']
+    assert entry['kind'] == 'callContract'
     assert entry['function'] == 'test_integers'
     assert entry['args'] == [
         {'type': 'u32', 'value': 42},
@@ -552,13 +667,18 @@ def test_trace_records_have_expected_structure_and_reflect_arguments(server: Ste
     ]
 
     # The instruction records (everything between the call-boundary frames) share one shape.
-    instr_records = [record for record in trace if 'locals' in record]
+    instr_records = [record for record in trace if record['kind'] == 'instr']
     assert instr_records
     for record in instr_records:
-        assert set(record) == {'pos', 'instr', 'stack', 'locals', 'mem'}
+        assert set(record) == {'kind', 'pos', 'instr', 'stack', 'locals', 'mem', 'globals'}
         assert record['pos'] is None or isinstance(record['pos'], int)
         # mem is null when linear memory is unchanged since the previous record, else a list of runs.
         assert record['mem'] is None or isinstance(record['mem'], list)
+        # globals is the executing module's globals keyed by module-relative index, repeated in
+        # full on every record (never null, unlike mem).
+        assert isinstance(record['globals'], dict)
+        assert all(key.isdigit() for key in record['globals'])
+        assert all(isinstance(e, list) and len(e) == 2 and isinstance(e[0], str) for e in record['globals'].values())
         assert isinstance(record['instr'], list) and record['instr']
         assert isinstance(record['instr'][0], str)  # opcode mnemonic
         # stack and locals hold [type, value] pairs.
@@ -588,7 +708,10 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
 
     def assert_args_round_trip(func: str, args: list[xdr.SCVal]) -> None:
         tx_hash = invoke(func, args)
-        entry = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result'][0]
+        trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
+        # The trace opens with the `ledger` baseline record, so find the call frame rather
+        # than assuming it is first.
+        entry = next(record for record in trace if record.get('kind') == 'callContract')
         assert entry['function'] == func
         assert [scval_from_json(arg) for arg in entry['args']] == args
 
@@ -610,6 +733,82 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
         ],
     )
     assert_args_round_trip('test_symbol', [xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(sc_symbol=b'hello'))])
+
+
+def test_call_tx_with_composite_args(server: StellarRpcServer) -> None:
+    """The scval_to_json / #decodeArg pipeline decodes composite (vec / map) call args.
+
+    Regression test for the composite-argument blocker: komet-node used to decode only
+    scalar SCVals in call arguments (``scval_to_json`` raised on SCV_VEC/SCV_MAP, and the
+    ``#decodeArg`` rules had no vec/map cases), so a Vec/Map argument was rejected at
+    admission and never ran. Both sides now recurse, so a contract call carrying vec and
+    map arguments reaches SUCCESS (asserted by ``invoke``) and — like ``test_call_tx_with_args``
+    — the arguments echoed in the trace's ``callContract`` frame round-trip back to the exact
+    SCVals sent, so a decoding bug is caught even when the transaction still succeeds.
+
+    User enums, structs, and tuples all reduce to vec/map at the XDR level, so the nested
+    ``Vec<(enum, i128)>`` case below (with an Address-carrying variant and a negative i128)
+    stands in for the real ``Vec<(AssetKey, i128)>`` motivating argument.
+    """
+    invoke = deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
+
+    def assert_args_round_trip(func: str, args: list[xdr.SCVal]) -> None:
+        tx_hash = invoke(func, args)
+        trace = _rpc(server.port(), 'traceTransaction', {'hash': tx_hash})['result']
+        # A composite argument is allocated as a host object first, so the callContract
+        # frame is not necessarily trace[0] (unlike the scalar-only case): find it.
+        entry = next(record for record in trace if record.get('kind') == 'callContract')
+        assert entry['function'] == func
+        assert [scval_from_json(arg) for arg in entry['args']] == args
+
+    def sym(name: str) -> xdr.SCVal:
+        return xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(sc_symbol=name.encode()))
+
+    def i128(value: int) -> xdr.SCVal:
+        # Two's-complement split into (hi: signed int64, lo: unsigned int64) so negative
+        # and high-bit values round-trip, not just small positive ones.
+        unsigned = value & ((1 << 128) - 1)
+        hi = unsigned >> 64
+        lo = unsigned & ((1 << 64) - 1)
+        if hi >= (1 << 63):
+            hi -= 1 << 64
+        return xdr.SCVal(type=SCValType.SCV_I128, i128=xdr.Int128Parts(hi=xdr.Int64(hi), lo=xdr.Uint64(lo)))
+
+    def u32(value: int) -> xdr.SCVal:
+        return xdr.SCVal(type=SCValType.SCV_U32, u32=xdr.Uint32(value))
+
+    def vec(elems: list[xdr.SCVal]) -> xdr.SCVal:
+        return xdr.SCVal(type=SCValType.SCV_VEC, vec=xdr.SCVec(elems))
+
+    def mp(entries: list[tuple[xdr.SCVal, xdr.SCVal]]) -> xdr.SCVal:
+        return xdr.SCVal(type=SCValType.SCV_MAP, map=xdr.SCMap([xdr.SCMapEntry(key=k, val=v) for k, v in entries]))
+
+    address = Address(Keypair.random().public_key).to_xdr_sc_val()
+
+    # A flat vec of scalars.
+    assert_args_round_trip('test_vec', [vec([u32(1), u32(2), u32(3)])])
+
+    # The nested motivating case: Vec<(enum, i128)> mirroring Vec<(AssetKey, i128)> — a unit
+    # variant (Native), an Address-carrying variant (Stellar(addr)), and a positive and a
+    # negative i128, exercising SCV_ADDRESS nested in a composite and the full signed i128 range.
+    assert_args_round_trip(
+        'test_vec',
+        [
+            vec(
+                [
+                    vec([vec([sym('Native')]), i128(1000)]),
+                    vec([vec([sym('Stellar'), address]), i128(-5)]),
+                ]
+            )
+        ],
+    )
+
+    # A map from symbol keys to scalar values (a struct at the XDR level). Keys are sent in
+    # sorted order ('amount' < 'nonce') to match the canonical SCMap ordering the trace echoes.
+    assert_args_round_trip('test_map', [mp([(sym('amount'), i128(500)), (sym('nonce'), u32(7))])])
+
+    # A map nested inside a vec — composites compose in both directions.
+    assert_args_round_trip('test_vec', [vec([mp([(sym('k'), u32(1))])])])
 
 
 def test_call_tx_with_return_value(server: StellarRpcServer) -> None:
@@ -1680,3 +1879,66 @@ def test_get_transaction_not_found_omits_transaction_fields(server: StellarRpcSe
     assert get_result['status'] == 'NOT_FOUND'
     for field in ('ledger', 'createdAt', 'envelopeXdr', 'resultXdr', 'resultMetaXdr', 'returnValue'):
         assert field not in get_result, f'NOT_FOUND response must omit {field}'
+
+
+def test_trace_transaction_served_from_file_without_interpreter(server: StellarRpcServer) -> None:
+    """traceTransaction is a pure read of ``traces/trace_<hash>.jsonl`` and must NOT invoke the
+    interpreter.
+
+    The trace is already valid JSONL on disk (one record per line); reassembling it into a JSON
+    array is a linear string operation the Python layer can do directly. Routing it through the
+    semantics instead made the interpreter join the lines with a recursive per-line tail-copy —
+    O(n^2) in time and memory — which OOM-killed the interpreter on multi-hundred-MB traces. This
+    test pins the record content AND that no interpreter subprocess is spawned to serve the trace.
+
+    The records are served VERBATIM — the array is exactly the stored file, field for field. The
+    server derives nothing and adds nothing; a consumer that wants, say, the contract executing at
+    each record folds it out of the `callContract`/`endWasm` boundaries itself.
+    """
+    tx_hash = 'a' * 64
+    contract_id = 'ab' * 32
+    records: list[dict[str, Any]] = [
+        {
+            'kind': 'callContract',
+            'function': 'f',
+            'to': {'type': 'address', 'addrType': 'contract', 'value': contract_id},
+        },
+        {'kind': 'instr', 'pos': 1, 'instr': ['const', 'i32', 1]},
+        {'kind': 'endWasm', 'success': True},
+    ]
+    (server.io_dir / 'traces' / f'trace_{tx_hash}.jsonl').write_text('\n'.join(json.dumps(r) for r in records) + '\n')
+
+    calls: list[Any] = []
+    original_run = server.interpreter.run
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(args)
+        return original_run(*args, **kwargs)
+
+    server.interpreter.run = _spy  # type: ignore[method-assign]
+    try:
+        response = json.loads(server.handle_rpc('traceTransaction', {'hash': tx_hash}))
+    finally:
+        server.interpreter.run = original_run  # type: ignore[method-assign]
+
+    assert response['result'] == records
+    assert calls == [], 'traceTransaction must not invoke the interpreter'
+
+
+def test_trace_transaction_missing_file_returns_null_without_interpreter(server: StellarRpcServer) -> None:
+    """A hash with no trace file yields ``result: null`` — again without touching the interpreter."""
+    calls: list[Any] = []
+    original_run = server.interpreter.run
+
+    def _spy(*args: Any, **kwargs: Any) -> Any:
+        calls.append(args)
+        return original_run(*args, **kwargs)
+
+    server.interpreter.run = _spy  # type: ignore[method-assign]
+    try:
+        response = json.loads(server.handle_rpc('traceTransaction', {'hash': '0' * 64}))
+    finally:
+        server.interpreter.run = original_run  # type: ignore[method-assign]
+
+    assert response['result'] is None
+    assert calls == [], 'traceTransaction must not invoke the interpreter'
