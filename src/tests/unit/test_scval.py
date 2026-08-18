@@ -1,4 +1,5 @@
-"""Unit tests for ``scval_to_json`` — the SCVal -> request-envelope JSON encoder.
+"""Unit tests for ``scval_to_json`` — the SCVal -> request-envelope JSON encoder —
+and for the 256-bit cases of its inverse, ``scval_from_json``.
 
 These are pure-Python tests (no K, no kdist build). They pin two things:
 
@@ -18,7 +19,7 @@ import json
 from stellar_sdk import xdr
 from stellar_sdk.xdr.sc_val_type import SCValType
 
-from komet_node.scval import scval_to_json
+from komet_node.scval import scval_from_json, scval_to_json
 
 
 def _sym(name: str) -> xdr.SCVal:
@@ -132,3 +133,41 @@ def test_scval_to_json_deeply_nested_vec_survives_recursion_limit() -> None:
         assert len(encoded['value']) == 1
         encoded = encoded['value'][0]
     assert encoded == {'type': 'symbol', 'value': 'leaf'}
+
+
+def test_scval_from_json_u256() -> None:
+    """The semantics emit 256-bit values as a single integer; the parts are rebuilt here."""
+    value = (1 << 192) | (2 << 128) | (3 << 64) | 4
+    decoded = scval_from_json({'type': 'u256', 'value': value})
+    assert decoded.type == SCValType.SCV_U256
+    assert decoded.u256 is not None
+    assert (decoded.u256.hi_hi.uint64, decoded.u256.hi_lo.uint64) == (1, 2)
+    assert (decoded.u256.lo_hi.uint64, decoded.u256.lo_lo.uint64) == (3, 4)
+
+
+def test_scval_from_json_i256_positive() -> None:
+    value = (1 << 192) | (2 << 128) | (3 << 64) | 4
+    decoded = scval_from_json({'type': 'i256', 'value': value})
+    assert decoded.type == SCValType.SCV_I256
+    assert decoded.i256 is not None
+    assert (decoded.i256.hi_hi.int64, decoded.i256.hi_lo.uint64) == (1, 2)
+    assert (decoded.i256.lo_hi.uint64, decoded.i256.lo_lo.uint64) == (3, 4)
+
+
+def test_scval_from_json_i256_negative() -> None:
+    """Only the i256 case can carry a negative value: the words are its two's complement."""
+    mask = (1 << 64) - 1
+    decoded = scval_from_json({'type': 'i256', 'value': -1})
+    assert decoded.type == SCValType.SCV_I256
+    assert decoded.i256 is not None
+    assert decoded.i256.hi_hi.int64 == -1
+    assert decoded.i256.hi_lo.uint64 == mask
+    assert decoded.i256.lo_hi.uint64 == mask
+    assert decoded.i256.lo_lo.uint64 == mask
+
+
+def test_scval_from_json_i256_min() -> None:
+    decoded = scval_from_json({'type': 'i256', 'value': -(2**255)})
+    assert decoded.i256 is not None
+    assert decoded.i256.hi_hi.int64 == -(2**63)
+    assert (decoded.i256.hi_lo.uint64, decoded.i256.lo_hi.uint64, decoded.i256.lo_lo.uint64) == (0, 0, 0)
