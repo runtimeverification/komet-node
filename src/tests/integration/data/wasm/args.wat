@@ -32,6 +32,15 @@
   (func $test_map (type 1) (param i64) (result i64)
     i64.const 2)
 
+  ;; test_string / test_void: accept 1 arg (a String object handle, resp. the small
+  ;; Void value), return Void. test_wide256: accept u256 and i256 handles.
+  (func $test_string (type 1) (param i64) (result i64)
+    i64.const 2)
+  (func $test_void (type 1) (param i64) (result i64)
+    i64.const 2)
+  (func $test_wide256 (type 3) (param i64 i64) (result i64)
+    i64.const 2)
+
   (memory (;0;) 16)
   (global (;0;) (mut i32) (i32.const 1048576))
   (global (;1;) i32 (i32.const 1048576))
@@ -45,6 +54,9 @@
   (export "_" (func 4))
   (export "test_vec" (func $test_vec))
   (export "test_map" (func $test_map))
+  (export "test_string" (func $test_string))
+  (export "test_void" (func $test_void))
+  (export "test_wide256" (func $test_wide256))
   (export "__data_end" (global 1))
   (export "__heap_base" (global 2))
 )

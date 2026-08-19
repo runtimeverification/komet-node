@@ -140,7 +140,7 @@ Step decoding pattern-matches on the `JSON` sort. Key order in the step objects 
 #decodeStep({ "op": "callTx",            ... })→  callTx(...)
 ```
 
-SCVal arguments are decoded by `#decodeArg`, which matches on `"type"` and produces a K `ScVal` constructor (`SCBool`, `I32`, `U32`, `I64`, `U64`, `I128`, `U128`, `Symbol`, `ScBytes`, `ScAddress`).
+SCVal arguments are decoded by `#decodeArg`, which matches on `"type"` and produces a K `ScVal` constructor (`Void`, `SCBool`, `I32`, `U32`, `I64`, `U64`, `I128`, `U128`, `I256`, `U256`, `Symbol`, `ScString`, `ScBytes`, `ScAddress`, `ScVec`, `ScMap`) — the same set `scval_to_json` encodes, so the two stay in step.
 
 The `steps-done` rule (mirroring KASMER's `steps-empty` but with a `...` frame) consumes the final `.Steps` so the `#finalizeTx` continuation can proceed.
 
