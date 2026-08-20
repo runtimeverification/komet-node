@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "komet-node"
-version = "0.1.0"
+version = "0.1.1"
 description = "Local development testnet for Stellar based on K semantics"
 readme = "README.md"
 requires-python = "~=3.10"
