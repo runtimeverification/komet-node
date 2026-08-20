@@ -702,7 +702,8 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
     Uses a minimal contract (args.wat) whose functions accept various arg types and return
     Void. For each call the arguments echoed in the trace's ``callContract`` frame must
     round-trip back to the exact SCVals that were sent — so a decoding bug is caught even
-    when the transaction still succeeds. Covers: bool, u32, i32, u64, i64, u128, i128, symbol.
+    when the transaction still succeeds. Covers: bool, u32, i32, u64, i64, u128, i128, symbol,
+    string, void, u256, i256. (Composite args have their own test below.)
     """
     invoke = deploy_and_get_invoker(server, ARGS_CONTRACT_WAT)
 
@@ -733,6 +734,34 @@ def test_call_tx_with_args(server: StellarRpcServer) -> None:
         ],
     )
     assert_args_round_trip('test_symbol', [xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=xdr.SCSymbol(sc_symbol=b'hello'))])
+    assert_args_round_trip(
+        'test_string', [xdr.SCVal(type=SCValType.SCV_STRING, str=xdr.SCString(sc_string=b'Soroban'))]
+    )
+    assert_args_round_trip('test_void', [xdr.SCVal(type=SCValType.SCV_VOID)])
+
+    def u256(value: int) -> xdr.SCVal:
+        mask = (1 << 64) - 1
+        parts = xdr.UInt256Parts(
+            hi_hi=xdr.Uint64(value >> 192),
+            hi_lo=xdr.Uint64((value >> 128) & mask),
+            lo_hi=xdr.Uint64((value >> 64) & mask),
+            lo_lo=xdr.Uint64(value & mask),
+        )
+        return xdr.SCVal(type=SCValType.SCV_U256, u256=parts)
+
+    def i256(value: int) -> xdr.SCVal:
+        # As for i128: only the top word is signed, so a negative value's lower words
+        # are its two's complement.
+        mask = (1 << 64) - 1
+        parts = xdr.Int256Parts(
+            hi_hi=xdr.Int64(value >> 192),
+            hi_lo=xdr.Uint64((value >> 128) & mask),
+            lo_hi=xdr.Uint64((value >> 64) & mask),
+            lo_lo=xdr.Uint64(value & mask),
+        )
+        return xdr.SCVal(type=SCValType.SCV_I256, i256=parts)
+
+    assert_args_round_trip('test_wide256', [u256(2**200 + 33), i256(-(2**200) - 33)])
 
 
 def test_call_tx_with_composite_args(server: StellarRpcServer) -> None:

@@ -19,6 +19,8 @@ def scval_to_json(scval: SCVal) -> dict:
     produced with keys in the same order as the ``#decodeArg`` rules in ``node.md``.
     """
     match scval.type:
+        case SCValType.SCV_VOID:
+            return {'type': 'void'}
         case SCValType.SCV_BOOL:
             assert scval.b is not None
             return {'type': 'bool', 'value': scval.b}
@@ -42,9 +44,25 @@ def scval_to_json(scval: SCVal) -> dict:
             assert scval.u128 is not None
             val = (scval.u128.hi.uint64 << 64) | scval.u128.lo.uint64
             return {'type': 'u128', 'value': val}
+        case SCValType.SCV_U256:
+            assert scval.u256 is not None
+            u = scval.u256
+            val = (u.hi_hi.uint64 << 192) | (u.hi_lo.uint64 << 128) | (u.lo_hi.uint64 << 64) | u.lo_lo.uint64
+            return {'type': 'u256', 'value': val}
+        case SCValType.SCV_I256:
+            assert scval.i256 is not None
+            i = scval.i256
+            # Only the top word is signed; the lower words are its two's complement, and
+            # OR-ing them onto the shifted signed word reproduces the value (inverse of
+            # the masking scval_from_json does).
+            val = (i.hi_hi.int64 << 192) | (i.hi_lo.uint64 << 128) | (i.lo_hi.uint64 << 64) | i.lo_lo.uint64
+            return {'type': 'i256', 'value': val}
         case SCValType.SCV_SYMBOL:
             assert scval.sym is not None
             return {'type': 'symbol', 'value': scval.sym.sc_symbol.decode()}
+        case SCValType.SCV_STRING:
+            assert scval.str is not None
+            return {'type': 'string', 'value': scval.str.sc_string.decode()}
         case SCValType.SCV_BYTES:
             assert scval.bytes is not None
             return {'type': 'bytes', 'value': scval.bytes.sc_bytes.hex()}
@@ -79,9 +97,8 @@ def scval_to_json(scval: SCVal) -> dict:
 def scval_from_json(value: dict) -> SCVal:
     """Decode the JSON ScVal encoding emitted by the semantics back into an XDR SCVal.
 
-    Inverse of :func:`scval_to_json`, extended with the value-only types the semantics can
-    hold in contract storage or return from a contract call but that never appear as call
-    arguments (``void``, ``string``, ``u256``, ``vec``, ``map``). Covers all three K-side
+    Inverse of :func:`scval_to_json`, which now covers every type in both directions, so
+    this decoder and that encoder handle the same set. Covers all three K-side
     encoders (``#scVal2JSON``, ``#scValJSON``, ``#scValToJSON`` in ``node.md``); the ``map``
     case accepts both entry shapes they emit — ``{"key": ..., "val": ...}`` objects and
     ``[key, val]`` pairs — so keep the encoders and this decoder in sync. Raises
@@ -120,6 +137,17 @@ def scval_from_json(value: dict) -> SCVal:
                 lo_lo=stellar_xdr.Uint64(val & _UINT64_MASK),
             )
             return stellar_xdr.SCVal(type=SCValType.SCV_U256, u256=parts256)
+        case 'i256':
+            # Only the top word is signed, so a negative value's remaining words are
+            # its two's complement -- which is what masking a negative Python int gives.
+            val = value['value']
+            parts256i = stellar_xdr.Int256Parts(
+                hi_hi=stellar_xdr.Int64(val >> 192),
+                hi_lo=stellar_xdr.Uint64((val >> 128) & _UINT64_MASK),
+                lo_hi=stellar_xdr.Uint64((val >> 64) & _UINT64_MASK),
+                lo_lo=stellar_xdr.Uint64(val & _UINT64_MASK),
+            )
+            return stellar_xdr.SCVal(type=SCValType.SCV_I256, i256=parts256i)
         case 'symbol':
             return stellar_xdr.SCVal(type=SCValType.SCV_SYMBOL, sym=stellar_xdr.SCSymbol(value['value'].encode()))
         case 'string':

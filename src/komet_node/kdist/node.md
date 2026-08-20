@@ -1262,6 +1262,7 @@ SCVal arg encoding (key order also significant):
     rule #decodeArgList(.JSONs)           => .List
     rule #decodeArgList(A:JSON, AS:JSONs) => ListItem(#decodeArg(A)) #decodeArgList(AS)
 
+    rule #decodeArg({ "type" : "void"                        }) => Void
     rule #decodeArg({ "type" : "bool"    , "value" : V:Bool   }) => SCBool(V)
     rule #decodeArg({ "type" : "i32"     , "value" : V:Int    }) => I32(V)
     rule #decodeArg({ "type" : "u32"     , "value" : V:Int    }) => U32(V)
@@ -1269,7 +1270,10 @@ SCVal arg encoding (key order also significant):
     rule #decodeArg({ "type" : "u64"     , "value" : V:Int    }) => U64(V)
     rule #decodeArg({ "type" : "i128"    , "value" : V:Int    }) => I128(V)
     rule #decodeArg({ "type" : "u128"    , "value" : V:Int    }) => U128(V)
+    rule #decodeArg({ "type" : "i256"    , "value" : V:Int    }) => I256(V)
+    rule #decodeArg({ "type" : "u256"    , "value" : V:Int    }) => U256(V)
     rule #decodeArg({ "type" : "symbol"  , "value" : V:String }) => Symbol(V)
+    rule #decodeArg({ "type" : "string"  , "value" : V:String }) => ScString(V)
     rule #decodeArg({ "type" : "bytes"   , "value" : V:String }) => ScBytes(HexBytes(V))
     rule #decodeArg({ "type" : "address" , "addrType" : "account"  , "value" : V:String }) => ScAddress(Account(HexBytes(V)))
     rule #decodeArg({ "type" : "address" , "addrType" : "contract" , "value" : V:String }) => ScAddress(Contract(HexBytes(V)))
